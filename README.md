@@ -73,7 +73,7 @@ Rules:
 | 1 | HEARTBEAT | Connection keepalive |
 | 3 | IDENTIFY | Auth with token |
 | 10 | ROOM_CREATE | Create a room |
-| 11 | ROOM_JOIN | Join room (returns ICE params + DTLS fingerprint) |
+| 11 | ROOM_JOIN | Join room with SDP Offer (returns SDP Answer) |
 | 12 | ROOM_LEAVE | Leave room |
 | 15 | SDP_OFFER | Renegotiation |
 | 16 | ICE_CANDIDATE | Trickle ICE (acknowledged, ignored in ICE-Lite) |
@@ -109,6 +109,7 @@ src/
 │   ├── demux_conn.rs       Virtual Conn adapter (mpsc ↔ DTLSConn bridge)
 │   ├── dtls.rs             DTLS session (cert, fingerprint, handshake, key export)
 │   ├── srtp.rs             SRTP context (encrypt/decrypt, key install)
+│   ├── sdp.rs              SDP Offer parsing + Answer generation
 │   └── udp.rs              Single-port UDP listener with demux dispatch
 ├── media/
 │   ├── router.rs           SSRC routing table
@@ -125,6 +126,8 @@ cargo build
 cargo test
 RUST_LOG=debug cargo run
 ```
+
+상세 실행/배포/모니터링은 [OPERATIONS.md](OPERATIONS.md) 참조.
 
 ## Design Targets
 

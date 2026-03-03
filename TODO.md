@@ -43,12 +43,14 @@
 - [x] Stale DTLS session cleanup
 - [x] AppState shared between WS handlers and UDP transport
 
-## Phase 3: SDP Negotiation ← NEXT
-- [ ] SDP Offer parsing (extract codecs, SSRC, mid, ice-ufrag, fingerprint)
-- [ ] SDP Answer generation (ICE-Lite params, DTLS fingerprint, codec mirror)
-- [ ] Track registration from SDP (SSRC → TrackKind mapping)
-- [ ] ROOM_JOIN flow: Offer → Answer → ICE → DTLS → SRTP (end-to-end)
-- [ ] Browser integration test (video only, 2 tabs)
+## Phase 3: SDP Negotiation ✔
+- [x] SDP Offer parsing (extract codecs, SSRC, mid, direction, extmap, rtcp-rsize)
+- [x] SDP Answer generation (ICE-Lite params, passive DTLS fingerprint, codec mirror, host candidate)
+- [x] ROOM_JOIN flow: sdp_offer required → parse → answer → response
+- [x] ROOM_LIST opcode + 서버 기본 방 생성
+- [x] 클라이언트 SDK + UI (insight-lens) light 프로토콜 전환
+- [x] 브라우저 통합 테스트 (WS→SDP→ICE→DTLS→SRTP relay 확인, 3명 그리드)
+- [ ] Track registration (SSRC → TrackKind mapping) — deferred to Phase 4
 
 ## Phase 4: RTP Routing Refinement
 - [ ] RTP header parsing (SSRC, PT, sequence, timestamp)

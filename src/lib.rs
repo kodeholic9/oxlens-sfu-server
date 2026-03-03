@@ -35,6 +35,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Build shared state
     let state = AppState::new(cert);
 
+    // Create default rooms
+    create_default_rooms(&state);
+
     // Start UDP transport (shares RoomHub + ServerCert with signaling)
     let udp = UdpTransport::bind(
         Arc::clone(&state.rooms),
@@ -58,4 +61,23 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// 서버 기동 시 기본 방 생성 (테스트/개발용)
+fn create_default_rooms(state: &AppState) {
+    let defaults = [
+        ("회의실-1", 10),
+        ("회의실-2", 10),
+        ("대회의실", 20),
+    ];
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for (name, capacity) in defaults {
+        let room = state.rooms.create(name.to_string(), Some(capacity), now);
+        info!("default room created: {} (id={}, cap={})", name, room.id, capacity);
+    }
 }

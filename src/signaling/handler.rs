@@ -5,9 +5,11 @@
 //!   1. Server sends HELLO (heartbeat_interval)
 //!   2. Client sends IDENTIFY (token) → Server responds with user_id
 //!   3. Client sends ROOM_JOIN (room_id, sdp_offer)
+//!      → Server parses SDP Offer (codecs, extmap, SSRC)
 //!      → Server creates Participant (ufrag, ice_pwd)
 //!      → Server registers in RoomHub (3 indices)
-//!      → Server responds with sdp_answer + ice_params + participants
+//!      → Server builds SDP Answer (ICE-Lite, passive DTLS, codec mirror)
+//!      → Server responds with sdp_answer + participants
 //!   4. Browser initiates ICE → STUN → DTLS → SRTP (media path)
 //!   5. Client sends ROOM_LEAVE or disconnects → cleanup
 
@@ -26,6 +28,7 @@ use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
 use crate::transport::ice::IceCredentials;
+use crate::transport::sdp;
 
 // ============================================================================
 // Session (per-WS connection)
@@ -156,6 +159,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
     match packet.op {
         opcode::HEARTBEAT    => Some(Packet::ok(opcode::HEARTBEAT, packet.pid, serde_json::json!({}))),
         opcode::IDENTIFY     => Some(handle_identify(session, state, &packet)),
+        opcode::ROOM_LIST    => Some(handle_room_list(state, &packet)),
         opcode::ROOM_CREATE  => Some(handle_room_create(state, &packet)),
         opcode::ROOM_JOIN    => Some(handle_room_join(session, state, &packet).await),
         opcode::ROOM_LEAVE   => Some(handle_room_leave(session, state, &packet).await),
@@ -183,13 +187,41 @@ fn handle_identify(session: &mut Session, _state: &AppState, packet: &Packet) ->
     };
 
     // TODO: token verification (for now accept anything)
-    let user_id = format!("user_{}", &req.token[..8.min(req.token.len())]);
+    // 클라이언트가 user_id 지정 → 수용, 없으면 랜덤 생성
+    let user_id = req.user_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| format!("U{:03}", rand_u16() % 1000));
     session.user_id = Some(user_id.clone());
 
     info!("IDENTIFY ok user={}", user_id);
 
     Packet::ok(opcode::IDENTIFY, packet.pid, serde_json::json!({
         "user_id": user_id,
+    }))
+}
+
+// ============================================================================
+// ROOM_LIST
+// ============================================================================
+
+fn handle_room_list(state: &AppState, packet: &Packet) -> Packet {
+    let rooms: Vec<serde_json::Value> = state.rooms.rooms
+        .iter()
+        .map(|entry| {
+            let room = entry.value();
+            serde_json::json!({
+                "room_id": room.id,
+                "name": room.name,
+                "capacity": room.capacity,
+                "participants": room.participant_count(),
+            })
+        })
+        .collect();
+
+    debug!("ROOM_LIST count={}", rooms.len());
+
+    Packet::ok(opcode::ROOM_LIST, packet.pid, serde_json::json!({
+        "rooms": rooms,
     }))
 }
 
@@ -230,6 +262,15 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
 
     let user_id = session.user_id.clone().unwrap();
 
+    // Parse SDP Offer
+    let parsed_offer = match sdp::parse_offer(&req.sdp_offer) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("SDP parse failed user={}: {}", user_id, e);
+            return Packet::err(opcode::ROOM_JOIN, packet.pid, 4001, "sdp parse error");
+        }
+    };
+
     // Get room
     let room = match state.rooms.get(&req.room_id) {
         Ok(r) => r,
@@ -261,7 +302,17 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     session.current_room = Some(req.room_id.clone());
     session.ufrag = Some(ice.ufrag.clone());
 
-    info!("ROOM_JOIN user={} room={} ufrag={}", user_id, req.room_id, ice.ufrag);
+    // Build SDP Answer
+    let sdp_answer = sdp::build_answer(
+        &parsed_offer,
+        &state.cert.fingerprint,
+        &ice.ufrag,
+        &ice.pwd,
+        config::UDP_PORT,
+    );
+
+    info!("ROOM_JOIN user={} room={} ufrag={} sections={}",
+        user_id, req.room_id, ice.ufrag, parsed_offer.sections.len());
 
     // Notify existing participants
     let event = Packet::new(
@@ -278,18 +329,10 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     // Current member list
     let members: Vec<String> = room.member_ids();
 
-    // TODO: SDP Answer generation (Phase 4)
-    // For now, return ICE params so browser can start ICE
-
     Packet::ok(opcode::ROOM_JOIN, packet.pid, serde_json::json!({
         "room_id": req.room_id,
-        "ice_params": {
-            "ufrag": ice.ufrag,
-            "pwd": ice.pwd,
-        },
-        "dtls_fingerprint": state.cert.fingerprint,
+        "sdp_answer": sdp_answer,
         "participants": members,
-        // "sdp_answer": "TODO — Phase 4",
     }))
 }
 
@@ -425,4 +468,11 @@ fn broadcast_to_room(room: &crate::room::room::Room, packet: &Packet) {
     for entry in room.participants.iter() {
         let _ = entry.value().ws_tx.send(json.clone());
     }
+}
+
+/// 랜덤 u16 생성 (getrandom 기반)
+fn rand_u16() -> u16 {
+    let mut buf = [0u8; 2];
+    getrandom::fill(&mut buf).expect("getrandom failed");
+    u16::from_le_bytes(buf)
 }

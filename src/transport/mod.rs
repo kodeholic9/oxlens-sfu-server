@@ -7,4 +7,5 @@ pub mod ice;
 pub mod demux_conn;
 pub mod dtls;
 pub mod srtp;
+pub mod sdp;
 pub mod udp;

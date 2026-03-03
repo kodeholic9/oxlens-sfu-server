@@ -8,6 +8,7 @@
 // --- Client → Server (Request) ---
 pub const HEARTBEAT: u16 = 1;
 pub const IDENTIFY: u16 = 3;
+pub const ROOM_LIST: u16 = 9;
 pub const ROOM_CREATE: u16 = 10;
 pub const ROOM_JOIN: u16 = 11;
 pub const ROOM_LEAVE: u16 = 12;

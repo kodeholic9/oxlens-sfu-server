@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.4] - 2026-03-04
+
+### Added
+- SDP Offer parsing (`transport/sdp.rs`): media section extraction, codec/extmap capture, SSRC collection, direction/rtcp-rsize detection
+- SDP Answer generation: ICE-Lite params, passive DTLS fingerprint, codec mirror, host candidate
+- Local IP auto-detection (routing table based, `detect_local_ip()`)
+- ROOM_JOIN now accepts `sdp_offer` (required) and returns `sdp_answer`
+- Unit tests: 20 tests covering parse/answer/utility
+
+### Changed
+- `RoomJoinRequest.sdp_offer`: `Option<String>` → `String` (required field)
+- ROOM_JOIN response: removed separate `ice_params` + `dtls_fingerprint`, replaced with unified `sdp_answer`
+- SDP design: direction echo (sendrecv → sendrecv), no SSRC/msid in answer, re-nego deferred
+
 ## [0.1.3] - 2026-03-03
 
 ### Added

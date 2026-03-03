@@ -57,6 +57,8 @@ impl Packet {
 #[derive(Debug, Deserialize)]
 pub struct IdentifyRequest {
     pub token: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,8 +71,7 @@ pub struct RoomCreateRequest {
 #[derive(Debug, Deserialize)]
 pub struct RoomJoinRequest {
     pub room_id: String,
-    #[serde(default)]
-    pub sdp_offer: Option<String>,
+    pub sdp_offer: String,
 }
 
 #[derive(Debug, Deserialize)]
