@@ -31,3 +31,9 @@ pub const DEMUX_RTP_MAX: u8 = 0xBF;
 // --- Media ---
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 pub const UDP_RECV_BUF_SIZE: usize = 2048;
+
+// --- Debug ---
+/// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
+pub const DBG_DETAIL_LIMIT: u64 = 50;
+/// 요약 로그 주기 (패킷 수 기준)
+pub const DBG_SUMMARY_INTERVAL: u64 = 1000;

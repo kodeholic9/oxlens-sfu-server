@@ -52,8 +52,18 @@
 - [x] 브라우저 통합 테스트 (WS→SDP→ICE→DTLS→SRTP relay 확인, 3명 그리드)
 - [ ] Track registration (SSRC → TrackKind mapping) — deferred to Phase 4
 
+## Phase 3.5: Debug Logging + Video Rendering Fix ✅
+- [x] Server debug tags: `[DBG:SDP]`, `[DBG:STUN]`, `[DBG:DTLS]`, `[DBG:RTP]`, `[DBG:RELAY]`, `[DBG:RTCP]`
+- [x] Client debug tags: `[DBG:SDP]`, `[DBG:ICE]`, `[DBG:TRACK]`, `[DBG:RTP]`
+- [x] RTP header parser (logging only): SSRC, PT, seq, timestamp, marker, payload_len
+- [x] Log throttling: AtomicU64 counter, first 50 detailed, 1000-interval summary
+- [x] Client inbound-rtp stats monitor (3s getStats polling)
+- [x] Video rendering fix: remoteVideoStream deferred attach (ontrack ↔ tile timing)
+
 ## Phase 4: RTP Routing Refinement
-- [ ] RTP header parsing (SSRC, PT, sequence, timestamp)
+- [ ] **RTCP 릴레이** — 근본 원인: Chrome congestion control이 피드백 없으면 비트레이트 안 올림 (화질 저하)
+- [ ] **PLI 생성/전송** — 새 참가자 입장 시 키프레임 요청 (첫 프레임 지연 해결)
+- [ ] **SSRC → user_id 매핑** — 3명+ 지원 기반
 - [ ] SSRC rewrite (optional, for simulcast/SVC prep)
 - [ ] Hot-path optimization (minimize allocations, Bytes zero-copy)
 - [ ] Bandwidth estimation (basic)

@@ -271,6 +271,17 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
         }
     };
 
+    // [DBG:SDP] Offer 파싱 결과
+    for sec in &parsed_offer.sections {
+        let pts: Vec<&str> = sec.codec_lines.iter()
+            .filter(|l| l.starts_with("a=rtpmap:"))
+            .map(|l| l.as_str())
+            .collect();
+        info!("[DBG:SDP] offer section mid={} type={} dir={} ssrcs={:?} codecs={:?}",
+            sec.mid, sec.media_type, sec.direction, sec.ssrcs, pts);
+    }
+    info!("[DBG:SDP] bundle_mids={:?}", parsed_offer.bundle_mids);
+
     // Get room
     let room = match state.rooms.get(&req.room_id) {
         Ok(r) => r,
@@ -310,6 +321,11 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
         &ice.pwd,
         config::UDP_PORT,
     );
+
+    // [DBG:SDP] Answer 전문 (줄 단위)
+    for line in sdp_answer.lines() {
+        debug!("[DBG:SDP] answer | {}", line);
+    }
 
     info!("ROOM_JOIN user={} room={} ufrag={} sections={}",
         user_id, req.room_id, ice.ufrag, parsed_offer.sections.len());

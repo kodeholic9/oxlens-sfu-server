@@ -6,7 +6,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.1.4] - 2026-03-04
 
-### Added
+### Added (Phase 3.5: Debug Logging + Video Rendering Fix)
+- Debug log system: 6 server tags (`[DBG:SDP]`, `[DBG:STUN]`, `[DBG:DTLS]`, `[DBG:RTP]`, `[DBG:RELAY]`, `[DBG:RTCP]`) + 4 client tags (`[DBG:SDP]`, `[DBG:ICE]`, `[DBG:TRACK]`, `[DBG:RTP]`)
+- RTP header parser for logging (SSRC, PT, seq, timestamp, marker, payload_len)
+- Log throttling: AtomicU64 counter — first 50 packets detailed, then summary every 1000
+- Config constants: `DBG_DETAIL_LIMIT`, `DBG_SUMMARY_INTERVAL`
+- Client: periodic inbound-rtp stats monitor (3s interval via `getStats()`)
+- Client: ICE state transition logging (iceConnectionState, connectionState, gatheringState, local candidates)
+- Client: ontrack detail logging (kind, id, readyState, stream.id, mid) + mute/unmute/ended events
+
+### Fixed
+- **Video rendering**: ontrack fires before grid tile exists → `remoteVideoStream` stored in app state, `tryAttachRemoteVideo()` called from both `media:track`, `room:joined`, and `room:event(participant_joined)` — works regardless of event ordering
+
+### Known Issues (deferred to Phase 4)
+- Low video quality: RTCP not relayed → Chrome congestion control has no feedback → conservative bitrate
+- Slow first-frame for early joiner: no PLI sent when new participant enters
+- SSRC→user_id mapping absent: limits 3+ participant support
+
+### Added (Phase 3: SDP Negotiation)
 - SDP Offer parsing (`transport/sdp.rs`): media section extraction, codec/extmap capture, SSRC collection, direction/rtcp-rsize detection
 - SDP Answer generation: ICE-Lite params, passive DTLS fingerprint, codec mirror, host candidate
 - Local IP auto-detection (routing table based, `detect_local_ip()`)
