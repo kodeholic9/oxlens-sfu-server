@@ -106,6 +106,22 @@ impl UdpTransport {
         })
     }
 
+    /// 외부에서 생성된 socket을 받아 구성 (AppState와 socket 공유 시)
+    pub fn from_socket(
+        socket:   Arc<UdpSocket>,
+        room_hub: Arc<RoomHub>,
+        cert:     Arc<ServerCert>,
+    ) -> Self {
+        Self {
+            socket,
+            room_hub,
+            cert,
+            dtls_map: DtlsSessionMap::new(),
+            pkt_count: 0,
+            dbg_rtp_count: AtomicU64::new(0),
+        }
+    }
+
     pub async fn run(mut self) {
         let mut buf = BytesMut::zeroed(config::UDP_RECV_BUF_SIZE);
 
@@ -977,7 +993,7 @@ fn parse_rtp_header(buf: &[u8]) -> RtpHeader {
 // |                  SSRC of media source                        |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-fn build_pli(media_ssrc: u32) -> [u8; 12] {
+pub fn build_pli(media_ssrc: u32) -> [u8; 12] {
     let mut buf = [0u8; 12];
     // V=2, P=0, FMT=1 → 0b10_0_00001 = 0x81
     buf[0] = 0x81;

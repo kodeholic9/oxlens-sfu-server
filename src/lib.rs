@@ -54,8 +54,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let cert = ServerCert::generate()?;
     info!("DTLS fingerprint: {}", cert.fingerprint);
 
-    // Build shared state
-    let state = AppState::new(cert);
+    // Start UDP transport (socket 먼저 생성 → AppState에 공유)
+    let udp_socket = {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config::UDP_PORT));
+        Arc::new(tokio::net::UdpSocket::bind(addr).await?)
+    };
+    info!("UDP listening on port {}", config::UDP_PORT);
+
+    // Build shared state (udp_socket 포함)
+    let state = AppState::new(cert, Arc::clone(&udp_socket));
 
     // Create default rooms
     create_default_rooms(&state);
@@ -63,12 +70,12 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
 
-    // Start UDP transport
-    let udp = UdpTransport::bind(
+    // UDP transport (기존 socket 재사용)
+    let udp = UdpTransport::from_socket(
+        udp_socket,
         Arc::clone(&state.rooms),
         Arc::clone(&state.cert),
-    ).await?;
-    info!("UDP listening on port {}", config::UDP_PORT);
+    );
 
     tokio::spawn(async move {
         udp.run().await;

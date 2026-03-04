@@ -68,6 +68,8 @@ pub struct Track {
     pub track_id: String,
     /// RTX SSRC (video only, RFC 4588)
     pub rtx_ssrc: Option<u32>,
+    /// mute 상태 (true = 송신 중단)
+    pub muted: bool,
 }
 
 // ============================================================================
@@ -257,7 +259,7 @@ impl Participant {
             } else {
                 None
             };
-            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc });
+            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false });
             trace!("track added ssrc={} rtx_ssrc={:?} user={}", ssrc, rtx_ssrc, self.user_id);
         }
     }
@@ -278,6 +280,17 @@ impl Participant {
         let mut tracks = self.tracks.lock().unwrap();
         if let Some(pos) = tracks.iter().position(|t| t.ssrc == ssrc) {
             Some(tracks.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// 트랙 mute 상태 변경. 성공 시 해당 트랙의 TrackKind 반환.
+    pub fn set_track_muted(&self, ssrc: u32, muted: bool) -> Option<TrackKind> {
+        let mut tracks = self.tracks.lock().unwrap();
+        if let Some(track) = tracks.iter_mut().find(|t| t.ssrc == ssrc) {
+            track.muted = muted;
+            Some(track.kind.clone())
         } else {
             None
         }

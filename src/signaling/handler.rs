@@ -183,6 +183,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::ROOM_JOIN       => Some(handle_room_join(session, state, &packet).await),
         opcode::ROOM_LEAVE      => Some(handle_room_leave(session, state, &packet).await),
         opcode::PUBLISH_TRACKS  => Some(handle_publish_tracks(session, state, &packet).await),
+        opcode::MUTE_UPDATE     => Some(handle_mute_update(session, state, &packet).await),
         opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
         _ => {
             warn!("unknown opcode: {}", packet.op);
@@ -438,6 +439,82 @@ async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Pac
 
     Packet::ok(opcode::PUBLISH_TRACKS, packet.pid, serde_json::json!({
         "registered": new_tracks.len(),
+    }))
+}
+
+// ============================================================================
+// MUTE_UPDATE — 트랙 mute/unmute 상태 변경 + 브로드캐스트
+// ============================================================================
+
+async fn handle_mute_update(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: MuteUpdateRequest = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::MUTE_UPDATE, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room_id = match &session.current_room {
+        Some(r) => r,
+        None => return Packet::err(opcode::MUTE_UPDATE, packet.pid, 2004, "not in room"),
+    };
+
+    let room = match state.rooms.get(room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::MUTE_UPDATE, packet.pid, 2001, "room not found"),
+    };
+
+    let participant = match room.get_participant(user_id) {
+        Some(p) => p,
+        None => return Packet::err(opcode::MUTE_UPDATE, packet.pid, 2004, "not in room"),
+    };
+
+    // 트랙 mute 상태 갱신
+    let kind = match participant.set_track_muted(req.ssrc, req.muted) {
+        Some(k) => k,
+        None => return Packet::err(opcode::MUTE_UPDATE, packet.pid, 2005, "track not found"),
+    };
+
+    info!("MUTE_UPDATE user={} ssrc={} kind={} muted={}",
+        user_id, req.ssrc, kind, req.muted);
+
+    // 다른 참가자에게 TRACK_STATE 브로드캐스트
+    let state_event = Packet::new(
+        opcode::TRACK_STATE,
+        0,
+        serde_json::json!({
+            "user_id": user_id,
+            "ssrc": req.ssrc,
+            "kind": kind.to_string(),
+            "muted": req.muted,
+        }),
+    );
+    broadcast_to_others(&room, user_id, &state_event);
+
+    // Video unmute → PLI 전송 (키프레임 요청)
+    if !req.muted && kind == TrackKind::Video {
+        if participant.is_publish_ready() {
+            if let Some(pub_addr) = participant.publish.get_address() {
+                let pli_plain = crate::transport::udp::build_pli(req.ssrc);
+                let encrypted = {
+                    let mut ctx = participant.publish.outbound_srtp.lock().unwrap();
+                    ctx.encrypt_rtcp(&pli_plain).ok()
+                };
+                if let Some(enc) = encrypted {
+                    let socket = &state.udp_socket;
+                    if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                        warn!("[MUTE] PLI send FAILED user={} ssrc={}: {e}", user_id, req.ssrc);
+                    } else {
+                        info!("[MUTE] PLI sent user={} ssrc=0x{:08X} (video unmute)",
+                            user_id, req.ssrc);
+                    }
+                }
+            }
+        }
+    }
+
+    Packet::ok(opcode::MUTE_UPDATE, packet.pid, serde_json::json!({
+        "ssrc": req.ssrc,
+        "muted": req.muted,
     }))
 }
 

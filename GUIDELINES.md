@@ -163,6 +163,7 @@ async-trait = "0.1"
 | 12 | ROOM_LEAVE | 퇴장 |
 | 15 | SDP_OFFER | 재협상 (Phase 3+) |
 | 16 | ICE_CANDIDATE | Trickle ICE (ICE-Lite에서 무시) |
+| 17 | MUTE_UPDATE | 트랙 mute/unmute 상태 변경 |
 | 20 | MESSAGE | 데이터 메시지 |
 
 ### Server → Client
@@ -171,6 +172,7 @@ async-trait = "0.1"
 | 0 | HELLO | heartbeat_interval |
 | 100 | ROOM_EVENT | participant_joined / participant_left |
 | 101 | TRACK_EVENT | track_added / track_removed |
+| 102 | TRACK_STATE | 트랙 mute/unmute 상태 브로드캐스트 |
 | 103 | MESSAGE_EVENT | 메시지 릴레이 |
 
 ---
@@ -192,6 +194,7 @@ async-trait = "0.1"
 | B-2 | BUNDLE demux 수정 + inactive m-line 처리 | 0.1.9 | ✅ |
 | C | NACK 기반 RTX 재전송 (서버 캐시) | 0.2.0 | ✅ |
 | C-2 | RTCP Transparent Relay (SR/RR/PLI/REMB) | 0.2.2 | ✅ |
+| C-3 | Mute/Unmute 시그널링 (MUTE_UPDATE/TRACK_STATE) | 0.2.3 | ✅ |
 | D | Hardening (좀비/타임아웃/shutdown/로그, 인증 제외) | 0.2.1 | ✅ |
 | E | PTT 지원 | 0.2.0 | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
@@ -235,6 +238,14 @@ async-trait = "0.1"
 - 참가자별 `<audio>` 요소 독립 생성 (브라우저 자동 믹싱)
 - `_nextMid` 카운터: mid 순차 할당, 재사용 시 기존 mid 유지
 - inactive m-line: `active: false` + mid 보존 (SDP m-line 삭제 불가 규칙)
+
+### v0.2.3 — Mute/Unmute 시그널링
+- MUTE_UPDATE (op 17): 클라이언트 → 서버 트랙 mute/unmute 상태 변경
+- TRACK_STATE (op 102): 서버 → 다른 참가자 mute 상태 브로드캐스트
+- Track.muted 필드 + set_track_muted() 메서드
+- Video unmute 시 PLI 자동 전송 (키프레임 요청)
+- AppState에 udp_socket 추가 (handler에서 PLI 전송용)
+- UdpTransport::from_socket() 생성자 추가
 
 ### v0.2.2 — RTCP Transparent Relay (Phase C-2)
 - `split_compound_rtcp()` — compound 내 NACK/relay 대상 분류

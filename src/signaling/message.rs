@@ -81,6 +81,13 @@ pub struct PublishTrackItem {
     pub ssrc: u32,
 }
 
+/// 트랙 mute/unmute 상태 변경 요청
+#[derive(Debug, Deserialize)]
+pub struct MuteUpdateRequest {
+    pub ssrc: u32,
+    pub muted: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MessageRequest {
     pub room_id: String,

@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.3] - 2026-03-04
+
+### Added (Phase C-3: Mute/Unmute Signaling)
+
+#### 시그널링
+- `MUTE_UPDATE` (op 17) — 클라이언트가 트랙 mute/unmute 상태 변경 요청
+  - payload: `{ ssrc, muted }` (audio/video 구분 없이 SSRC 기반)
+- `TRACK_STATE` (op 102) — 다른 참가자에게 mute 상태 브로드캐스트
+  - payload: `{ user_id, ssrc, kind, muted }`
+
+#### 서버
+- `participant.rs`: `Track.muted: bool` 필드 추가 + `set_track_muted()` 메서드
+- `handler.rs`: `handle_mute_update()` — 상태 갱신 + 브로드캐스트 + video unmute 시 PLI
+- `state.rs`: `AppState.udp_socket: Arc<UdpSocket>` 추가 (handler에서 PLI 전송용)
+- `udp.rs`: `UdpTransport::from_socket()` 생성자 + `build_pli()` pub 노출
+- `lib.rs`: socket 생성 → AppState 공유 → UdpTransport 순서로 변경
+
+### 목적
+- 클라이언트 마이크/카메라 on/off 시 다른 참가자 UI에 상태 반영
+- soft mute (track.enabled) / hard mute (replaceTrack(null)) 테스트용 서버 인프라
+- video unmute 시 PLI로 키프레임 빠른 복구
+
 ## [0.2.2] - 2026-03-04
 
 ### Added (Phase C-2: RTCP Transparent Relay)
