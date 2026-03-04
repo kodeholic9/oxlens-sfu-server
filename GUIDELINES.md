@@ -191,6 +191,7 @@ async-trait = "0.1"
 | B | Multi-party 스트림 매핑 + SDP mid 안정화 | 0.1.8 | ✅ |
 | B-2 | BUNDLE demux 수정 + inactive m-line 처리 | 0.1.9 | ✅ |
 | C | NACK 기반 RTX 재전송 (서버 캐시) | 0.2.0 | ✅ |
+| C-2 | RTCP Transparent Relay (SR/RR/PLI/REMB) | 0.2.2 | ✅ |
 | D | Hardening (좀비/타임아웃/shutdown/로그, 인증 제외) | 0.2.1 | ✅ |
 | E | PTT 지원 | 0.2.0 | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
@@ -234,6 +235,14 @@ async-trait = "0.1"
 - 참가자별 `<audio>` 요소 독립 생성 (브라우저 자동 믹싱)
 - `_nextMid` 카운터: mid 순차 할당, 재사용 시 기존 mid 유지
 - inactive m-line: `active: false` + mid 보존 (SDP m-line 삭제 불가 규칙)
+
+### v0.2.2 — RTCP Transparent Relay (Phase C-2)
+- `split_compound_rtcp()` — compound 내 NACK/relay 대상 분류
+- `relay_publish_rtcp()` — publish SR → 모든 subscriber fan-out
+- `handle_nack_block()` — NACK 처리 메서드 추출
+- `assemble_compound()` — relay 블록 compound 재조립
+- subscribe RTCP(RR/PLI/REMB) → media_ssrc 기반 publisher 매핑 → relay
+- config: RTCP_PT_SR(200), RTCP_PT_RR(201), RTCP_PT_PSFB(206), RTCP_FMT_PLI(1), RTCP_FMT_REMB(15)
 
 ### v0.2.1 — Hardening (Phase D, 인증 제외)
 - D-1: WS heartbeat timeout (90초 무활동 → 강제 종료 + cleanup)

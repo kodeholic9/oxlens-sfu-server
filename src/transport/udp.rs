@@ -8,7 +8,7 @@
 //!     → DTLS : DtlsSessionMap.inject() or start new handshake (per PC session)
 //!     → SRTP : RoomHub.find_by_addr() → (Participant, PcType)
 //!              PcType::Publish  → decrypt → relay → encrypt → send to subscribers
-//!              PcType::Subscribe → RTCP feedback (future)
+//!              PcType::Subscribe → NACK(RTX) + RTCP relay(RR/PLI/REMB)
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
@@ -337,24 +337,25 @@ impl UdpTransport {
             .unwrap_or(false);
 
         if is_rtcp {
-            let rtcp_pt = buf.get(1).map(|b| b & 0x7F).unwrap_or(0);
-            let rtcp_ssrc = parse_ssrc(buf);
-            let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
-            match ctx.decrypt_rtcp(buf) {
-                Ok(plain) => {
-                    if seq_num < config::DBG_DETAIL_LIMIT {
-                        debug!("[DBG:RTCP] user={} pt={} ssrc=0x{:08X} srtp_len={} plain_len={}",
-                            sender.user_id, rtcp_pt, rtcp_ssrc, buf.len(), plain.len());
+            let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
+
+            // Decrypt SRTCP (publish session inbound)
+            let plaintext = {
+                let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
+                match ctx.decrypt_rtcp(buf) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if is_detail {
+                            debug!("[DBG:RTCP:PUB] decrypt FAILED user={}: {e}", sender.user_id);
+                        }
+                        return;
                     }
                 }
-                Err(e) => {
-                    if seq_num < config::DBG_DETAIL_LIMIT {
-                        debug!("[DBG:RTCP] decrypt FAILED user={} pt={} ssrc=0x{:08X}: {e}",
-                            sender.user_id, rtcp_pt, rtcp_ssrc);
-                    }
-                }
-            }
-            return; // RTCP relay — Phase C
+            };
+
+            // Phase C-2a: SR relay — publisher의 SR을 모든 subscriber에게 전달
+            self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail).await;
+            return;
         }
 
         // Decrypt SRTP → plaintext RTP (from publish session)
@@ -452,10 +453,12 @@ impl UdpTransport {
     }
 
     // ========================================================================
-    // Subscribe RTCP — NACK 파싱 + RTX 재전송 (Phase C)
+    // Subscribe RTCP — compound 파싱 → NACK 서버 처리 + 나머지 publisher 릴레이
     // ========================================================================
 
-    /// Subscribe PC에서 수신된 RTCP 처리 (NACK → RTX 재전송)
+    /// Subscribe PC에서 수신된 RTCP 처리
+    /// - NACK (PT=205): 서버에서 RTX 재전송 (기존 Phase C 로직)
+    /// - RR/PLI/REMB: 해당 publisher의 publish PC로 transparent relay
     async fn handle_subscribe_rtcp(
         &self,
         buf: &[u8],
@@ -486,7 +489,7 @@ impl UdpTransport {
                 Ok(p) => p,
                 Err(e) => {
                     if is_detail {
-                        debug!("[DBG:NACK] SRTCP decrypt FAILED user={} addr={}: {e}",
+                        debug!("[DBG:RTCP:SUB] SRTCP decrypt FAILED user={} addr={}: {e}",
                             subscriber.user_id, remote);
                     }
                     return;
@@ -494,17 +497,93 @@ impl UdpTransport {
             }
         };
 
-        // RTCP compound 패킷 내에서 NACK (PT=205, FMT=1) 찾기
-        let nack_items = parse_rtcp_nack(&plaintext);
-        if nack_items.is_empty() {
-            if is_detail {
-                let rtcp_pt = plaintext.get(1).map(|b| b & 0x7F).unwrap_or(0);
-                trace!("[DBG:SUB] RTCP (non-NACK) pt={} user={}", rtcp_pt, subscriber.user_id);
-            }
+        // Compound RTCP 파싱: NACK 분리 + publisher별 릴레이 대상 수집
+        let parsed = split_compound_rtcp(&plaintext);
+
+        // (1) NACK 처리 (RTX 재전송 — 기존 로직)
+        for nack_block in &parsed.nack_blocks {
+            self.handle_nack_block(nack_block, subscriber, room, is_detail).await;
+        }
+
+        // (2) 릴레이 대상 RTCP (RR, PLI, REMB) → publisher별로 모아서 전송
+        if parsed.relay_blocks.is_empty() {
             return;
         }
 
-        // NACK에서 요청한 seq 목록 추출
+        // media_ssrc → publisher 매핑 + RTCP 블록 그룹핑
+        let mut publisher_rtcp: HashMap<u32, Vec<&[u8]>> = HashMap::new();
+        for block in &parsed.relay_blocks {
+            if block.media_ssrc == 0 { continue; } // RC=0 RR 등 media_ssrc 없는 경우 skip
+            publisher_rtcp.entry(block.media_ssrc)
+                .or_default()
+                .push(&plaintext[block.offset..block.offset + block.length]);
+        }
+
+        for (media_ssrc, blocks) in &publisher_rtcp {
+            // publisher 찾기
+            let publisher = room.all_participants().into_iter()
+                .find(|p| p.get_tracks().iter().any(|t| t.ssrc == *media_ssrc));
+
+            let publisher = match publisher {
+                Some(p) => p,
+                None => {
+                    if is_detail {
+                        debug!("[DBG:RTCP:SUB] publisher not found for ssrc=0x{:08X}", media_ssrc);
+                    }
+                    continue;
+                }
+            };
+
+            if !publisher.is_publish_ready() { continue; }
+
+            let pub_addr = match publisher.publish.get_address() {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // 릴레이 대상 RTCP 블록들을 compound로 재조립
+            let compound = assemble_compound(blocks);
+
+            // publisher의 publish session outbound_srtp로 encrypt
+            let encrypted = {
+                let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
+                match ctx.encrypt_rtcp(&compound) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if is_detail {
+                            debug!("[DBG:RTCP:SUB] relay encrypt FAILED ssrc=0x{:08X}: {e}", media_ssrc);
+                        }
+                        continue;
+                    }
+                }
+            };
+
+            if let Err(e) = self.socket.send_to(&encrypted, pub_addr).await {
+                if is_detail {
+                    debug!("[DBG:RTCP:SUB] relay send FAILED ssrc=0x{:08X} addr={}: {e}",
+                        media_ssrc, pub_addr);
+                }
+            } else if is_detail {
+                debug!("[DBG:RTCP:SUB] relayed {} block(s) ssrc=0x{:08X} → user={} addr={}",
+                    blocks.len(), media_ssrc, publisher.user_id, pub_addr);
+            }
+        }
+    }
+
+    // ========================================================================
+    // NACK 처리 (RTX 재전송 — 기존 Phase C 로직 추출)
+    // ========================================================================
+
+    /// 단일 NACK RTCP 블록 처리: 캐시 조회 → RTX 조립 → 전송
+    async fn handle_nack_block(
+        &self,
+        nack_data: &[u8],
+        subscriber: &Arc<crate::room::participant::Participant>,
+        room: &Arc<crate::room::room::Room>,
+        is_detail: bool,
+    ) {
+        let nack_items = parse_rtcp_nack(nack_data);
+
         for nack in &nack_items {
             let lost_seqs = expand_nack(nack.pid, nack.blp);
 
@@ -515,9 +594,7 @@ impl UdpTransport {
 
             // 해당 media_ssrc의 publisher 찾기
             let publisher = room.all_participants().into_iter()
-                .find(|p| {
-                    p.get_tracks().iter().any(|t| t.ssrc == nack.media_ssrc)
-                });
+                .find(|p| p.get_tracks().iter().any(|t| t.ssrc == nack.media_ssrc));
 
             let publisher = match publisher {
                 Some(p) => p,
@@ -544,13 +621,12 @@ impl UdpTransport {
                 }
             };
 
-            // subscriber의 subscribe addr
             let sub_addr = match subscriber.subscribe.get_address() {
                 Some(a) => a,
                 None => continue,
             };
 
-            // 캐시 조회 + RTX 조립 (lock 내에서 완료, await 전에 drop)
+            // 캐시 조회 + RTX 조립
             let rtx_packets: Vec<(u16, u16, Vec<u8>)> = {
                 let cache = publisher.rtp_cache.lock().unwrap();
                 lost_seqs.iter().filter_map(|&lost_seq| {
@@ -559,7 +635,7 @@ impl UdpTransport {
                     let rtx_pkt = build_rtx_packet(original, rtx_ssrc, rtx_seq);
                     Some((lost_seq, rtx_seq, rtx_pkt))
                 }).collect()
-            }; // cache lock dropped here
+            };
 
             if is_detail && rtx_packets.len() < lost_seqs.len() {
                 trace!("[DBG:RTX] cache miss {}/{} seqs for ssrc=0x{:08X}",
@@ -567,7 +643,6 @@ impl UdpTransport {
             }
 
             for (lost_seq, rtx_seq, rtx_pkt) in &rtx_packets {
-                // subscriber의 subscribe session outbound_srtp로 암호화
                 let encrypted = {
                     let mut ctx = subscriber.subscribe.outbound_srtp.lock().unwrap();
                     match ctx.encrypt_rtp(rtx_pkt) {
@@ -590,6 +665,63 @@ impl UdpTransport {
                         lost_seq, rtx_seq, rtx_ssrc, subscriber.user_id, sub_addr);
                 }
             }
+        }
+    }
+
+    // ========================================================================
+    // Publish RTCP relay — SR을 모든 subscriber에게 fan-out (Phase C-2a)
+    // ========================================================================
+
+    /// Publish PC에서 수신된 RTCP compound를 모든 subscriber에게 릴레이.
+    /// SR 외 다른 RTCP도 함께 있을 수 있으나, compound 통째로 릴레이한다.
+    /// (publish → subscribe 방향에는 NACK이 없으므로 분리 불필요)
+    async fn relay_publish_rtcp(
+        &self,
+        plaintext: &[u8],
+        sender: &Arc<crate::room::participant::Participant>,
+        room: &Arc<crate::room::room::Room>,
+        is_detail: bool,
+    ) {
+        // compound 내 첫 RTCP PT 로그용
+        let first_pt = plaintext.get(1).map(|b| b & 0x7F).unwrap_or(0);
+
+        let targets = room.other_participants(&sender.user_id);
+        let mut relay_count = 0u32;
+
+        for target in &targets {
+            if !target.is_subscribe_ready() { continue; }
+
+            let addr = match target.subscribe.get_address() {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // subscriber의 subscribe session outbound_srtp로 SRTCP encrypt
+            let encrypted = {
+                let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
+                match ctx.encrypt_rtcp(plaintext) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if is_detail {
+                            debug!("[DBG:RTCP:PUB] relay encrypt FAILED → user={}: {e}", target.user_id);
+                        }
+                        continue;
+                    }
+                }
+            };
+
+            if let Err(e) = self.socket.send_to(&encrypted, addr).await {
+                if is_detail {
+                    debug!("[DBG:RTCP:PUB] relay send FAILED → user={} addr={}: {e}", target.user_id, addr);
+                }
+            } else {
+                relay_count += 1;
+            }
+        }
+
+        if is_detail {
+            debug!("[DBG:RTCP:PUB] SR relay user={} pt={} relayed_to={}",
+                sender.user_id, first_pt, relay_count);
         }
     }
 }
@@ -652,6 +784,88 @@ fn parse_rtcp_nack(buf: &[u8]) -> Vec<NackItem> {
     }
 
     items
+}
+
+// ============================================================================
+// Compound RTCP 파싱 + 분리 (Phase C-2)
+// ============================================================================
+
+/// Compound RTCP 파싱 결과
+struct CompoundRtcpParsed {
+    /// NACK 블록 (PT=205): 서버에서 RTX 처리
+    nack_blocks: Vec<Vec<u8>>,
+    /// 릴레이 대상 블록 (RR, PLI, REMB 등): publisher로 전달
+    relay_blocks: Vec<RtcpBlockRef>,
+}
+
+/// Compound 내 개별 RTCP 블록 참조 (offset + length + media_ssrc)
+struct RtcpBlockRef {
+    offset: usize,
+    length: usize,
+    /// RTCP 내 media source SSRC (RR/PLI/REMB: bytes 8-11)
+    media_ssrc: u32,
+}
+
+/// Compound RTCP를 순회하며 NACK / relay 대상으로 분류
+///
+/// - PT=205 FMT=1 (Generic NACK): nack_blocks로 분리 (서버 처리)
+/// - PT=201 (RR), PT=206 FMT=1 (PLI), PT=206 FMT=15 (REMB): relay_blocks로 수집
+/// - 그 외: 무시
+fn split_compound_rtcp(buf: &[u8]) -> CompoundRtcpParsed {
+    let mut result = CompoundRtcpParsed {
+        nack_blocks: Vec::new(),
+        relay_blocks: Vec::new(),
+    };
+
+    let mut offset = 0;
+    while offset + 4 <= buf.len() {
+        let fmt = buf[offset] & 0x1F;
+        let pt  = buf[offset + 1];
+        let length_words = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        let pkt_len = (length_words + 1) * 4;
+
+        if pkt_len == 0 || offset + pkt_len > buf.len() { break; }
+
+        // media_ssrc: 대부분 RTCP에서 bytes 8-11 (패킷 내 2번째 SSRC)
+        let media_ssrc = if offset + 12 <= buf.len() {
+            u32::from_be_bytes([
+                buf[offset + 8], buf[offset + 9],
+                buf[offset + 10], buf[offset + 11],
+            ])
+        } else {
+            0
+        };
+
+        if pt == config::RTCP_PT_NACK && fmt == config::RTCP_FMT_NACK {
+            // NACK: 별도 복사하여 nack_blocks에 저장
+            result.nack_blocks.push(buf[offset..offset + pkt_len].to_vec());
+        } else if pt == config::RTCP_PT_RR
+            || (pt == config::RTCP_PT_PSFB && fmt == config::RTCP_FMT_PLI)
+            || (pt == config::RTCP_PT_PSFB && fmt == config::RTCP_FMT_REMB)
+        {
+            // 릴레이 대상: RR, PLI, REMB
+            result.relay_blocks.push(RtcpBlockRef {
+                offset,
+                length: pkt_len,
+                media_ssrc,
+            });
+        }
+        // 그 외 (SR 등 subscribe에서 오는 것): 무시
+
+        offset += pkt_len;
+    }
+
+    result
+}
+
+/// 릴레이 대상 RTCP 블록들을 하나의 compound 패킷으로 재조립
+fn assemble_compound(blocks: &[&[u8]]) -> Vec<u8> {
+    let total: usize = blocks.iter().map(|b| b.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for block in blocks {
+        buf.extend_from_slice(block);
+    }
+    buf
 }
 
 /// NACK PID + BLP → 손실 seq 목록 확장
@@ -747,11 +961,6 @@ fn parse_rtp_header(buf: &[u8]) -> RtpHeader {
         ssrc:       u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
         header_len: 12 + cc * 4,
     }
-}
-
-fn parse_ssrc(buf: &[u8]) -> u32 {
-    if buf.len() < 8 { return 0; }
-    u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])
 }
 
 // ============================================================================

@@ -53,6 +53,18 @@ pub const RTCP_PT_NACK: u8 = 205;
 /// NACK feedback message type (FMT=1)
 pub const RTCP_FMT_NACK: u8 = 1;
 
+// --- RTCP Transparent Relay (Phase C-2) ---
+/// Sender Report
+pub const RTCP_PT_SR: u8 = 200;
+/// Receiver Report
+pub const RTCP_PT_RR: u8 = 201;
+/// Payload-Specific Feedback (PLI, REMB 등)
+pub const RTCP_PT_PSFB: u8 = 206;
+/// PLI feedback message type (FMT=1)
+pub const RTCP_FMT_PLI: u8 = 1;
+/// REMB feedback message type (FMT=15)
+pub const RTCP_FMT_REMB: u8 = 15;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;

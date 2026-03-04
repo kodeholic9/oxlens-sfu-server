@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.2] - 2026-03-04
+
+### Added (Phase C-2: RTCP Transparent Relay)
+
+#### C-2a. Publish RTCP (SR) → subscriber fan-out (`udp.rs`)
+- Publish PC에서 수신된 RTCP compound를 decrypt 후 모든 subscriber의 subscribe PC로 릴레이
+- `relay_publish_rtcp()` — compound 통째로 전달 (NACK 없으므로 분리 불필요)
+- RTP relay와 동일한 fan-out 패턴 (encrypt_rtcp → send_to)
+
+#### C-2b/c/d. Subscribe RTCP (RR/PLI/REMB) → publisher relay (`udp.rs`)
+- `split_compound_rtcp()` — compound RTCP 순회, NACK/relay 대상 분류
+  - PT=205 (NACK): 기존 서버 RTX 처리 유지
+  - PT=201 (RR), PT=206 FMT=1 (PLI), PT=206 FMT=15 (REMB): relay 대상
+- media_ssrc 기반 publisher 매핑 → publisher별 RTCP compound 재조립
+- `assemble_compound()` — relay 블록들을 compound로 이어붙임
+- publisher의 publish PC outbound_srtp로 encrypt → send_to
+
+#### 리팩터링
+- `handle_subscribe_rtcp()` 전면 리팩터링 (compound 파싱 → 분기)
+- `handle_nack_block()` — 기존 NACK→RTX 로직을 별도 메서드로 추출
+- 미사용 `parse_ssrc()` 함수 제거
+
+### Added (config.rs)
+- `RTCP_PT_SR` (200), `RTCP_PT_RR` (201), `RTCP_PT_PSFB` (206)
+- `RTCP_FMT_PLI` (1), `RTCP_FMT_REMB` (15)
+
+### 목적
+- Chrome congestion control에 SR/RR 피드백 제공 → 비트레이트 적응 개선
+- 클라이언트 발 PLI/REMB → publisher 전달 → 화질/대역폭 제어 루프 완성
+- NACK은 기존대로 서버에서 RTX 처리 (릴레이 안 함)
+
 ## [0.2.1] - 2026-03-04
 
 ### Added (Phase D: Hardening — 인증 제외)

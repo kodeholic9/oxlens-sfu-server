@@ -103,10 +103,10 @@
 - [ ] subscribe PC 사전 생성 옵션 검토 (joinRoom 시점)
 
 ## Phase C: RTCP + 안정화
-- [ ] RTCP SR/RR transparent relay
-- [ ] NACK 수신 → 원본 송신자에게 전달
-- [ ] REMB 처리 (대역폭 추정 전달)
-- [ ] PLI 클라이언트 발 → 해당 publisher에 전달
+- [x] RTCP SR/RR transparent relay — v0.2.2
+- [x] NACK 수신 → 서버에서 RTX 재전송 — v0.2.0
+- [x] REMB 처리 (대역폭 추정 전달) — v0.2.2
+- [x] PLI 클라이언트 발 → 해당 publisher에 전달 — v0.2.2
 - [ ] mute/unmute 이벤트 처리 (포워딩 중단/재개)
 - [ ] VP8 키프레임 캠시 (LRU) 검토
   - RTP payload에서 VP8 I-frame 감지 (RFC 7741 descriptor + bit0)
