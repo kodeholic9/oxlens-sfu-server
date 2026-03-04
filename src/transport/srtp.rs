@@ -74,6 +74,16 @@ impl SrtpContext {
                 .map_err(|e| SrtpError::EncryptFailed(e.to_string())),
         }
     }
+
+    pub fn encrypt_rtcp(&mut self, packet: &[u8]) -> Result<Vec<u8>, SrtpError> {
+        match &mut self.inner {
+            None => Err(SrtpError::KeyNotInstalled),
+            Some(ctx) => ctx
+                .encrypt_rtcp(packet)
+                .map(|b: bytes::Bytes| b.to_vec())
+                .map_err(|e| SrtpError::EncryptFailed(e.to_string())),
+        }
+    }
 }
 
 impl Default for SrtpContext {

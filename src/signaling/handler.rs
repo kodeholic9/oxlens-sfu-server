@@ -326,7 +326,7 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
                 "port": config::UDP_PORT,
             },
             "dtls": {
-                "fingerprint": format!("sha-256 {}", state.cert.fingerprint),
+                "fingerprint": state.cert.fingerprint,
                 "setup": "passive",
             },
             "codecs": server_codec_policy(),

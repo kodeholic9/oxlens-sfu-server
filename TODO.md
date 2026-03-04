@@ -61,27 +61,57 @@
 - [x] transport/sdp.rs 삭제
 - [x] Router 제거 (sockaddr 기반 직접 릴레이)
 
-## Phase A-2: 클라이언트 SdpBuilder
-- [ ] SdpBuilder JS 모듈 개발
-  - [ ] buildPublishRemoteSdp(serverConfig) → recvonly fake SDP
-  - [ ] buildSubscribeRemoteSdp(serverConfig, tracks[]) → sendonly × N fake SDP
-  - [ ] updateSubscribeRemoteSdp(기존 SDP, 추가/제거 트랙)
-- [ ] SdpBuilder 유닛테스트 (서버 없이 순수 입출력 검증)
-- [ ] 클라이언트 PC 관리 (publish PC + subscribe PC 생성/연결)
-- [ ] tracks_update 수신 → subscribe PC re-negotiation
+## Phase A-2: 클라이언트 SdpBuilder ✅ (v0.1.6)
+- [x] SdpBuilder JS 모듈 개발 (sdp-builder.mjs)
+  - [x] buildPublishRemoteSdp(serverConfig) → recvonly fake SDP
+  - [x] buildSubscribeRemoteSdp(serverConfig, tracks[]) → sendonly × N fake SDP
+  - [x] updateSubscribeRemoteSdp(serverConfig, allTracks) → re-nego용 전체 재조립
+  - [x] validateSdp(sdp) → 디버깅용 구조 검증
+- [x] SdpBuilder 유닛테스트 74개 전부 통과
+- [x] livechat-sdk.js v2.0.0 (2PC/SDP-free 전환)
+  - [x] _pubPc + _subPc 2개 PC 관리
+  - [x] PUBLISH_TRACKS로 SSRC 서버 등록
+  - [x] tracks_update 수신 → subscribe PC re-negotiation
+- [x] handler.rs fingerprint 중복 접두어 버그 수정
+- [x] 브라우저 E2E 테스트 성공 (양방향 RTP, lost=0, jitter<0.003)
 
-## Phase B: 통합 테스트
-- [ ] 1:1 audio 통화 확인
-- [ ] 1:1 video 통화 확인
-- [ ] 3명 conference (audio + video)
-- [ ] 참가자 입퇴장 시 subscribe re-negotiation 확인
+## Phase A-3: PLI 키프레임 요청 ✅ (v0.1.7)
+> 원인: 새 구독자 입장 시 VP8 키프레임 없이 P-frame만 수신 → Chrome 디코더 10~20초 대기
+> 해결: subscribe SRTP ready 시점에 publisher에게 RTCP PLI 전송
+
+### 서버 (light-livechat)
+- [x] RTCP PLI 패킷 생성 함수 (12바이트 고정, RFC 4585)
+  - FMT=1, PT=206, SSRC of sender=0, SSRC of media=publisher의 video SSRC
+- [x] SrtpContext.encrypt_rtcp() 추가
+- [x] PLI를 SRTP 암호화하여 publisher의 publish addr로 전송
+- [x] subscribe SRTP ready 이벤트 시점에 PLI 트리거
+  - udp.rs: DTLS handshake 완료 → PcType::Subscribe인 경우
+  - 해당 room의 모든 다른 참가자(publisher)에게 PLI 전송
+- [ ] PUBLISH_TRACKS 수신 시점에도 기존 구독자에게 PLI 전송 (late join) — Phase B에서
+
+### 검증
+- [ ] 서버 로그에 [DBG:PLI] 태그로 PLI 전송 확인
+- [ ] 브라우저 E2E: B 입장 후 1~2초 이내 비디오 표시 확인
+- [ ] 기존 기능 회귀 테스트 (audio relay, 정상 퇴장 등)
+
+## Phase B: 통합 테스트 + 다중 참가자
+- [ ] 3명 이상 동시 접속 테스트
+- [ ] 참가자 중간 퇴장 → inactive m-line 처리 확인
+- [ ] 재입장 → 슬롯 재활용 확인
+- [ ] app.js tryAttachRemoteVideo() 다중 참가자 대응 개선
+- [ ] subscribe PC 사전 생성 옵션 검토 (joinRoom 시점)
 
 ## Phase C: RTCP + 안정화
-- [ ] RTCP 릴레이 (SR/RR transparent relay)
-- [ ] NACK 처리 (수신 → 송신자에게 전달)
-- [ ] PLI 생성/전달 (새 참가자 입장 시 키프레임 요청)
+- [ ] RTCP SR/RR transparent relay
+- [ ] NACK 수신 → 원본 송신자에게 전달
 - [ ] REMB 처리 (대역폭 추정 전달)
+- [ ] PLI 클라이언트 발 → 해당 publisher에 전달
 - [ ] mute/unmute 이벤트 처리 (포워딩 중단/재개)
+- [ ] VP8 키프레임 캠시 (LRU) 검토
+  - RTP payload에서 VP8 I-frame 감지 (RFC 7741 descriptor + bit0)
+  - publisher별 마지막 키프레임 RTP 패킷 묶음(same timestamp) 캐시
+  - 새 구독자 입장 시 캐시된 키프레임 즉시 전달 (PLI 왕복 없이 200ms 이내)
+  - seq/timestamp rewrite 필요 — 복잡도 높음, 성능 효과 측정 후 결정
 
 ## Phase D: Hardening
 - [ ] IDENTIFY token verification (JWT or shared secret)

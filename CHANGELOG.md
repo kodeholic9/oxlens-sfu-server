@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.7] - 2026-03-04
+
+### Added (Phase A-3: PLI Keyframe Request)
+- `build_pli(media_ssrc)` — RTCP PLI 패킷 빌더 (12바이트 고정, RFC 4585)
+- `SrtpContext::encrypt_rtcp()` — SRTCP 암호화 메서드 추가
+- `send_pli_to_publishers()` — room 내 모든 publisher에게 PLI 전송
+- Subscribe PC SRTP ready 시점에 자동 PLI 트리거 (udp.rs DTLS 핸드셰이크 완료 콜백)
+- `start_dtls_handshake()` spawn에 socket + room_hub 전달 (PLI 전송용)
+- `[DBG:PLI]` 로그 태그 추가
+
+### 목적
+- 새 구독자 입장 시 VP8 키프레임 대기 10~20초 → 1~2초로 단축
+- publisher 브라우저에 PLI 전송 → 즉시 키프레임 생성 → 서버 relay → 구독자 디코더 시작
+
 ## [0.1.5] - 2026-03-04
 
 ### Changed (Phase A-1: 2PC / SDP-free Architecture)

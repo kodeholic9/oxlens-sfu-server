@@ -226,6 +226,8 @@ impl UdpTransport {
         self.dtls_map.insert(remote, tx);
 
         let cert = Arc::clone(&self.cert);
+        let socket = Arc::clone(&self.socket);
+        let room_hub = Arc::clone(&self.room_hub);
 
         tokio::spawn(async move {
             info!("[DBG:DTLS] handshake starting user={} pc={} addr={}",
@@ -252,6 +254,15 @@ impl UdpTransport {
                             );
                             info!("[DBG:DTLS] SRTP ready user={} pc={} addr={}",
                                 participant.user_id, pc_type, remote);
+
+                            // Subscribe SRTP ready → PLI to all publishers in room
+                            if pc_type == PcType::Subscribe {
+                                if let Ok(room) = room_hub.get(&participant.room_id) {
+                                    info!("[DBG:PLI] subscribe ready, requesting keyframes user={}",
+                                        participant.user_id);
+                                    send_pli_to_publishers(&socket, &room, &participant.user_id).await;
+                                }
+                            }
                         }
                         Err(e) => {
                             error!("[DBG:DTLS] SRTP key export FAILED user={} pc={}: {e}",
@@ -472,4 +483,88 @@ fn parse_rtp_header(buf: &[u8]) -> RtpHeader {
 fn parse_ssrc(buf: &[u8]) -> u32 {
     if buf.len() < 8 { return 0; }
     u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])
+}
+
+// ============================================================================
+// RTCP PLI builder (RFC 4585, 12 bytes fixed)
+// ============================================================================
+//
+//  0               1               2               3
+//  0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |V=2|P| FMT=1  |   PT=206      |          length=2             |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                  SSRC of packet sender (0)                   |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                  SSRC of media source                        |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+fn build_pli(media_ssrc: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    // V=2, P=0, FMT=1 → 0b10_0_00001 = 0x81
+    buf[0] = 0x81;
+    // PT=206 (PSFB)
+    buf[1] = 206;
+    // length=2 (in 32-bit words minus 1)
+    buf[2] = 0;
+    buf[3] = 2;
+    // SSRC of sender = 0 (server doesn't have its own SSRC)
+    // buf[4..8] already 0
+    // SSRC of media source
+    buf[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    buf
+}
+
+/// Subscribe SRTP ready 시 해당 room의 모든 publisher에게 PLI 전송
+async fn send_pli_to_publishers(
+    socket: &UdpSocket,
+    room: &crate::room::room::Room,
+    exclude_user: &str,
+) {
+    use crate::room::participant::TrackKind;
+
+    for entry in room.participants.iter() {
+        let publisher = entry.value();
+        if publisher.user_id == exclude_user { continue; }
+        if !publisher.is_publish_ready() { continue; }
+
+        let pub_addr = match publisher.publish.get_address() {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // publisher의 video 트랙 SSRC 찾기
+        let video_ssrc = {
+            let tracks = publisher.tracks.lock().unwrap();
+            tracks.iter()
+                .find(|t| t.kind == TrackKind::Video)
+                .map(|t| t.ssrc)
+        };
+
+        let ssrc = match video_ssrc {
+            Some(s) => s,
+            None => continue, // video 트랙 없으면 skip
+        };
+
+        let pli_plain = build_pli(ssrc);
+
+        // SRTCP 암호화 (publisher의 publish session outbound context)
+        let encrypted = {
+            let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
+            match ctx.encrypt_rtcp(&pli_plain) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("[DBG:PLI] encrypt FAILED → user={}: {e}", publisher.user_id);
+                    continue;
+                }
+            }
+        };
+
+        if let Err(e) = socket.send_to(&encrypted, pub_addr).await {
+            warn!("[DBG:PLI] send FAILED → user={} addr={}: {e}", publisher.user_id, pub_addr);
+        } else {
+            info!("[DBG:PLI] sent → user={} ssrc=0x{:08X} addr={}",
+                publisher.user_id, ssrc, pub_addr);
+        }
+    }
 }
