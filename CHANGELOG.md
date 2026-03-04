@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.1] - 2026-03-04
+
+### Added (Phase D: Hardening — 인증 제외)
+
+#### D-1. Heartbeat timeout → disconnect (`handler.rs`)
+- WS select 루프에 `interval_at` 타이머 추가 (30초 주기 체크)
+- `last_activity: Instant` — 모든 WS 메시지 수신 시 갱신
+- 90초 무활동 → `warn!` 로그 + break → cleanup 실행
+- HEARTBEAT 핸들러에서 `participant.touch()` 호출 (zombie reaper 연동)
+
+#### D-2. Zombie session reaper (`lib.rs` + `room.rs`)
+- `RoomHub::reap_zombies(now_ms, timeout_ms)` — 전체 room 순회, `last_seen + 120s < now` 좀비 판별
+- `run_zombie_reaper()` — 30초 주기 백그라운드 태스크, CancellationToken 연동
+- 좀비 제거 시 남은 참가자에게 `tracks_update(remove)` + `participant_left` 브로드캐스트
+- DTLS 미완료 상태 좀비도 동일 경로로 커버 (D-3 포함)
+
+#### D-4. Graceful shutdown (`lib.rs`)
+- `CancellationToken` 패턴 (tokio-util)
+- `Ctrl+C` → axum `with_graceful_shutdown` + reaper cancel
+- 3초 drain 대기 후 종료
+
+#### D-5. 로그 레벨 정리 (`udp.rs` + `lib.rs`)
+- hot-path detail 로그: `info!` → `debug!` (RTP, RELAY, RTCP, NACK, RTX)
+- summary 로그: `info!` → `trace!`
+- 기본 로그 레벨: `debug` → `info` (`RUST_LOG=light_livechat=debug`로 전환 가능)
+- 운영 필수(연결/해제, STUN latch, DTLS 핸드셰이크, PLI, 에러)만 `info!` 유지
+
+### Added (config.rs)
+- `REAPER_INTERVAL_MS` (30,000) — 좀비 검사 주기
+- `ZOMBIE_TIMEOUT_MS` (120,000) — 좀비 판정 시간 (WS 90s + 마진 30s)
+- `SHUTDOWN_DRAIN_MS` (3,000) — graceful shutdown drain 대기
+
+### Added (dependencies)
+- `tokio-util = "0.7"` (CancellationToken)
+
 ## [0.2.0] - 2026-03-04
 
 ### Added (Phase C: NACK-based RTX Retransmission)

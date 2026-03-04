@@ -20,6 +20,7 @@ use axum::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, interval_at};
 use tracing::{debug, info, warn};
 
 use crate::config;
@@ -94,6 +95,12 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         return;
     }
 
+    // Heartbeat timeout tracking
+    let mut last_activity = Instant::now();
+    let hb_timeout = Duration::from_millis(config::HEARTBEAT_TIMEOUT_MS);
+    let check_interval = Duration::from_millis(config::HEARTBEAT_INTERVAL_MS);
+    let mut hb_timer = interval_at(Instant::now() + check_interval, check_interval);
+
     loop {
         tokio::select! {
             Some(json) = ws_rx.recv() => {
@@ -104,6 +111,7 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        last_activity = Instant::now();
                         let text_str: &str = &text;
                         match serde_json::from_str::<Packet>(text_str) {
                             Ok(packet) => {
@@ -118,7 +126,14 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(e)) => { warn!("ws error: {e}"); break; }
-                    _ => {}
+                    _ => { last_activity = Instant::now(); }
+                }
+            }
+            _ = hb_timer.tick() => {
+                if last_activity.elapsed() > hb_timeout {
+                    warn!("heartbeat timeout user={:?} elapsed={:.1}s",
+                        session.user_id, last_activity.elapsed().as_secs_f32());
+                    break;
                 }
             }
         }
@@ -151,7 +166,17 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
     }
 
     match packet.op {
-        opcode::HEARTBEAT       => Some(Packet::ok(opcode::HEARTBEAT, packet.pid, serde_json::json!({}))),
+        opcode::HEARTBEAT       => {
+            // 좀비 reaper용 last_seen 갱신 (room 에 있는 경우)
+            if let (Some(room_id), Some(user_id)) = (&session.current_room, &session.user_id) {
+                if let Ok(room) = state.rooms.get(room_id) {
+                    if let Some(p) = room.get_participant(user_id) {
+                        p.touch(current_ts());
+                    }
+                }
+            }
+            Some(Packet::ok(opcode::HEARTBEAT, packet.pid, serde_json::json!({})))
+        }
         opcode::IDENTIFY        => Some(handle_identify(session, state, &packet)),
         opcode::ROOM_LIST       => Some(handle_room_list(state, &packet)),
         opcode::ROOM_CREATE     => Some(handle_room_create(state, &packet)),

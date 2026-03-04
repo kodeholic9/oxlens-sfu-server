@@ -16,6 +16,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, trace, warn};
+// 로그 레벨 정책:
+//   info!  = 운영 필수 (연결/해제, 에러, 상태 전환)
+//   debug! = 진단용 상세 (패킷 단위 로그 앞 50건)
+//   trace! = 패킷 레벨 상세 (요약 로그 포함)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -289,7 +293,7 @@ impl UdpTransport {
                 }
             }
 
-            debug!("[DBG:DTLS] session ended user={} pc={} addr={}",
+            trace!("[DBG:DTLS] session ended user={} pc={} addr={}",
                 participant.user_id, pc_type, remote);
         });
     }
@@ -306,7 +310,7 @@ impl UdpTransport {
             Some(r) => r,
             None => {
                 if seq_num < config::DBG_DETAIL_LIMIT {
-                    info!("[DBG:RTP] from unknown addr={} srtp_len={}", remote, buf.len());
+                    debug!("[DBG:RTP] from unknown addr={} srtp_len={}", remote, buf.len());
                 }
                 return;
             }
@@ -322,7 +326,7 @@ impl UdpTransport {
 
         if !sender.publish.is_media_ready() {
             if seq_num < config::DBG_DETAIL_LIMIT {
-                info!("[DBG:RTP] before DTLS complete user={} addr={}", sender.user_id, remote);
+                debug!("[DBG:RTP] before DTLS complete user={} addr={}", sender.user_id, remote);
             }
             return;
         }
@@ -339,13 +343,13 @@ impl UdpTransport {
             match ctx.decrypt_rtcp(buf) {
                 Ok(plain) => {
                     if seq_num < config::DBG_DETAIL_LIMIT {
-                        info!("[DBG:RTCP] user={} pt={} ssrc=0x{:08X} srtp_len={} plain_len={}",
+                        debug!("[DBG:RTCP] user={} pt={} ssrc=0x{:08X} srtp_len={} plain_len={}",
                             sender.user_id, rtcp_pt, rtcp_ssrc, buf.len(), plain.len());
                     }
                 }
                 Err(e) => {
                     if seq_num < config::DBG_DETAIL_LIMIT {
-                        info!("[DBG:RTCP] decrypt FAILED user={} pt={} ssrc=0x{:08X}: {e}",
+                        debug!("[DBG:RTCP] decrypt FAILED user={} pt={} ssrc=0x{:08X}: {e}",
                             sender.user_id, rtcp_pt, rtcp_ssrc);
                     }
                 }
@@ -360,7 +364,7 @@ impl UdpTransport {
                 Ok(p) => p,
                 Err(e) => {
                     if seq_num < config::DBG_DETAIL_LIMIT {
-                        info!("[DBG:RTP] decrypt FAILED user={} addr={} srtp_len={}: {e}",
+                        debug!("[DBG:RTP] decrypt FAILED user={} addr={} srtp_len={}: {e}",
                             sender.user_id, remote, buf.len());
                     }
                     return;
@@ -382,12 +386,12 @@ impl UdpTransport {
         }
 
         if is_detail {
-            info!("[DBG:RTP] #{} user={} ssrc=0x{:08X} pt={} seq={} ts={} marker={} payload_len={}",
+            debug!("[DBG:RTP] #{} user={} ssrc=0x{:08X} pt={} seq={} ts={} marker={} payload_len={}",
                 seq_num, sender.user_id,
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq, rtp_hdr.timestamp,
                 rtp_hdr.marker, plaintext.len().saturating_sub(rtp_hdr.header_len));
         } else if is_summary {
-            info!("[DBG:RTP] summary #{} user={} last_ssrc=0x{:08X} last_pt={} last_seq={}",
+            trace!("[DBG:RTP] summary #{} user={} last_ssrc=0x{:08X} last_pt={} last_seq={}",
                 seq_num, sender.user_id,
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
         }
@@ -401,7 +405,7 @@ impl UdpTransport {
                 .map(|t| format!("{}@{}", t.user_id, t.subscribe.get_address()
                     .map(|a| a.to_string()).unwrap_or("none".into())))
                 .collect();
-            info!("[DBG:RELAY] #{} from={} targets=[{}]",
+            debug!("[DBG:RELAY] #{} from={} targets=[{}]",
                 seq_num, sender.user_id, target_info.join(", "));
         }
 
@@ -421,7 +425,7 @@ impl UdpTransport {
                     Ok(p) => p,
                     Err(e) => {
                         if is_detail {
-                            info!("[DBG:RELAY] encrypt FAILED → user={}: {e}", target.user_id);
+                            debug!("[DBG:RELAY] encrypt FAILED → user={}: {e}", target.user_id);
                         }
                         continue;
                     }
@@ -430,19 +434,19 @@ impl UdpTransport {
 
             if let Err(e) = self.socket.send_to(&encrypted, addr).await {
                 if is_detail {
-                    info!("[DBG:RELAY] send FAILED → user={} addr={}: {e}", target.user_id, addr);
+                    debug!("[DBG:RELAY] send FAILED → user={} addr={}: {e}", target.user_id, addr);
                 }
             } else {
                 relay_count += 1;
                 if is_detail {
-                    info!("[DBG:RELAY] #{} → user={} addr={} enc_len={}",
+                    debug!("[DBG:RELAY] #{} → user={} addr={} enc_len={}",
                         seq_num, target.user_id, addr, encrypted.len());
                 }
             }
         }
 
         if is_summary {
-            info!("[DBG:RELAY] summary #{} from={} ssrc=0x{:08X} relayed_to={}",
+            trace!("[DBG:RELAY] summary #{} from={} ssrc=0x{:08X} relayed_to={}",
                 seq_num, sender.user_id, rtp_hdr.ssrc, relay_count);
         }
     }
@@ -482,7 +486,7 @@ impl UdpTransport {
                 Ok(p) => p,
                 Err(e) => {
                     if is_detail {
-                        info!("[DBG:NACK] SRTCP decrypt FAILED user={} addr={}: {e}",
+                        debug!("[DBG:NACK] SRTCP decrypt FAILED user={} addr={}: {e}",
                             subscriber.user_id, remote);
                     }
                     return;
@@ -505,7 +509,7 @@ impl UdpTransport {
             let lost_seqs = expand_nack(nack.pid, nack.blp);
 
             if is_detail {
-                info!("[DBG:NACK] user={} media_ssrc=0x{:08X} pid={} blp=0x{:04X} seqs={:?}",
+                debug!("[DBG:NACK] user={} media_ssrc=0x{:08X} pid={} blp=0x{:04X} seqs={:?}",
                     subscriber.user_id, nack.media_ssrc, nack.pid, nack.blp, lost_seqs);
             }
 
@@ -519,7 +523,7 @@ impl UdpTransport {
                 Some(p) => p,
                 None => {
                     if is_detail {
-                        info!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", nack.media_ssrc);
+                        debug!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", nack.media_ssrc);
                     }
                     continue;
                 }
@@ -534,7 +538,7 @@ impl UdpTransport {
                 Some(s) => s,
                 None => {
                     if is_detail {
-                        info!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", nack.media_ssrc);
+                        debug!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", nack.media_ssrc);
                     }
                     continue;
                 }
@@ -570,7 +574,7 @@ impl UdpTransport {
                         Ok(p) => p,
                         Err(e) => {
                             if is_detail {
-                                info!("[DBG:RTX] encrypt FAILED seq={}: {e}", lost_seq);
+                                debug!("[DBG:RTX] encrypt FAILED seq={}: {e}", lost_seq);
                             }
                             continue;
                         }
@@ -579,10 +583,10 @@ impl UdpTransport {
 
                 if let Err(e) = self.socket.send_to(&encrypted, sub_addr).await {
                     if is_detail {
-                        info!("[DBG:RTX] send FAILED seq={} addr={}: {e}", lost_seq, sub_addr);
+                        debug!("[DBG:RTX] send FAILED seq={} addr={}: {e}", lost_seq, sub_addr);
                     }
                 } else if is_detail {
-                    info!("[DBG:RTX] sent seq={} rtx_seq={} rtx_ssrc=0x{:08X} → user={} addr={}",
+                    debug!("[DBG:RTX] sent seq={} rtx_seq={} rtx_ssrc=0x{:08X} → user={} addr={}",
                         lost_seq, rtx_seq, rtx_ssrc, subscriber.user_id, sub_addr);
                 }
             }

@@ -9,6 +9,17 @@ pub const UDP_PORT: u16 = 19740;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 pub const HEARTBEAT_TIMEOUT_MS: u64 = 90_000;
 
+// --- Zombie reaper ---
+/// 좀비 세션 검사 주기 (ms)
+pub const REAPER_INTERVAL_MS: u64 = 30_000;
+/// 미디어/시그널링 무활동 좀비 판정 시간 (ms)
+/// HEARTBEAT_TIMEOUT_MS와 동일하게 유지 (WS 끊김 + UDP 무응답 모두 커버)
+pub const ZOMBIE_TIMEOUT_MS: u64 = 120_000;
+
+// --- Graceful shutdown ---
+/// shutdown 시 drain 대기 시간 (ms)
+pub const SHUTDOWN_DRAIN_MS: u64 = 3_000;
+
 // --- Room ---
 pub const ROOM_MAX_CAPACITY: usize = 20;
 pub const ROOM_DEFAULT_CAPACITY: usize = 10;

@@ -191,7 +191,7 @@ async-trait = "0.1"
 | B | Multi-party 스트림 매핑 + SDP mid 안정화 | 0.1.8 | ✅ |
 | B-2 | BUNDLE demux 수정 + inactive m-line 처리 | 0.1.9 | ✅ |
 | C | NACK 기반 RTX 재전송 (서버 캐시) | 0.2.0 | ✅ |
-| D | Hardening (인증, 좀비, 타임아웃) | - | |
+| D | Hardening (좀비/타임아웃/shutdown/로그, 인증 제외) | 0.2.1 | ✅ |
 | E | PTT 지원 | 0.2.0 | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -234,6 +234,14 @@ async-trait = "0.1"
 - 참가자별 `<audio>` 요소 독립 생성 (브라우저 자동 믹싱)
 - `_nextMid` 카운터: mid 순차 할당, 재사용 시 기존 mid 유지
 - inactive m-line: `active: false` + mid 보존 (SDP m-line 삭제 불가 규칙)
+
+### v0.2.1 — Hardening (Phase D, 인증 제외)
+- D-1: WS heartbeat timeout (90초 무활동 → 강제 종료 + cleanup)
+- D-2: Zombie reaper (30초 주기, last_seen + 120s 초과 시 제거 + broadcast)
+- D-3: DTLS 미완료 좀비도 reaper에 통합
+- D-4: Graceful shutdown (Ctrl+C → CancellationToken → 3s drain)
+- D-5: 로그 레벨 정리 (hot-path info→debug, summary→trace, 기본 info)
+- 의존성: `tokio-util = "0.7"` 추가
 
 ### v0.2.0 — NACK 기반 RTX 재전송 (Phase C)
 - 서버: `RtpCache` 링버퍼(128) + NACK 파싱(PT=205) + RTX 조립(RFC 4588, PT=97)

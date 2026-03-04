@@ -291,4 +291,43 @@ impl RoomHub {
         let (p, pc_type) = room.get_by_ufrag(ufrag)?;
         Some((p, pc_type, room))
     }
+
+    /// 좀비 세션 정리: last_seen + timeout < now 인 참가자 제거
+    /// 반환: (room_id, participant) 목록 (broadcast 용도)
+    pub fn reap_zombies(&self, now_ms: u64, timeout_ms: u64) -> Vec<(String, Arc<Participant>)> {
+        let mut reaped = Vec::new();
+
+        // 모든 room 순회
+        let room_ids: Vec<String> = self.rooms.iter()
+            .map(|e| e.key().clone())
+            .collect();
+
+        for room_id in &room_ids {
+            let room = match self.rooms.get(room_id) {
+                Some(r) => r.value().clone(),
+                None => continue,
+            };
+
+            // 좀비 판별: last_seen 기준
+            let zombie_ids: Vec<String> = room.participants.iter()
+                .filter(|entry| {
+                    let p = entry.value();
+                    let last = p.last_seen.load(std::sync::atomic::Ordering::Relaxed);
+                    last > 0 && now_ms.saturating_sub(last) > timeout_ms
+                })
+                .map(|entry| entry.key().clone())
+                .collect();
+
+            for user_id in zombie_ids {
+                match self.remove_participant(room_id, &user_id) {
+                    Ok(p) => {
+                        reaped.push((room_id.clone(), p));
+                    }
+                    Err(_) => {} // 이미 제거됨 (race)
+                }
+            }
+        }
+
+        reaped
+    }
 }

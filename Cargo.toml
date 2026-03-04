@@ -1,9 +1,13 @@
 [package]
 name = "light-livechat"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "High-performance SFU server — 2PC / SDP-free architecture"
 authors = ["kodeholic (powered by Claude)"]
+
+[[bin]]
+name = "livechatd"
+path = "src/main.rs"
 
 [dependencies]
 # async runtime
@@ -33,6 +37,7 @@ crc32fast = "1"
 
 # async
 async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # stream utilities
 futures-util = "0.3"
@@ -40,6 +45,7 @@ futures-util = "0.3"
 # logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
 
 # utils
 uuid = { version = "1", features = ["v4"] }

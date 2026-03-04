@@ -116,11 +116,11 @@
 
 ## Phase D: Hardening
 - [ ] IDENTIFY token verification (JWT or shared secret)
-- [ ] Zombie session reaper (last_seen timeout)
-- [ ] Heartbeat timeout → disconnect
-- [ ] DTLS handshake timeout cleanup
-- [ ] Graceful shutdown (drain connections)
-- [ ] Structured logging & metrics
+- [x] Zombie session reaper (last_seen timeout) — v0.2.1
+- [x] Heartbeat timeout → disconnect — v0.2.1
+- [x] DTLS handshake timeout cleanup (zombie reaper에 통합) — v0.2.1
+- [x] Graceful shutdown (drain connections) — v0.2.1
+- [x] Structured logging (info/debug/trace 레벨 정리) — v0.2.1
 
 ## Phase E: PTT Support
 - [ ] Room mode field (Conference / PTT)
