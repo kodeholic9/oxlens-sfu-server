@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.3] - 2026-03-05
+
+### Added (Phase T-4/5: 시계열 차트 + Contract + 스냅샷)
+
+#### 어드민
+- Canvas 시계열 차트 (3모드: 패킷 흐름/품질 지표/SFU 내부)
+- WebRTC Contract 체크리스트 (8항목, PASS/FAIL/WARN)
+- 스냅샷 내보내기 — 클립보드 복사 (Claude 분석용 텍스트)
+- SFU 패널 헤더에 Contract/스냅샷 버튼
+- 중앙 컨텐츠 상하 분할 (개요 테이블 + 시계열 차트)
+
+## [0.3.2] - 2026-03-05
+
+### Added (Phase T-3: 어드민 SFU 서버 패널)
+
+#### 어드민
+- `app.js`: `server_metrics` 타입 메시지 수신 처리 + `renderServerMetrics()`
+- `index.html`: 우측 컨텐츠에 SFU 서버 패널 (h=260px, 보라색 돈)
+- 타이밍 avg/max (ms), fan-out, RTCP 카운터, 실패 경고 표시
+
+## [0.3.1] - 2026-03-05
+
+### Added (Phase T-2: 서버 B구간 계측)
+
+#### 서버
+- `udp.rs`: `ServerMetrics` + `TimingStat` — relay/decrypt/encrypt/lock_wait 타이밍
+- `udp.rs`: RTCP 카운터 (nack_received, rtx_sent, rtx_cache_miss, pli_sent, sr_relayed, rr_relayed)
+- `udp.rs`: `run()` 루프 `tokio::select!` + 3초 타이머 → `flush_metrics()` → `admin_tx`
+- `udp.rs`: hot path 메서드 `&self` → `&mut self` (metrics 기록용)
+- `lib.rs`: `UdpTransport::from_socket()` 호출에 `admin_tx` 전달
+
+### 설계 결정
+- hot path에서 `Instant::now()` 만 사용 (allocation/Mutex 추가 없음)
+- `ServerMetrics`는 UdpTransport 내부 단일 소유 (concurrent access 무)
+- 3초 주기 flush 후 reset — 어드민이 담당 window 집계
+- p95는 histogram 없이 정확 계산 불가 → max를 대신 노출
+
+## [0.3.0] - 2026-03-05
+
+### Added (Phase T-1: Media Telemetry 1단계)
+
+#### 서버
+- `opcode.rs`: `TELEMETRY = 30` (클라이언트 → 서버 telemetry 보고)
+- `opcode.rs`: `ADMIN_TELEMETRY = 110` (서버 → 어드민, 향후 B구간용)
+- `state.rs`: `admin_tx: broadcast::Sender<String>` — 어드민 WS broadcast 채널
+- `handler.rs`: `handle_telemetry()` — 클라이언트 telemetry를 user_id/room_id 래핑하여 어드민으로 passthrough
+- `handler.rs`: `admin_ws_handler()` — `/admin/ws` 어드민 전용 WebSocket
+  - 접속 시 rooms/participants/tracks 스냅샷 전송
+  - 이후 telemetry 스트림 실시간 중계
+- `lib.rs`: `/admin/ws` 라우트 추가
+
+#### 클라이언트 SDK
+- `OP.TELEMETRY = 30` 추가
+- `_sendSdpTelemetry()` — 방 입장 2초 후 SDP 전문 + m-line 요약 보고 (구간 S-1)
+- `_parseMlineSummary()` — SDP에서 mid/kind/direction/codec/pt/ssrc 추출
+- `_startStatsMonitor()` → 3초 주기 telemetry 수집+서버 전송 (기존 콘솔 로그 대체)
+- `_collectPublishStats()` — 구간 A (outbound-rtp, candidate-pair)
+- `_collectSubscribeStats()` — 구간 C (inbound-rtp, candidate-pair)
+- `_collectCodecStats()` — 구간 S-2 (encoder/decoder 상태)
+
+#### 어드민 대시보드 (완전 재작성)
+- `/admin/ws` WebSocket 접속 + 자동 재연결
+- Room 목록 패널 (참가자 상태 배지)
+- 실시간 개요 테이블 (참가자/방향/kind/패킷/손실률/jitter/RTT/상태)
+- 참가자 상세 패널 (코덱, publish/subscribe 수치)
+- SDP 상태 패널 (m-line 요약)
+- 시계열 버퍼 저장 (최근 100건, 향후 차트용)
+
+### 설계 결정
+- telemetry는 응답 없음 (fire-and-forget) — 비즈니스 로직 오염 방지
+- admin broadcast channel (tokio::broadcast) — receiver 없으면 자동 버림
+- SDP 전문은 S-1에서만 1회 전송, 3초 주기에는 stats만
+
 ## [0.2.3] - 2026-03-04
 
 ### Added (Phase C-3: Mute/Unmute Signaling)

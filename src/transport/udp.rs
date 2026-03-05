@@ -14,7 +14,9 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
 // 로그 레벨 정책:
 //   info!  = 운영 필수 (연결/해제, 에러, 상태 전환)
@@ -32,6 +34,165 @@ use crate::transport::demux::{self, PacketType};
 use crate::transport::demux_conn::{DemuxConn, DtlsPacketTx};
 use crate::transport::dtls::{self, ServerCert};
 use crate::transport::stun;
+
+// ============================================================================
+// Server Metrics (B구간 계측 — atomic counters + timing accumulators)
+// ============================================================================
+
+/// 3초 주기 집계를 위한 타이밍 어퀴뮬레이터
+struct TimingStat {
+    sum_us: u64,
+    count:  u64,
+    min_us: u64,
+    max_us: u64,
+}
+
+impl TimingStat {
+    fn new() -> Self {
+        Self { sum_us: 0, count: 0, min_us: u64::MAX, max_us: 0 }
+    }
+
+    fn record(&mut self, us: u64) {
+        self.sum_us += us;
+        self.count += 1;
+        if us < self.min_us { self.min_us = us; }
+        if us > self.max_us { self.max_us = us; }
+    }
+
+    fn avg(&self) -> u64 {
+        if self.count == 0 { 0 } else { self.sum_us / self.count }
+    }
+
+    #[allow(dead_code)]
+    fn p95_approx(&self) -> u64 {
+        // 정확한 p95는 histogram 필요. 단순 근사: max * 0.95 또는 avg + (max-avg)*0.8
+        // 여기서는 max를 그대로 노출 (p95 대신 max 사용)
+        self.max_us
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        if self.count == 0 {
+            return serde_json::json!(null);
+        }
+        serde_json::json!({
+            "avg_us": self.avg(),
+            "min_us": if self.min_us == u64::MAX { 0 } else { self.min_us },
+            "max_us": self.max_us,
+            "count":  self.count,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.sum_us = 0;
+        self.count = 0;
+        self.min_us = u64::MAX;
+        self.max_us = 0;
+    }
+}
+
+struct ServerMetrics {
+    // B-1: relay total (decrypt ~ last send_to)
+    relay:          TimingStat,
+    // B-2: SRTP decrypt
+    decrypt:        TimingStat,
+    // B-3: SRTP encrypt (per target)
+    encrypt:        TimingStat,
+    // B-4: Mutex lock wait
+    lock_wait:      TimingStat,
+    // B-5: fan-out count per relay
+    fan_out_sum:    u64,
+    fan_out_count:  u64,
+    fan_out_min:    u32,
+    fan_out_max:    u32,
+    // B-6, B-7: encrypt/decrypt failures
+    encrypt_fail:   u64,
+    decrypt_fail:   u64,
+    // B-8~14: RTCP counters
+    nack_received:  u64,
+    rtx_sent:       u64,
+    rtx_cache_miss: u64,
+    pli_sent:       u64,
+    sr_relayed:     u64,
+    rr_relayed:     u64,
+    twcc_sent:      u64,
+}
+
+impl ServerMetrics {
+    fn new() -> Self {
+        Self {
+            relay:          TimingStat::new(),
+            decrypt:        TimingStat::new(),
+            encrypt:        TimingStat::new(),
+            lock_wait:      TimingStat::new(),
+            fan_out_sum:    0,
+            fan_out_count:  0,
+            fan_out_min:    u32::MAX,
+            fan_out_max:    0,
+            encrypt_fail:   0,
+            decrypt_fail:   0,
+            nack_received:  0,
+            rtx_sent:       0,
+            rtx_cache_miss: 0,
+            pli_sent:       0,
+            sr_relayed:     0,
+            rr_relayed:     0,
+            twcc_sent:      0,
+        }
+    }
+
+    fn record_fan_out(&mut self, count: u32) {
+        self.fan_out_sum += count as u64;
+        self.fan_out_count += 1;
+        if count < self.fan_out_min { self.fan_out_min = count; }
+        if count > self.fan_out_max { self.fan_out_max = count; }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let fan_out_avg = if self.fan_out_count == 0 { 0.0 }
+            else { self.fan_out_sum as f64 / self.fan_out_count as f64 };
+        serde_json::json!({
+            "type": "server_metrics",
+            "relay":          self.relay.to_json(),
+            "decrypt":        self.decrypt.to_json(),
+            "encrypt":        self.encrypt.to_json(),
+            "lock_wait":      self.lock_wait.to_json(),
+            "fan_out": {
+                "avg": format!("{:.1}", fan_out_avg),
+                "min": if self.fan_out_min == u32::MAX { 0 } else { self.fan_out_min },
+                "max": self.fan_out_max,
+            },
+            "encrypt_fail":   self.encrypt_fail,
+            "decrypt_fail":   self.decrypt_fail,
+            "nack_received":  self.nack_received,
+            "rtx_sent":       self.rtx_sent,
+            "rtx_cache_miss": self.rtx_cache_miss,
+            "pli_sent":       self.pli_sent,
+            "sr_relayed":     self.sr_relayed,
+            "rr_relayed":     self.rr_relayed,
+            "twcc_sent":      self.twcc_sent,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.relay.reset();
+        self.decrypt.reset();
+        self.encrypt.reset();
+        self.lock_wait.reset();
+        self.fan_out_sum = 0;
+        self.fan_out_count = 0;
+        self.fan_out_min = u32::MAX;
+        self.fan_out_max = 0;
+        self.encrypt_fail = 0;
+        self.decrypt_fail = 0;
+        self.nack_received = 0;
+        self.rtx_sent = 0;
+        self.rtx_cache_miss = 0;
+        self.pli_sent = 0;
+        self.sr_relayed = 0;
+        self.rr_relayed = 0;
+        self.twcc_sent = 0;
+    }
+}
 
 // ============================================================================
 // DTLS Session Map (addr → packet channel)
@@ -85,12 +246,15 @@ pub struct UdpTransport {
     dtls_map:     DtlsSessionMap,
     pkt_count:    u64,
     dbg_rtp_count: AtomicU64,
+    metrics:      ServerMetrics,
+    admin_tx:     broadcast::Sender<String>,
 }
 
 impl UdpTransport {
     pub async fn bind(
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
+        admin_tx: broadcast::Sender<String>,
     ) -> std::io::Result<Self> {
         let addr = SocketAddr::from(([0, 0, 0, 0], config::UDP_PORT));
         let socket = UdpSocket::bind(addr).await?;
@@ -103,6 +267,8 @@ impl UdpTransport {
             dtls_map: DtlsSessionMap::new(),
             pkt_count: 0,
             dbg_rtp_count: AtomicU64::new(0),
+            metrics: ServerMetrics::new(),
+            admin_tx,
         })
     }
 
@@ -111,6 +277,7 @@ impl UdpTransport {
         socket:   Arc<UdpSocket>,
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
+        admin_tx: broadcast::Sender<String>,
     ) -> Self {
         Self {
             socket,
@@ -119,34 +286,56 @@ impl UdpTransport {
             dtls_map: DtlsSessionMap::new(),
             pkt_count: 0,
             dbg_rtp_count: AtomicU64::new(0),
+            metrics: ServerMetrics::new(),
+            admin_tx,
         }
     }
 
     pub async fn run(mut self) {
         let mut buf = BytesMut::zeroed(config::UDP_RECV_BUF_SIZE);
 
+        // 3초 주기 metrics flush 타이머
+        let mut metrics_timer = tokio::time::interval(
+            tokio::time::Duration::from_secs(3),
+        );
+        metrics_timer.tick().await; // 첨 tick 소비
+
         loop {
-            let (len, remote) = match self.socket.recv_from(&mut buf).await {
-                Ok(r) => r,
-                Err(e) => { error!("UDP recv error: {e}"); continue; }
-            };
+            tokio::select! {
+                result = self.socket.recv_from(&mut buf) => {
+                    let (len, remote) = match result {
+                        Ok(r) => r,
+                        Err(e) => { error!("UDP recv error: {e}"); continue; }
+                    };
 
-            let data = Bytes::copy_from_slice(&buf[..len]);
+                    let data = Bytes::copy_from_slice(&buf[..len]);
 
-            match demux::classify(&data) {
-                PacketType::Stun => self.handle_stun(&data, remote).await,
-                PacketType::Dtls => self.handle_dtls(data, remote).await,
-                PacketType::Srtp => self.handle_srtp(&data, remote).await,
-                PacketType::Unknown => {
-                    trace!("unknown packet from {} byte0=0x{:02X}", remote, data[0]);
+                    match demux::classify(&data) {
+                        PacketType::Stun => self.handle_stun(&data, remote).await,
+                        PacketType::Dtls => self.handle_dtls(data, remote).await,
+                        PacketType::Srtp => self.handle_srtp(&data, remote).await,
+                        PacketType::Unknown => {
+                            trace!("unknown packet from {} byte0=0x{:02X}", remote, data[0]);
+                        }
+                    }
+
+                    self.pkt_count += 1;
+                    if self.pkt_count % 1000 == 0 {
+                        self.dtls_map.remove_stale();
+                    }
+                }
+                _ = metrics_timer.tick() => {
+                    self.flush_metrics();
                 }
             }
-
-            self.pkt_count += 1;
-            if self.pkt_count % 1000 == 0 {
-                self.dtls_map.remove_stale();
-            }
         }
+    }
+
+    /// 3초마다 metrics 집계 → admin_tx로 push → reset
+    fn flush_metrics(&mut self) {
+        let json = self.metrics.to_json();
+        let _ = self.admin_tx.send(json.to_string());
+        self.metrics.reset();
     }
 
     // ========================================================================
@@ -318,7 +507,8 @@ impl UdpTransport {
     // SRTP — hot path (media relay)
     // ========================================================================
 
-    async fn handle_srtp(&self, buf: &[u8], remote: SocketAddr) {
+    async fn handle_srtp(&mut self, buf: &[u8], remote: SocketAddr) {
+        let relay_start = Instant::now();
         let seq_num = self.dbg_rtp_count.fetch_add(1, Ordering::Relaxed);
 
         // O(1) lookup: addr → (participant, pc_type, room)
@@ -357,10 +547,17 @@ impl UdpTransport {
 
             // Decrypt SRTCP (publish session inbound)
             let plaintext = {
+                let lock_t = Instant::now();
                 let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
+                self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
+                let dec_t = Instant::now();
                 match ctx.decrypt_rtcp(buf) {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        self.metrics.decrypt.record(dec_t.elapsed().as_micros() as u64);
+                        p
+                    }
                     Err(e) => {
+                        self.metrics.decrypt_fail += 1;
                         if is_detail {
                             debug!("[DBG:RTCP:PUB] decrypt FAILED user={}: {e}", sender.user_id);
                         }
@@ -376,10 +573,17 @@ impl UdpTransport {
 
         // Decrypt SRTP → plaintext RTP (from publish session)
         let plaintext = {
+            let lock_t = Instant::now();
             let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
+            self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
+            let dec_t = Instant::now();
             match ctx.decrypt_rtp(buf) {
-                Ok(p) => p,
+                Ok(p) => {
+                    self.metrics.decrypt.record(dec_t.elapsed().as_micros() as u64);
+                    p
+                }
                 Err(e) => {
+                    self.metrics.decrypt_fail += 1;
                     if seq_num < config::DBG_DETAIL_LIMIT {
                         debug!("[DBG:RTP] decrypt FAILED user={} addr={} srtp_len={}: {e}",
                             sender.user_id, remote, buf.len());
@@ -437,10 +641,17 @@ impl UdpTransport {
             };
 
             let encrypted = {
+                let lock_t = Instant::now();
                 let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
+                self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
+                let enc_t = Instant::now();
                 match ctx.encrypt_rtp(&plaintext) {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        self.metrics.encrypt.record(enc_t.elapsed().as_micros() as u64);
+                        p
+                    }
                     Err(e) => {
+                        self.metrics.encrypt_fail += 1;
                         if is_detail {
                             debug!("[DBG:RELAY] encrypt FAILED → user={}: {e}", target.user_id);
                         }
@@ -462,6 +673,10 @@ impl UdpTransport {
             }
         }
 
+        // B구간 계측: fan-out count + relay total
+        self.metrics.record_fan_out(relay_count);
+        self.metrics.relay.record(relay_start.elapsed().as_micros() as u64);
+
         if is_summary {
             trace!("[DBG:RELAY] summary #{} from={} ssrc=0x{:08X} relayed_to={}",
                 seq_num, sender.user_id, rtp_hdr.ssrc, relay_count);
@@ -476,7 +691,7 @@ impl UdpTransport {
     /// - NACK (PT=205): 서버에서 RTX 재전송 (기존 Phase C 로직)
     /// - RR/PLI/REMB: 해당 publisher의 publish PC로 transparent relay
     async fn handle_subscribe_rtcp(
-        &self,
+        &mut self,
         buf: &[u8],
         remote: SocketAddr,
         subscriber: &Arc<crate::room::participant::Participant>,
@@ -517,6 +732,7 @@ impl UdpTransport {
         let parsed = split_compound_rtcp(&plaintext);
 
         // (1) NACK 처리 (RTX 재전송 — 기존 로직)
+        self.metrics.nack_received += parsed.nack_blocks.len() as u64;
         for nack_block in &parsed.nack_blocks {
             self.handle_nack_block(nack_block, subscriber, room, is_detail).await;
         }
@@ -524,6 +740,13 @@ impl UdpTransport {
         // (2) 릴레이 대상 RTCP (RR, PLI, REMB) → publisher별로 모아서 전송
         if parsed.relay_blocks.is_empty() {
             return;
+        }
+
+        // RR/PLI relay count
+        for block in &parsed.relay_blocks {
+            let pt = plaintext.get(block.offset + 1).map(|b| b & 0x7F).unwrap_or(0);
+            if pt == config::RTCP_PT_RR { self.metrics.rr_relayed += 1; }
+            if pt == config::RTCP_PT_PSFB { self.metrics.pli_sent += 1; }
         }
 
         // media_ssrc → publisher 매핑 + RTCP 블록 그룹핑
@@ -592,7 +815,7 @@ impl UdpTransport {
 
     /// 단일 NACK RTCP 블록 처리: 캐시 조회 → RTX 조립 → 전송
     async fn handle_nack_block(
-        &self,
+        &mut self,
         nack_data: &[u8],
         subscriber: &Arc<crate::room::participant::Participant>,
         room: &Arc<crate::room::room::Room>,
@@ -653,9 +876,13 @@ impl UdpTransport {
                 }).collect()
             };
 
-            if is_detail && rtx_packets.len() < lost_seqs.len() {
+            let cache_miss = lost_seqs.len() - rtx_packets.len();
+            self.metrics.rtx_cache_miss += cache_miss as u64;
+            self.metrics.rtx_sent += rtx_packets.len() as u64;
+
+            if is_detail && cache_miss > 0 {
                 trace!("[DBG:RTX] cache miss {}/{} seqs for ssrc=0x{:08X}",
-                    lost_seqs.len() - rtx_packets.len(), lost_seqs.len(), nack.media_ssrc);
+                    cache_miss, lost_seqs.len(), nack.media_ssrc);
             }
 
             for (lost_seq, rtx_seq, rtx_pkt) in &rtx_packets {
@@ -692,12 +919,13 @@ impl UdpTransport {
     /// SR 외 다른 RTCP도 함께 있을 수 있으나, compound 통째로 릴레이한다.
     /// (publish → subscribe 방향에는 NACK이 없으므로 분리 불필요)
     async fn relay_publish_rtcp(
-        &self,
+        &mut self,
         plaintext: &[u8],
         sender: &Arc<crate::room::participant::Participant>,
         room: &Arc<crate::room::room::Room>,
         is_detail: bool,
     ) {
+        self.metrics.sr_relayed += 1;
         // compound 내 첫 RTCP PT 로그용
         let first_pt = plaintext.get(1).map(|b| b & 0x7F).unwrap_or(0);
 

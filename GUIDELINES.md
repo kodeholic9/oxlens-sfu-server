@@ -165,6 +165,7 @@ async-trait = "0.1"
 | 16 | ICE_CANDIDATE | Trickle ICE (ICE-Lite에서 무시) |
 | 17 | MUTE_UPDATE | 트랙 mute/unmute 상태 변경 |
 | 20 | MESSAGE | 데이터 메시지 |
+| 30 | TELEMETRY | 클라이언트 telemetry 보고 (SDP/stats) |
 
 ### Server → Client
 | op | Name | 설명 |
@@ -174,6 +175,7 @@ async-trait = "0.1"
 | 101 | TRACK_EVENT | track_added / track_removed |
 | 102 | TRACK_STATE | 트랙 mute/unmute 상태 브로드캐스트 |
 | 103 | MESSAGE_EVENT | 메시지 릴레이 |
+| 110 | ADMIN_TELEMETRY | 서버 → 어드민 telemetry 중계 |
 
 ---
 
@@ -196,7 +198,11 @@ async-trait = "0.1"
 | C-2 | RTCP Transparent Relay (SR/RR/PLI/REMB) | 0.2.2 | ✅ |
 | C-3 | Mute/Unmute 시그널링 (MUTE_UPDATE/TRACK_STATE) | 0.2.3 | ✅ |
 | D | Hardening (좀비/타임아웃/shutdown/로그, 인증 제외) | 0.2.1 | ✅ |
-| E | PTT 지원 | 0.2.0 | |
+| T-1 | Media Telemetry 1단계 (SDP/클라이언트 수집 + 어드민 전달) | 0.3.0 | ✅ |
+| T-2 | Media Telemetry 2단계 (서버 B구간 계측) | 0.3.1 | ✅ |
+| T-3 | Media Telemetry 3단계 (어드민 SFU 서버 패널 + server_metrics 표시) | 0.3.2 | ✅ |
+| T-4/5 | Media Telemetry 4+5 (시계열 차트 + Contract + 스냅샷) | 0.3.3 | ✅ |
+| E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
 ---
@@ -270,6 +276,54 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.3.3 — 시계열 차트 + Contract + 스냅샷 (Phase T-4/5)
+- **어드민**: Canvas 시계열 차트 (3모드: 패킷 흐름, 품질 지표, SFU 내부)
+  - 패킷 흐름: pub/sub pps delta + 손실
+  - 품질 지표: jitter(ms) + JB delay(ms)
+  - SFU 내부: relay/decrypt/encrypt/lock_wait avg(ms) 시계열
+  - Y축 레이블, 그리드라인, 범례 표시
+- **어드민**: WebRTC Contract 체크리스트 (7항목 + TWCC 미구현 WARN)
+  - sdp_negotiation, encoder_healthy, sr_relay, rr_relay, nack_rtx, jitter_buffer, video_freeze, twcc
+  - ✅/❌/⚠️ 상태 + 상세 설명
+- **어드민**: 스냅샷 내보내기 — Claude 분석용 텍스트 포맷
+  - SDP STATE, ENCODER/DECODER, PUBLISH, SUBSCRIBE, NETWORK, SFU SERVER, CONTRACT CHECK
+  - 클립보드 복사 (플루백 포함)
+- SFU 패널 헤더에 Contract/스냅샷 버튼 추가
+
+### v0.3.2 — 어드민 SFU 서버 패널 (Phase T-3)
+- **어드민**: `server_metrics` 타입 메시지 수신 처리 + `renderServerMetrics()` 함수
+- **어드민 HTML**: 우측 컨텐츠에 "데이터 대기" SFU 서버 패널 추가
+- 타이밍 지표: relay/decrypt/encrypt/lock_wait (avg/max ms + count)
+- Fan-out: avg/min/max
+- RTCP 카운터: nack/rtx/miss/pli/SR/RR (3s window)
+- 실패 경고: encrypt_fail + decrypt_fail > 0 시 빨간 경고 표시
+- 임계값 색상: avg > 5ms 빨강, > 2ms 노란
+
+### v0.3.1 — 서버 B구간 계측 (Phase T-2)
+- **udp.rs**: `ServerMetrics` 구조체 — B-1~B-14 지표 수집
+  - `TimingStat`: sum/count/min/max 어퀴뮬레이터 (relay, decrypt, encrypt, lock_wait)
+  - RTCP 카운터: nack_received, rtx_sent, rtx_cache_miss, pli_sent, sr_relayed, rr_relayed
+  - fan_out: sum/count/min/max
+- **udp.rs**: hot path에 `Instant::now()` 기반 타이밍 삽입
+  - decrypt (RTP+RTCP), encrypt (per target), lock_wait (Mutex), relay total
+  - encrypt/decrypt 실패 카운트
+- **udp.rs**: `run()` 루프에 `tokio::select!` + 3초 타이머 → `flush_metrics()` → `admin_tx.send()`
+- **UdpTransport**: `admin_tx: broadcast::Sender<String>` 필드 추가
+- **lib.rs**: `from_socket()` 호출에 `admin_tx` 전달
+- `handle_srtp`, `handle_subscribe_rtcp`, `handle_nack_block`, `relay_publish_rtcp` → `&mut self`
+
+### v0.3.0 — Media Telemetry 1단계 (Phase T-1)
+- **서버**: OP_TELEMETRY(30) — 클라이언트 telemetry를 어드민으로 passthrough
+- **서버**: OP_ADMIN_TELEMETRY(110) — 어드민 전용 opcode (향후 서버 B구간용)
+- **서버**: AppState에 `admin_tx: broadcast::Sender<String>` 추가
+- **서버**: `/admin/ws` 어드민 WS 엔드포인트 (접속 시 rooms 스냅샷 + telemetry 스트림)
+- **SDK**: `_sendSdpTelemetry()` — 방 입장 2초 후 SDP 전문 + m-line 요약 보고 (구간 S-1)
+- **SDK**: `_startStatsMonitor()` → 3초 주기 telemetry 수집+전송으로 전환 (기존 콘솔 로그 대체)
+- **SDK**: `_collectPublishStats()` 구간 A, `_collectSubscribeStats()` 구간 C, `_collectCodecStats()` 구간 S-2
+- **어드민**: livechat-admin 완전 재작성 (SFU telemetry 대시보드)
+  - Room 목록, 실시간 개요 테이블, 참가자 상세 패널, SDP 상태 패널
+  - 시계열 버퍼 저장 (최근 100건, 향후 차트용)
 
 ### v0.1.9 — BUNDLE demux + inactive m-line 처리
 - subscribe SDP에서 `sdes:mid` extmap 제거 (서버가 RTP mid 헤더 rewrite 안 함)
@@ -350,7 +404,18 @@ Bytes 8-11: media_ssrc (big-endian)
 
 ---
 
-## 13. 주의사항
+## 13. Media Telemetry
+
+각 지표의 의미, 정상 범위, 이상 판별 기준은 **`TELEMETRY.md`** 참조.
+
+- 수집 구간: S(SDP/코덱), A(Publisher), B(SFU 서버), C(Subscriber)
+- 전달: 클라이언트 → OP_TELEMETRY(30) → 서버 passthrough → /admin/ws
+- 서버 B구간: udp.rs `ServerMetrics` → 3초 flush → admin_tx
+- 어드민: `livechat-admin/` (WS 접속, 실시간 개요, 상세, SDP, SFU 패널, Contract, 스냅샷)
+
+---
+
+## 14. 주의사항
 
 ### 절대 하지 말 것
 - re-nego 성급하게 구현 (mini 실패 원인)

@@ -75,6 +75,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         udp_socket,
         Arc::clone(&state.rooms),
         Arc::clone(&state.cert),
+        state.admin_tx.clone(),
     );
 
     tokio::spawn(async move {
@@ -91,6 +92,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Start WebSocket signaling
     let app = Router::new()
         .route("/ws", axum::routing::get(handler::ws_handler))
+        .route("/admin/ws", axum::routing::get(handler::admin_ws_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config::WS_PORT));

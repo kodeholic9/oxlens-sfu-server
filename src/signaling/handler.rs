@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, interval_at};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config;
 use crate::room::participant::{Participant, TrackKind};
@@ -185,6 +185,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::PUBLISH_TRACKS  => Some(handle_publish_tracks(session, state, &packet).await),
         opcode::MUTE_UPDATE     => Some(handle_mute_update(session, state, &packet).await),
         opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
+        opcode::TELEMETRY      => { handle_telemetry(session, state, &packet); None }
         _ => {
             warn!("unknown opcode: {}", packet.op);
             Some(Packet::err(packet.op, packet.pid, 3001, "invalid opcode"))
@@ -337,6 +338,9 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
         }).unwrap(),
     );
     broadcast_to_others(&room, &user_id, &event);
+
+    // Admin snapshot push (room 변경 시)
+    push_admin_snapshot(state);
 
     // Detect local IP for ICE candidate
     let local_ip = detect_local_ip();
@@ -577,6 +581,9 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
             session.pub_ufrag = None;
             session.sub_ufrag = None;
 
+            // Admin snapshot push
+            push_admin_snapshot(state);
+
             Packet::ok(opcode::ROOM_LEAVE, packet.pid, serde_json::json!({}))
         }
         Err(e) => Packet::err(opcode::ROOM_LEAVE, packet.pid, e.code(), &e.to_string()),
@@ -672,6 +679,10 @@ async fn cleanup(session: &Session, state: &AppState) {
         if let Err(e) = state.rooms.remove_participant(room_id, user_id) {
             warn!("cleanup error: {e}");
         }
+
+        // Admin snapshot push
+        push_admin_snapshot(state);
+
         debug!("cleanup done user={} room={}", user_id, room_id);
     }
 }
@@ -763,4 +774,136 @@ fn detect_local_ip() -> String {
         })
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+// ============================================================================
+// TELEMETRY — 클라이언트 telemetry를 어드민 채널로 passthrough
+// ============================================================================
+
+fn handle_telemetry(session: &Session, state: &AppState, packet: &Packet) {
+    let user_id = match &session.user_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+    let room_id = match &session.current_room {
+        Some(r) => r.clone(),
+        None => return,
+    };
+
+    // 클라이언트 telemetry에 user_id, room_id를 래핑하여 어드민으로 전달
+    let admin_msg = serde_json::json!({
+        "type": "client_telemetry",
+        "user_id": user_id,
+        "room_id": room_id,
+        "data": packet.d,
+    });
+
+    // broadcast::send — receiver 없으면 에러지만 무시
+    let _ = state.admin_tx.send(admin_msg.to_string());
+    trace!("telemetry forwarded user={} room={}", user_id, room_id);
+}
+
+// ============================================================================
+// Admin WebSocket handler — telemetry 수신 전용
+// ============================================================================
+
+pub async fn admin_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_admin_connection(socket, state))
+}
+
+async fn handle_admin_connection(mut socket: WebSocket, state: AppState) {
+    info!("admin WS connected");
+    let mut rx = state.admin_tx.subscribe();
+
+    // 접속 즉시 room 상태 스냅샷 전송
+    let snapshot = build_rooms_snapshot(&state);
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(json) => {
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("admin WS lagged {} messages", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+            ws_msg = socket.recv() => {
+                match ws_msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {} // admin은 수신 전용, 클라이언트 메시지 무시
+                }
+            }
+        }
+    }
+
+    info!("admin WS disconnected");
+}
+
+/// Room 변경 시 admin broadcast 채널로 스냅샷 push
+fn push_admin_snapshot(state: &AppState) {
+    let snapshot = build_rooms_snapshot(state);
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        let _ = state.admin_tx.send(json);
+    }
+}
+
+/// 어드민 접속 시 전송하는 room 전체 스냅샷
+fn build_rooms_snapshot(state: &AppState) -> serde_json::Value {
+    let rooms: Vec<serde_json::Value> = state.rooms.rooms
+        .iter()
+        .map(|entry| {
+            let room = entry.value();
+            let participants: Vec<serde_json::Value> = room.all_participants()
+                .iter()
+                .map(|p| {
+                    let tracks: Vec<serde_json::Value> = p.get_tracks()
+                        .iter()
+                        .map(|t| {
+                            let mut j = serde_json::json!({
+                                "kind": t.kind.to_string(),
+                                "ssrc": t.ssrc,
+                                "track_id": &t.track_id,
+                                "muted": t.muted,
+                            });
+                            if let Some(rs) = t.rtx_ssrc {
+                                j["rtx_ssrc"] = serde_json::json!(rs);
+                            }
+                            j
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "user_id": &p.user_id,
+                        "pub_ready": p.is_publish_ready(),
+                        "sub_ready": p.is_subscribe_ready(),
+                        "tracks": tracks,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "room_id": &room.id,
+                "name": &room.name,
+                "capacity": room.capacity,
+                "participants": participants,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "type": "snapshot",
+        "rooms": rooms,
+    })
 }
