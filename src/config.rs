@@ -44,6 +44,11 @@ pub const DEMUX_RTP_MAX: u8 = 0xBF;
 /// Windows에서는 무시됨 (항상 single worker)
 pub const UDP_WORKER_COUNT: usize = 0;
 
+// --- Egress (Phase W-3: subscriber별 egress task) ---
+/// subscriber당 egress 큐 크기 (bounded mpsc)
+/// 30fps × ~8초분. 큐 풀 시 try_send 실패 = backpressure 드롭 (NACK/RTX가 커버)
+pub const EGRESS_QUEUE_SIZE: usize = 256;
+
 // --- Media ---
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 pub const UDP_RECV_BUF_SIZE: usize = 2048;

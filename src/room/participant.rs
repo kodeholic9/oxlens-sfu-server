@@ -20,6 +20,18 @@ use crate::config;
 use crate::transport::srtp::SrtpContext;
 
 // ============================================================================
+// EgressPacket — subscriber egress task에 전달할 plaintext 패킷
+// ============================================================================
+
+/// Egress task가 encrypt → send하는 plaintext 패킷 종류
+pub enum EgressPacket {
+    /// RTP plaintext (fan-out 미디어)
+    Rtp(Vec<u8>),
+    /// RTCP plaintext (SR relay 등)
+    Rtcp(Vec<u8>),
+}
+
+// ============================================================================
 // PcType — PeerConnection 종류 식별
 // ============================================================================
 
@@ -206,6 +218,12 @@ pub struct Participant {
     rtx_ssrc_counter: AtomicU32,
     /// RTX 패킷 전용 seq 카운터 (subscriber별이 아닌 publisher별)
     pub rtx_seq: AtomicU16,
+
+    // --- Egress (Phase W-3: subscriber별 egress task) ---
+    /// subscribe PC egress channel — plaintext를 egress task에 전달
+    pub egress_tx: mpsc::Sender<EgressPacket>,
+    /// egress task spawn 시 .take()으로 꼼냄 (1회용)
+    pub egress_rx: Mutex<Option<mpsc::Receiver<EgressPacket>>>,
 }
 
 impl Participant {
@@ -223,6 +241,7 @@ impl Participant {
             "Participant::new user={} room={} pub_ufrag={} sub_ufrag={}",
             user_id, room_id, pub_ufrag, sub_ufrag
         );
+        let (egress_tx, egress_rx) = mpsc::channel(config::EGRESS_QUEUE_SIZE);
         Self {
             user_id,
             room_id,
@@ -235,6 +254,8 @@ impl Participant {
             rtp_cache:  Mutex::new(RtpCache::new()),
             rtx_ssrc_counter: AtomicU32::new(0),
             rtx_seq:    AtomicU16::new(0),
+            egress_tx,
+            egress_rx:  Mutex::new(Some(egress_rx)),
         }
     }
 

@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, trace, warn};
 // 로그 레벨 정책:
 //   info!  = 운영 필수 (연결/해제, 에러, 상태 전환)
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use webrtc_util::conn::Conn;
 
 use crate::config;
-use crate::room::participant::PcType;
+use crate::room::participant::{PcType, EgressPacket};
 use crate::room::room::RoomHub;
 use crate::transport::demux::{self, PacketType};
 use crate::transport::demux_conn::{DemuxConn, DtlsPacketTx};
@@ -575,8 +575,17 @@ impl UdpTransport {
                             info!("[DBG:DTLS] SRTP ready user={} pc={} addr={}",
                                 participant.user_id, pc_type, remote);
 
-                            // Subscribe SRTP ready → PLI to all publishers in room
+                            // Subscribe SRTP ready → egress task spawn + PLI
                             if pc_type == PcType::Subscribe {
+                                // Phase W-3: subscriber별 egress task spawn
+                                let egress_rx = participant.egress_rx.lock().unwrap().take();
+                                if let Some(rx) = egress_rx {
+                                    let eg_socket = Arc::clone(&socket);
+                                    let eg_participant = Arc::clone(&participant);
+                                    tokio::spawn(run_egress_task(rx, eg_participant, eg_socket));
+                                    info!("[EGRESS] spawned user={}", participant.user_id);
+                                }
+
                                 if let Ok(room) = room_hub.get(&participant.room_id) {
                                     info!("[DBG:PLI] subscribe ready, requesting keyframes user={}",
                                         participant.user_id);
@@ -677,7 +686,7 @@ impl UdpTransport {
             };
 
             // Phase C-2a: SR relay — publisher의 SR을 모든 subscriber에게 전달
-            self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail).await;
+            self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail);
             return;
         }
 
@@ -727,9 +736,7 @@ impl UdpTransport {
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
         }
 
-        // Phase W-1: fan-out을 tokio::spawn으로 분리
-        // 메인 루프는 recv→decrypt→cache→spawn만 하고 즉시 다음 패킷 처리
-        // spawn된 task는 Tokio work-stealing으로 유휴 코어에 분산
+        // Phase W-3: egress 큐로 전달 (Mutex 경합 없음, subscriber별 egress task가 독점 encrypt)
         let targets = room.other_participants(&sender.user_id);
 
         if is_detail {
@@ -742,37 +749,10 @@ impl UdpTransport {
                 seq_num, sender.user_id, target_info.join(", "));
         }
 
-        let socket = Arc::clone(&self.socket);
-        let relay_counter = Arc::clone(&self.spawn_rtp_relayed);
-        let fail_counter = Arc::clone(&self.spawn_encrypt_fail);
-
-        tokio::spawn(async move {
-            let mut relay_count = 0u32;
-            for target in &targets {
-                if !target.is_subscribe_ready() { continue; }
-
-                let addr = match target.subscribe.get_address() {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                let encrypted = {
-                    let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
-                    match ctx.encrypt_rtp(&plaintext) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            fail_counter.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                };
-
-                if socket.send_to(&encrypted, addr).await.is_ok() {
-                    relay_count += 1;
-                }
-            }
-            relay_counter.fetch_add(relay_count as u64, Ordering::Relaxed);
-        });
+        for target in &targets {
+            if !target.is_subscribe_ready() { continue; }
+            let _ = target.egress_tx.try_send(EgressPacket::Rtp(plaintext.clone()));
+        }
     }
 
     // ========================================================================
@@ -839,7 +819,7 @@ impl UdpTransport {
         // (1) NACK 처리 (RTX 재전송 — 기존 로직)
         self.metrics.nack_received += parsed.nack_blocks.len() as u64;
         for nack_block in &parsed.nack_blocks {
-            self.handle_nack_block(nack_block, subscriber, room, is_detail).await;
+            self.handle_nack_block(nack_block, subscriber, room, is_detail);
         }
 
         // (2) 릴레이 대상 RTCP (RR, PLI, REMB) → publisher별로 모아서 전송
@@ -921,7 +901,7 @@ impl UdpTransport {
     // ========================================================================
 
     /// 단일 NACK RTCP 블록 처리: 캐시 조회 → RTX 조립 → 전송
-    async fn handle_nack_block(
+    fn handle_nack_block(
         &mut self,
         nack_data: &[u8],
         subscriber: &Arc<crate::room::participant::Participant>,
@@ -967,11 +947,6 @@ impl UdpTransport {
                 }
             };
 
-            let sub_addr = match subscriber.subscribe.get_address() {
-                Some(a) => a,
-                None => continue,
-            };
-
             // 캐시 조회 + RTX 조립
             let rtx_packets: Vec<(u16, u16, Vec<u8>)> = {
                 let cache = publisher.rtp_cache.lock().unwrap();
@@ -992,28 +967,9 @@ impl UdpTransport {
                     cache_miss, lost_seqs.len(), nack.media_ssrc);
             }
 
-            for (lost_seq, rtx_seq, rtx_pkt) in &rtx_packets {
-                let encrypted = {
-                    let mut ctx = subscriber.subscribe.outbound_srtp.lock().unwrap();
-                    match ctx.encrypt_rtp(rtx_pkt) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            if is_detail {
-                                debug!("[DBG:RTX] encrypt FAILED seq={}: {e}", lost_seq);
-                            }
-                            continue;
-                        }
-                    }
-                };
-
-                if let Err(e) = self.socket.send_to(&encrypted, sub_addr).await {
-                    if is_detail {
-                        debug!("[DBG:RTX] send FAILED seq={} addr={}: {e}", lost_seq, sub_addr);
-                    }
-                } else if is_detail {
-                    debug!("[DBG:RTX] sent seq={} rtx_seq={} rtx_ssrc=0x{:08X} → user={} addr={}",
-                        lost_seq, rtx_seq, rtx_ssrc, subscriber.user_id, sub_addr);
-                }
+            // Phase W-3: RTX도 egress 큐 경유
+            for (_lost_seq, _rtx_seq, rtx_pkt) in rtx_packets {
+                let _ = subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt));
             }
         }
     }
@@ -1025,7 +981,7 @@ impl UdpTransport {
     /// Publish PC에서 수신된 RTCP compound를 모든 subscriber에게 릴레이.
     /// SR 외 다른 RTCP도 함께 있을 수 있으나, compound 통째로 릴레이한다.
     /// (publish → subscribe 방향에는 NACK이 없으므로 분리 불필요)
-    async fn relay_publish_rtcp(
+    fn relay_publish_rtcp(
         &mut self,
         plaintext: &[u8],
         sender: &Arc<crate::room::participant::Participant>,
@@ -1034,40 +990,14 @@ impl UdpTransport {
     ) {
         self.metrics.sr_relayed += 1;
 
-        // Phase W-1: SR fan-out도 tokio::spawn으로 분리
+        // Phase W-3: egress 큐로 SR relay 전달
         let targets = room.other_participants(&sender.user_id);
         let plaintext_owned = plaintext.to_vec();
-        let socket = Arc::clone(&self.socket);
-        let relay_counter = Arc::clone(&self.spawn_sr_relayed);
-        let fail_counter = Arc::clone(&self.spawn_encrypt_fail);
 
-        tokio::spawn(async move {
-            let mut relay_count = 0u32;
-            for target in &targets {
-                if !target.is_subscribe_ready() { continue; }
-
-                let addr = match target.subscribe.get_address() {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                let encrypted = {
-                    let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
-                    match ctx.encrypt_rtcp(&plaintext_owned) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            fail_counter.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                };
-
-                if socket.send_to(&encrypted, addr).await.is_ok() {
-                    relay_count += 1;
-                }
-            }
-            relay_counter.fetch_add(relay_count as u64, Ordering::Relaxed);
-        });
+        for target in &targets {
+            if !target.is_subscribe_ready() { continue; }
+            let _ = target.egress_tx.try_send(EgressPacket::Rtcp(plaintext_owned.clone()));
+        }
     }
 }
 
@@ -1410,6 +1340,44 @@ fn encode_remb_bitrate(bps: u64) -> (u8, u32) {
         exp += 1;
     }
     (exp, mantissa as u32)
+}
+
+// ============================================================================
+// Phase W-3: Subscriber Egress Task (LiveKit 패턴)
+// ============================================================================
+
+/// Subscriber별 전용 egress task — 큐에서 plaintext를 꼼내서 encrypt → send
+/// subscriber당 1개, outbound_srtp를 독점 → Mutex 경합 없음
+async fn run_egress_task(
+    mut rx: mpsc::Receiver<EgressPacket>,
+    participant: Arc<crate::room::participant::Participant>,
+    socket: Arc<UdpSocket>,
+) {
+    info!("[EGRESS] started user={}", participant.user_id);
+
+    while let Some(pkt) = rx.recv().await {
+        let addr = match participant.subscribe.get_address() {
+            Some(a) => a,
+            None => continue,
+        };
+
+        let result = match pkt {
+            EgressPacket::Rtp(plaintext) => {
+                let mut ctx = participant.subscribe.outbound_srtp.lock().unwrap();
+                ctx.encrypt_rtp(&plaintext)
+            }
+            EgressPacket::Rtcp(plaintext) => {
+                let mut ctx = participant.subscribe.outbound_srtp.lock().unwrap();
+                ctx.encrypt_rtcp(&plaintext)
+            }
+        };
+
+        if let Ok(encrypted) = result {
+            let _ = socket.send_to(&encrypted, addr).await;
+        }
+    }
+
+    info!("[EGRESS] ended user={}", participant.user_id);
 }
 
 /// Subscribe SRTP ready 시 해당 room의 모든 publisher에게 PLI 전송
