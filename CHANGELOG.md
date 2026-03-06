@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.6] - 2026-03-07
+
+### Added (Phase W-2: SO_REUSEPORT multi-worker — UDP 멀티코어 분산 2단계)
+
+#### 서버
+- `bind_reuseport()` — socket2 SO_REUSEPORT UDP 바인드 (Linux 전용, 커널 4-tuple hash 분배)
+- `resolve_worker_count()` — 0=auto(코어 수), `.env` `UDP_WORKER_COUNT`로 설정 가능
+- `UdpTransport.worker_id` + `from_socket_with_id()` 생성자
+- `lib.rs` — Linux: N개 SO_REUSEPORT worker spawn / Windows: single worker fallback
+- REMB/metrics 타이머 worker-0 전담 (`is_primary` guard)
+- DtlsSessionMap/ServerMetrics worker별 독립, RoomHub/ServerCert 공유(Arc)
+- `Cargo.toml` — `socket2 = "0.5"` 의존성 추가
+- `config.rs` — `UDP_WORKER_COUNT` 상수 (fallback, `.env` 우선)
+
+### 결과 (RPi 4B 벤치마크)
+- 30인: loss 1.3%→**0.1%**, CPU 118%→113% (4 recv 루프 분산 효과)
+- 35인: loss 17.8%, CPU 155% (FAIL — outbound_srtp Mutex 경합 병목)
+
+### 설계 결정
+- Windows에는 SO_REUSEPORT 없음 → `#[cfg(target_os = "linux")]` 분기
+- 35인+ 병목은 outbound_srtp Mutex 경합 — subscriber별 per-worker encrypt 또는 lock-free 구조 필요
+
 ## [0.3.5] - 2026-03-07
 
 ### Added (Phase W-1: Fan-out spawn — UDP 멀티코어 분산 1단계)

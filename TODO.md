@@ -137,10 +137,8 @@
 ## Phase W: UDP Worker 멀티코어 분산
 - [x] W-1: Fan-out spawn — handle_srtp/relay_publish_rtcp fan-out을 tokio::spawn 분리 — v0.3.5
   - 30인 loss 9.6%→1.3%, 4코어 균등 분산 확인
-- [ ] W-2: Multi-worker (SO_REUSEPORT) — N개 독립 recv 루프, 커널 4-tuple hash 분배
-  - UdpTransport → UdpWorker × N 구조 개편
-  - DtlsSessionMap worker별 독립
-  - 목표: 50인+ conference
+- [x] W-2: Multi-worker (SO_REUSEPORT) — N개 독립 recv 루프, 커널 4-tuple hash 분배 — v0.3.6
+  - 30인 loss 0.1%, CPU 113% / 35인 FAIL (outbound_srtp Mutex 경합)
 - [ ] W-3: recvmmsg batch 수신 (선택적, pps 5만+ 시)
 
 ## Benchmark
@@ -149,7 +147,8 @@
 - [x] 벤치마크 리포트 문서화 (doc/BENCHMARK-FANOUT-20260306.md)
 - [x] Conference 벤치마크 (5/10/20/25/30인, 25인 PASS, 30인 FAIL)
 - [x] W-1 Conference 벤치마크 (25인 0%, 30인 1.3%, 35인 13.4%) — v0.3.5
-- [ ] W-2 Conference 벤치마크 (50인+ 목표)
+- [x] W-2 Conference 벤치마크 (30인 0.1%, 35인 17.8%) — v0.3.6
+- [ ] 50인+ 벤치마크 (outbound_srtp Mutex 개선 후)
 - [ ] TWCC 구현 후 전후 벤치마크 비교
 
 ## Backlog

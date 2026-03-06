@@ -205,7 +205,7 @@ async-trait = "0.1"
 | Q | Media Quality (REMB + RR fix + JB delta) | 0.3.4 | ✅ |
 | BM | Fan-out Benchmark (RPi 499sub, loss 0.002%) | 0.3.4 | ✅ |
 | W-1 | Fan-out spawn (tokio::spawn 분리, 30인 PASS) | 0.3.5 | ✅ |
-| W-2 | Multi-worker (SO_REUSEPORT, 50인+ 목표) | 0.3.6 | |
+| W-2 | Multi-worker (SO_REUSEPORT, 30인 0.1%) | 0.3.6 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
