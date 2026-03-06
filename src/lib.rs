@@ -51,6 +51,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // ========================================================================
     let ws_port: u16 = env_or("WS_PORT", config::WS_PORT);
     let udp_port: u16 = env_or("UDP_PORT", config::UDP_PORT);
+    let _udp_workers: usize = env_or("UDP_WORKER_COUNT", config::UDP_WORKER_COUNT);
     let public_ip: String = std::env::var("PUBLIC_IP")
         .unwrap_or_else(|_| detect_local_ip());
     let log_dir: Option<String> = std::env::var("LOG_DIR").ok()
@@ -97,15 +98,30 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let cert = ServerCert::generate()?;
     info!("DTLS fingerprint: {}", cert.fingerprint);
 
-    // Start UDP transport (socket 먼저 생성 → AppState에 공유)
-    let udp_socket = {
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], udp_port));
-        Arc::new(tokio::net::UdpSocket::bind(addr).await?)
+    // ========================================================================
+    // Phase W-2: UDP multi-worker (Linux SO_REUSEPORT) / single worker (Windows)
+    // ========================================================================
+    #[allow(unused_variables)]
+    let (primary_socket, worker_count) = {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::transport::udp::{resolve_worker_count, bind_reuseport};
+            let count = resolve_worker_count(_udp_workers);
+            let sock = Arc::new(bind_reuseport(udp_port)?);
+            info!("UDP SO_REUSEPORT: {} workers on port {}", count, udp_port);
+            (sock, count)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], udp_port));
+            let sock = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
+            info!("UDP single worker on port {}", udp_port);
+            (sock, 1usize)
+        }
     };
-    info!("UDP listening on port {}", udp_port);
 
-    // Build shared state
-    let state = AppState::new(cert, Arc::clone(&udp_socket), public_ip, ws_port, udp_port);
+    // Build shared state (primary_socket을 AppState에 공유 — PLI/REMB 전송용)
+    let state = AppState::new(cert, Arc::clone(&primary_socket), public_ip, ws_port, udp_port);
 
     // Create default rooms
     create_default_rooms(&state);
@@ -113,17 +129,32 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
 
-    // UDP transport (기존 socket 재사용)
-    let udp = UdpTransport::from_socket(
-        udp_socket,
+    // Worker-0: primary socket 사용
+    let w0 = UdpTransport::from_socket_with_id(
+        primary_socket,
         Arc::clone(&state.rooms),
         Arc::clone(&state.cert),
         state.admin_tx.clone(),
+        0,
     );
+    tokio::spawn(async move { w0.run().await; });
 
-    tokio::spawn(async move {
-        udp.run().await;
-    });
+    // Worker-1..N: SO_REUSEPORT 추가 소켓 (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        use crate::transport::udp::bind_reuseport;
+        for i in 1..worker_count {
+            let socket = Arc::new(bind_reuseport(udp_port)?);
+            let w = UdpTransport::from_socket_with_id(
+                socket,
+                Arc::clone(&state.rooms),
+                Arc::clone(&state.cert),
+                state.admin_tx.clone(),
+                i as u8,
+            );
+            tokio::spawn(async move { w.run().await; });
+        }
+    }
 
     // Start zombie reaper
     let reaper_cancel = cancel.clone();

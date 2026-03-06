@@ -266,6 +266,8 @@ pub struct UdpTransport {
     spawn_rtp_relayed:  Arc<AtomicU64>,
     spawn_sr_relayed:   Arc<AtomicU64>,
     spawn_encrypt_fail: Arc<AtomicU64>,
+    // Phase W-2: multi-worker
+    worker_id: u8,
 }
 
 impl UdpTransport {
@@ -290,6 +292,7 @@ impl UdpTransport {
             spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
             spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
             spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
+            worker_id: 0,
         })
     }
 
@@ -299,6 +302,17 @@ impl UdpTransport {
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
         admin_tx: broadcast::Sender<String>,
+    ) -> Self {
+        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0)
+    }
+
+    /// Phase W-2: worker_id 지정 생성자
+    pub fn from_socket_with_id(
+        socket:   Arc<UdpSocket>,
+        room_hub: Arc<RoomHub>,
+        cert:     Arc<ServerCert>,
+        admin_tx: broadcast::Sender<String>,
+        worker_id: u8,
     ) -> Self {
         Self {
             socket,
@@ -312,30 +326,33 @@ impl UdpTransport {
             spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
             spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
             spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
+            worker_id,
         }
     }
 
     pub async fn run(mut self) {
         let mut buf = BytesMut::zeroed(config::UDP_RECV_BUF_SIZE);
+        let is_primary = self.worker_id == 0;
 
-        // 3초 주기 metrics flush 타이머
+        info!("[W{}] UDP worker started", self.worker_id);
+
+        // 타이머는 worker-0만 실행 (metrics flush, REMB 전송)
         let mut metrics_timer = tokio::time::interval(
             tokio::time::Duration::from_secs(3),
         );
-        metrics_timer.tick().await; // 첨 tick 소비
+        metrics_timer.tick().await;
 
-        // REMB 전송 타이머 (1초 주기)
         let mut remb_timer = tokio::time::interval(
             tokio::time::Duration::from_millis(config::REMB_INTERVAL_MS),
         );
-        remb_timer.tick().await; // 첨 tick 소비
+        remb_timer.tick().await;
 
         loop {
             tokio::select! {
                 result = self.socket.recv_from(&mut buf) => {
                     let (len, remote) = match result {
                         Ok(r) => r,
-                        Err(e) => { error!("UDP recv error: {e}"); continue; }
+                        Err(e) => { error!("[W{}] UDP recv error: {e}", self.worker_id); continue; }
                     };
 
                     let data = Bytes::copy_from_slice(&buf[..len]);
@@ -354,10 +371,10 @@ impl UdpTransport {
                         self.dtls_map.remove_stale();
                     }
                 }
-                _ = metrics_timer.tick() => {
+                _ = metrics_timer.tick(), if is_primary => {
                     self.flush_metrics();
                 }
-                _ = remb_timer.tick() => {
+                _ = remb_timer.tick(), if is_primary => {
                     self.send_remb_to_publishers().await;
                 }
             }
@@ -1447,4 +1464,33 @@ async fn send_pli_to_publishers(
                 publisher.user_id, ssrc, pub_addr);
         }
     }
+}
+
+// ============================================================================
+// Phase W-2: SO_REUSEPORT multi-worker support (Linux only)
+// ============================================================================
+
+/// UDP worker 수 결정 (0 = auto = 코어 수)
+pub fn resolve_worker_count(configured: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// SO_REUSEPORT로 UDP 소켓 바인드 (Linux 전용)
+/// 동일 포트에 N개 소켓을 바인드하면 커널이 4-tuple hash로 패킷 분배
+#[cfg(target_os = "linux")]
+pub fn bind_reuseport(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    let addr: socket2::SockAddr = SocketAddr::from(([0, 0, 0, 0], port)).into();
+    socket.bind(&addr)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
 }

@@ -39,6 +39,11 @@ pub const DEMUX_DTLS_MAX: u8 = 0x3F;
 pub const DEMUX_RTP_MIN: u8 = 0x80;
 pub const DEMUX_RTP_MAX: u8 = 0xBF;
 
+// --- UDP Worker (Phase W-2) ---
+/// UDP worker 수 (0 = auto = 코어 수, Linux SO_REUSEPORT)
+/// Windows에서는 무시됨 (항상 single worker)
+pub const UDP_WORKER_COUNT: usize = 0;
+
 // --- Media ---
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 pub const UDP_RECV_BUF_SIZE: usize = 2048;

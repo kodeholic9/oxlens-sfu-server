@@ -30,6 +30,9 @@ webrtc-util = "0.17.1"
 # concurrency
 dashmap = "6"
 
+# SO_REUSEPORT multi-worker (Phase W-2)
+socket2 = { version = "0.5", features = ["all"] }
+
 # crypto (STUN MESSAGE-INTEGRITY, DTLS fingerprint)
 hmac = "0.12"
 sha1 = "0.10"
