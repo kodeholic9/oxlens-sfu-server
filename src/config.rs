@@ -21,8 +21,8 @@ pub const ZOMBIE_TIMEOUT_MS: u64 = 120_000;
 pub const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 
 // --- Room ---
-pub const ROOM_MAX_CAPACITY: usize = 500;
-pub const ROOM_DEFAULT_CAPACITY: usize = 500;
+pub const ROOM_MAX_CAPACITY: usize = 1000;
+pub const ROOM_DEFAULT_CAPACITY: usize = 1000;
 
 // --- Signaling ---
 /// ACK timeout: pid에 대한 응답 대기 시간
