@@ -4,7 +4,14 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.3.4] - 2026-03-05
+## [0.3.4] - 2026-03-06
+
+### Changed
+- `ROOM_MAX_CAPACITY`: 20 → 500 (fan-out 벤치마크용)
+- `ROOM_DEFAULT_CAPACITY`: 10 → 500
+
+### Added
+- `doc/BENCHMARK-FANOUT-20260306.md` — RPi 4B fan-out 한계 테스트 상세 리포트
 
 ### Added (Media Quality: REMB + RR relay fix + JB delta)
 

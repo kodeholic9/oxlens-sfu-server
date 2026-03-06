@@ -134,6 +134,13 @@
 - [ ] Relay gate: only floor holder's media forwarded in PTT mode
 - [ ] Floor indicator broadcast
 
+## Benchmark
+- [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화
+- [x] RPi 4B fan-out 한계 테스트 (fo1→499, 13회, loss 0.002%, CPU 69%)
+- [x] 벤치마크 리포트 문서화 (doc/BENCHMARK-FANOUT-20260306.md)
+- [ ] Multi-publisher 벤치마크 (5×5, 10×10 회의실 시나리오)
+- [ ] TWCC 구현 후 전후 벤치마크 비교
+
 ## Backlog
 - [ ] Simulcast / SVC (layer detection, adaptive quality)
 - [ ] TURN relay support (for restrictive NATs)

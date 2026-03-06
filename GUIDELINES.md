@@ -203,6 +203,7 @@ async-trait = "0.1"
 | T-3 | Media Telemetry 3단계 (어드민 SFU 서버 패널 + server_metrics 표시) | 0.3.2 | ✅ |
 | T-4/5 | Media Telemetry 4+5 (시계열 차트 + Contract + 스냅샷) | 0.3.3 | ✅ |
 | Q | Media Quality (REMB + RR fix + JB delta) | 0.3.4 | ✅ |
+| BM | Fan-out Benchmark (RPi 499sub, loss 0.002%) | 0.3.4 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
