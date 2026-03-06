@@ -147,6 +147,7 @@ impl ServerMetrics {
         }
     }
 
+    #[allow(dead_code)]
     fn record_fan_out(&mut self, count: u32) {
         self.fan_out_sum += count as u64;
         self.fan_out_count += 1;
@@ -261,6 +262,10 @@ pub struct UdpTransport {
     dbg_rtp_count: AtomicU64,
     metrics:      ServerMetrics,
     admin_tx:     broadcast::Sender<String>,
+    // Phase W-1: spawn fan-out atomic counters
+    spawn_rtp_relayed:  Arc<AtomicU64>,
+    spawn_sr_relayed:   Arc<AtomicU64>,
+    spawn_encrypt_fail: Arc<AtomicU64>,
 }
 
 impl UdpTransport {
@@ -282,6 +287,9 @@ impl UdpTransport {
             dbg_rtp_count: AtomicU64::new(0),
             metrics: ServerMetrics::new(),
             admin_tx,
+            spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
+            spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
+            spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -301,6 +309,9 @@ impl UdpTransport {
             dbg_rtp_count: AtomicU64::new(0),
             metrics: ServerMetrics::new(),
             admin_tx,
+            spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
+            spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
+            spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -355,7 +366,16 @@ impl UdpTransport {
 
     /// 3초마다 metrics 집계 → admin_tx로 push → reset
     fn flush_metrics(&mut self) {
-        let json = self.metrics.to_json();
+        let mut json = self.metrics.to_json();
+        // Phase W-1: spawn fan-out atomic counters 포함
+        let rtp_relayed = self.spawn_rtp_relayed.swap(0, Ordering::Relaxed);
+        let sr_relayed  = self.spawn_sr_relayed.swap(0, Ordering::Relaxed);
+        let enc_fail    = self.spawn_encrypt_fail.swap(0, Ordering::Relaxed);
+        if let serde_json::Value::Object(ref mut map) = json {
+            map.insert("spawn_rtp_relayed".into(), serde_json::json!(rtp_relayed));
+            map.insert("spawn_sr_relayed".into(), serde_json::json!(sr_relayed));
+            map.insert("spawn_encrypt_fail".into(), serde_json::json!(enc_fail));
+        }
         let _ = self.admin_tx.send(json.to_string());
         self.metrics.reset();
     }
@@ -582,7 +602,6 @@ impl UdpTransport {
     // ========================================================================
 
     async fn handle_srtp(&mut self, buf: &[u8], remote: SocketAddr) {
-        let relay_start = Instant::now();
         let seq_num = self.dbg_rtp_count.fetch_add(1, Ordering::Relaxed);
 
         // O(1) lookup: addr → (participant, pc_type, room)
@@ -691,7 +710,9 @@ impl UdpTransport {
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
         }
 
-        // Fan-out: relay to all other participants via their SUBSCRIBE session
+        // Phase W-1: fan-out을 tokio::spawn으로 분리
+        // 메인 루프는 recv→decrypt→cache→spawn만 하고 즉시 다음 패킷 처리
+        // spawn된 task는 Tokio work-stealing으로 유휴 코어에 분산
         let targets = room.other_participants(&sender.user_id);
 
         if is_detail {
@@ -704,57 +725,37 @@ impl UdpTransport {
                 seq_num, sender.user_id, target_info.join(", "));
         }
 
-        let mut relay_count = 0u32;
-        for target in &targets {
-            // Use subscribe session for sending media TO the target
-            if !target.is_subscribe_ready() { continue; }
+        let socket = Arc::clone(&self.socket);
+        let relay_counter = Arc::clone(&self.spawn_rtp_relayed);
+        let fail_counter = Arc::clone(&self.spawn_encrypt_fail);
 
-            let addr = match target.subscribe.get_address() {
-                Some(a) => a,
-                None => continue,
-            };
+        tokio::spawn(async move {
+            let mut relay_count = 0u32;
+            for target in &targets {
+                if !target.is_subscribe_ready() { continue; }
 
-            let encrypted = {
-                let lock_t = Instant::now();
-                let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
-                self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
-                let enc_t = Instant::now();
-                match ctx.encrypt_rtp(&plaintext) {
-                    Ok(p) => {
-                        self.metrics.encrypt.record(enc_t.elapsed().as_micros() as u64);
-                        p
-                    }
-                    Err(e) => {
-                        self.metrics.encrypt_fail += 1;
-                        if is_detail {
-                            debug!("[DBG:RELAY] encrypt FAILED → user={}: {e}", target.user_id);
+                let addr = match target.subscribe.get_address() {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                let encrypted = {
+                    let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
+                    match ctx.encrypt_rtp(&plaintext) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            fail_counter.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
-                        continue;
                     }
-                }
-            };
+                };
 
-            if let Err(e) = self.socket.send_to(&encrypted, addr).await {
-                if is_detail {
-                    debug!("[DBG:RELAY] send FAILED → user={} addr={}: {e}", target.user_id, addr);
-                }
-            } else {
-                relay_count += 1;
-                if is_detail {
-                    debug!("[DBG:RELAY] #{} → user={} addr={} enc_len={}",
-                        seq_num, target.user_id, addr, encrypted.len());
+                if socket.send_to(&encrypted, addr).await.is_ok() {
+                    relay_count += 1;
                 }
             }
-        }
-
-        // B구간 계측: fan-out count + relay total
-        self.metrics.record_fan_out(relay_count);
-        self.metrics.relay.record(relay_start.elapsed().as_micros() as u64);
-
-        if is_summary {
-            trace!("[DBG:RELAY] summary #{} from={} ssrc=0x{:08X} relayed_to={}",
-                seq_num, sender.user_id, rtp_hdr.ssrc, relay_count);
-        }
+            relay_counter.fetch_add(relay_count as u64, Ordering::Relaxed);
+        });
     }
 
     // ========================================================================
@@ -1012,50 +1013,44 @@ impl UdpTransport {
         plaintext: &[u8],
         sender: &Arc<crate::room::participant::Participant>,
         room: &Arc<crate::room::room::Room>,
-        is_detail: bool,
+        _is_detail: bool,
     ) {
         self.metrics.sr_relayed += 1;
-        // compound 내 첫 RTCP PT 로그용
-        let first_pt = plaintext.get(1).map(|b| b & 0x7F).unwrap_or(0);
 
+        // Phase W-1: SR fan-out도 tokio::spawn으로 분리
         let targets = room.other_participants(&sender.user_id);
-        let mut relay_count = 0u32;
+        let plaintext_owned = plaintext.to_vec();
+        let socket = Arc::clone(&self.socket);
+        let relay_counter = Arc::clone(&self.spawn_sr_relayed);
+        let fail_counter = Arc::clone(&self.spawn_encrypt_fail);
 
-        for target in &targets {
-            if !target.is_subscribe_ready() { continue; }
+        tokio::spawn(async move {
+            let mut relay_count = 0u32;
+            for target in &targets {
+                if !target.is_subscribe_ready() { continue; }
 
-            let addr = match target.subscribe.get_address() {
-                Some(a) => a,
-                None => continue,
-            };
+                let addr = match target.subscribe.get_address() {
+                    Some(a) => a,
+                    None => continue,
+                };
 
-            // subscriber의 subscribe session outbound_srtp로 SRTCP encrypt
-            let encrypted = {
-                let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
-                match ctx.encrypt_rtcp(plaintext) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if is_detail {
-                            debug!("[DBG:RTCP:PUB] relay encrypt FAILED → user={}: {e}", target.user_id);
+                let encrypted = {
+                    let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
+                    match ctx.encrypt_rtcp(&plaintext_owned) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            fail_counter.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
-                        continue;
                     }
-                }
-            };
+                };
 
-            if let Err(e) = self.socket.send_to(&encrypted, addr).await {
-                if is_detail {
-                    debug!("[DBG:RTCP:PUB] relay send FAILED → user={} addr={}: {e}", target.user_id, addr);
+                if socket.send_to(&encrypted, addr).await.is_ok() {
+                    relay_count += 1;
                 }
-            } else {
-                relay_count += 1;
             }
-        }
-
-        if is_detail {
-            debug!("[DBG:RTCP:PUB] SR relay user={} pt={} relayed_to={}",
-                sender.user_id, first_pt, relay_count);
-        }
+            relay_counter.fetch_add(relay_count as u64, Ordering::Relaxed);
+        });
     }
 }
 
