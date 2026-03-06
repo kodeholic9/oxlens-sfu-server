@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.5] - 2026-03-07
+
+### Added (Phase W-1: Fan-out spawn — UDP 멀티코어 분산 1단계)
+
+#### 서버
+- `handle_srtp()` fan-out 루프를 `tokio::spawn`으로 분리 — 메인 루프는 recv→decrypt→cache→spawn만 수행
+- `relay_publish_rtcp()` SR fan-out도 동일하게 `tokio::spawn` 분리
+- `UdpTransport`에 `Arc<AtomicU64>` 3종 추가: `spawn_rtp_relayed`, `spawn_sr_relayed`, `spawn_encrypt_fail`
+- `flush_metrics()`에서 spawn atomic 카운터를 JSON에 포함
+
+### 결과 (RPi 4B 벤치마크)
+- 25인: loss 0.004%→**0.000%**, CPU 80%→135% (4코어 균등 분산)
+- 30인: loss **9.6%→1.3%**, CPU 121%→118% (**사실상 PASS, NACK/RTX 커버 가능**)
+- 35인: loss 13.4%, CPU 155% (FAIL — recv+decrypt 단일 task 한계, W-2 필요)
+- 4코어 균등 분산 확인: Cpu0~3 각 25~28% (이전: Cpu0만 91.6%)
+
+### 설계 결정
+- spawn 내부에서는 per-target 타이밍 생략 (ServerMetrics 접근 불가)
+- relay total timing 제거 (spawn 후 의미 없음)
+- outbound_srtp Mutex가 동시 접근 직렬화하므로 정합성 안전
+
 ## [0.3.4] - 2026-03-06
 
 ### Changed

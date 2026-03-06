@@ -134,12 +134,22 @@
 - [ ] Relay gate: only floor holder's media forwarded in PTT mode
 - [ ] Floor indicator broadcast
 
+## Phase W: UDP Worker 멀티코어 분산
+- [x] W-1: Fan-out spawn — handle_srtp/relay_publish_rtcp fan-out을 tokio::spawn 분리 — v0.3.5
+  - 30인 loss 9.6%→1.3%, 4코어 균등 분산 확인
+- [ ] W-2: Multi-worker (SO_REUSEPORT) — N개 독립 recv 루프, 커널 4-tuple hash 분배
+  - UdpTransport → UdpWorker × N 구조 개편
+  - DtlsSessionMap worker별 독립
+  - 목표: 50인+ conference
+- [ ] W-3: recvmmsg batch 수신 (선택적, pps 5만+ 시)
+
 ## Benchmark
 - [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화
 - [x] RPi 4B fan-out 한계 테스트 (fo1→499, 13회, loss 0.002%, CPU 69%)
 - [x] 벤치마크 리포트 문서화 (doc/BENCHMARK-FANOUT-20260306.md)
 - [x] Conference 벤치마크 (5/10/20/25/30인, 25인 PASS, 30인 FAIL)
-- [ ] Multi-publisher 확장 벤치마크 (40인+ — fan-out 루프 병렬화 후)
+- [x] W-1 Conference 벤치마크 (25인 0%, 30인 1.3%, 35인 13.4%) — v0.3.5
+- [ ] W-2 Conference 벤치마크 (50인+ 목표)
 - [ ] TWCC 구현 후 전후 벤치마크 비교
 
 ## Backlog
