@@ -159,13 +159,14 @@
 - [x] egress_drop 카운터: try_send 실패 시 silent drop → 카운팅
 - [x] 어드민: eg_drop 표시 + 경고 배너
 
-## Phase GM: GlobalMetrics 리팩터링 (v0.4.0)
-- [ ] AtomicTimingStat 구현 (EgressTimingAtomics 일반화)
-- [ ] GlobalMetrics 구조체 (Arc 공유, 전체 Atomic)
-- [ ] ServerMetrics + EgressTimingAtomics + spawn atomics 통합
-- [ ] UdpTransport &mut self → &self 복귀
-- [ ] egress task 파라미터 정리 (timing 제거, metrics 통합)
-- [ ] 상세 설계: doc/NEXT-SESSION-GLOBALMETRICS.md 참조
+## Phase GM: GlobalMetrics 리팩터링 (v0.4.0) ✅
+- [x] AtomicTimingStat 구현 (EgressTimingAtomics 일반화)
+- [x] GlobalMetrics 구조체 (Arc 공유, 전체 Atomic)
+- [x] ServerMetrics + EgressTimingAtomics + spawn atomics 통합
+- [x] UdpTransport &mut self → &self 복귀
+- [x] egress task 파라미터 정리 (timing 제거, metrics 통합)
+- [x] `src/metrics/` 모듈 분리 (env.rs, tokio_snapshot.rs, mod.rs)
+- [x] `src/transport/udp/metrics.rs` 제거 (udp/ = 순수 미디어 코어)
 
 ## Benchmark
 - [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화

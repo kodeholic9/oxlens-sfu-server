@@ -15,9 +15,8 @@
 //!   ingress.rs  — publish RTP/RTCP 수신 처리 (hot path)
 //!   egress.rs   — subscriber 방향 송신 (egress task, PLI, REMB)
 //!   rtcp.rs     — RTCP/RTP 패킷 파싱 및 조립 헬퍼
-//!   metrics.rs  — B구간 계측 (TimingStat, ServerMetrics)
+//!   (metrics → src/metrics/ 모듈로 분리, v0.4.0)
 
-mod metrics;
 mod rtcp;
 mod ingress;
 mod egress;
@@ -30,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
@@ -43,6 +42,7 @@ use webrtc_util::conn::Conn;
 
 use crate::config;
 use crate::config::BweMode;
+use crate::metrics::GlobalMetrics;
 use crate::room::participant::PcType;
 use crate::room::room::RoomHub;
 use crate::transport::demux::{self, PacketType};
@@ -50,7 +50,6 @@ use crate::transport::demux_conn::{DemuxConn, DtlsPacketTx};
 use crate::transport::dtls::{self, ServerCert};
 use crate::transport::stun;
 
-use metrics::{ServerMetrics, EnvironmentMeta, EgressTimingAtomics, TokioRuntimeSnapshot};
 use rtcp::current_ts;
 use egress::{run_egress_task, send_pli_to_publishers};
 
@@ -106,22 +105,14 @@ pub struct UdpTransport {
     dtls_map:                  DtlsSessionMap,
     pub(crate) pkt_count:      u64,
     pub(crate) dbg_rtp_count:  AtomicU64,
-    pub(crate) metrics:        ServerMetrics,
+    pub(crate) metrics:        Arc<GlobalMetrics>,
     pub(crate) admin_tx:       broadcast::Sender<String>,
-    // Phase W-1: spawn fan-out atomic counters
-    pub(crate) spawn_rtp_relayed:  Arc<AtomicU64>,
-    pub(crate) spawn_sr_relayed:   Arc<AtomicU64>,
-    pub(crate) spawn_encrypt_fail: Arc<AtomicU64>,
     // Phase W-2: multi-worker
     pub(crate) worker_id: u8,
     // BWE mode (TWCC or REMB)
     pub(crate) bwe_mode: BweMode,
     // REMB bitrate (bps, .env REMB_BITRATE_BPS)
     pub(crate) remb_bitrate: u64,
-    // Phase v0.3.9: 텔레메트리 가시성
-    pub(crate) env_meta: EnvironmentMeta,
-    pub(crate) tokio_snapshot: TokioRuntimeSnapshot,
-    pub(crate) egress_timing: Arc<EgressTimingAtomics>,
 }
 
 impl UdpTransport {
@@ -134,6 +125,7 @@ impl UdpTransport {
         let socket = UdpSocket::bind(addr).await?;
         info!("UDP transport bound on {}", addr);
 
+        let metrics = Arc::new(GlobalMetrics::new(1, &BweMode::Twcc));
         Ok(Self {
             socket: Arc::new(socket),
             room_hub,
@@ -141,32 +133,28 @@ impl UdpTransport {
             dtls_map: DtlsSessionMap::new(),
             pkt_count: 0,
             dbg_rtp_count: AtomicU64::new(0),
-            metrics: ServerMetrics::new(),
+            metrics,
             admin_tx,
-            spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
-            spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
-            spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
             worker_id: 0,
             bwe_mode: BweMode::Twcc,
             remb_bitrate: config::REMB_BITRATE_BPS,
-            env_meta: EnvironmentMeta::capture(1, &BweMode::Twcc),
-            tokio_snapshot: TokioRuntimeSnapshot::new(),
-            egress_timing: Arc::new(EgressTimingAtomics::new()),
         })
     }
 
     /// 외부에서 생성된 socket을 받아 구성 (AppState와 socket 공유 시)
-    pub fn from_socket(
+    #[allow(dead_code)]
+    pub(crate) fn from_socket(
         socket:   Arc<UdpSocket>,
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
         admin_tx: broadcast::Sender<String>,
+        metrics:  Arc<GlobalMetrics>,
     ) -> Self {
-        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0, BweMode::Twcc, config::REMB_BITRATE_BPS)
+        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0, BweMode::Twcc, config::REMB_BITRATE_BPS, metrics)
     }
 
     /// Phase W-2: worker_id 지정 생성자
-    pub fn from_socket_with_id(
+    pub(crate) fn from_socket_with_id(
         socket:   Arc<UdpSocket>,
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
@@ -174,10 +162,8 @@ impl UdpTransport {
         worker_id: u8,
         bwe_mode: BweMode,
         remb_bitrate: u64,
+        metrics:  Arc<GlobalMetrics>,
     ) -> Self {
-        // worker_count: Linux=resolve_worker_count, Windows=1
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| n.get()).unwrap_or(1);
         Self {
             socket,
             room_hub,
@@ -185,17 +171,11 @@ impl UdpTransport {
             dtls_map: DtlsSessionMap::new(),
             pkt_count: 0,
             dbg_rtp_count: AtomicU64::new(0),
-            metrics: ServerMetrics::new(),
+            metrics,
             admin_tx,
-            spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
-            spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
-            spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
             worker_id,
             bwe_mode,
             remb_bitrate,
-            env_meta: EnvironmentMeta::capture(worker_count, &bwe_mode),
-            tokio_snapshot: TokioRuntimeSnapshot::new(),
-            egress_timing: Arc::new(EgressTimingAtomics::new()),
         }
     }
 
@@ -258,24 +238,10 @@ impl UdpTransport {
         }
     }
 
-    /// 3초마다 metrics 집계 → admin_tx로 push → reset
-    fn flush_metrics(&mut self) {
-        let mut json = self.metrics.to_json();
-        // Phase W-1: spawn fan-out atomic counters 포함
-        let rtp_relayed = self.spawn_rtp_relayed.swap(0, Ordering::Relaxed);
-        let sr_relayed  = self.spawn_sr_relayed.swap(0, Ordering::Relaxed);
-        let enc_fail    = self.spawn_encrypt_fail.swap(0, Ordering::Relaxed);
-        if let serde_json::Value::Object(ref mut map) = json {
-            map.insert("spawn_rtp_relayed".into(), serde_json::json!(rtp_relayed));
-            map.insert("spawn_sr_relayed".into(), serde_json::json!(sr_relayed));
-            map.insert("spawn_encrypt_fail".into(), serde_json::json!(enc_fail));
-            // v0.3.9: 환경 메타 + egress encrypt timing + Tokio 런타임
-            map.insert("env".into(), self.env_meta.to_json());
-            map.insert("egress_encrypt".into(), self.egress_timing.flush_to_json());
-            map.insert("tokio_runtime".into(), self.tokio_snapshot.sample());
-        }
+    /// 3초마다 metrics 집계 → admin_tx로 push (GlobalMetrics가 swap+reset 통합 처리)
+    fn flush_metrics(&self) {
+        let json = self.metrics.flush();
         let _ = self.admin_tx.send(json.to_string());
-        self.metrics.reset();
     }
 
     // ========================================================================
@@ -377,7 +343,7 @@ impl UdpTransport {
         let cert = Arc::clone(&self.cert);
         let socket = Arc::clone(&self.socket);
         let room_hub = Arc::clone(&self.room_hub);
-        let egress_timing = Arc::clone(&self.egress_timing);
+        let metrics = Arc::clone(&self.metrics);
 
         tokio::spawn(async move {
             info!("[DBG:DTLS] handshake starting user={} pc={} addr={}",
@@ -412,8 +378,8 @@ impl UdpTransport {
                                 if let Some(rx) = egress_rx {
                                     let eg_socket = Arc::clone(&socket);
                                     let eg_participant = Arc::clone(&participant);
-                                    let eg_timing = Arc::clone(&egress_timing);
-                                    tokio::spawn(run_egress_task(rx, eg_participant, eg_socket, eg_timing));
+                                    let eg_metrics = Arc::clone(&metrics);
+                                    tokio::spawn(run_egress_task(rx, eg_participant, eg_socket, eg_metrics));
                                     info!("[EGRESS] spawned user={}", participant.user_id);
                                 }
 

@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod signaling;
 pub mod transport;
 pub mod media;
@@ -22,6 +23,7 @@ use crate::signaling::opcode;
 use crate::state::AppState;
 use crate::signaling::handler;
 use crate::transport::dtls::ServerCert;
+use crate::metrics::GlobalMetrics;
 use crate::transport::udp::UdpTransport;
 
 // ============================================================================
@@ -131,6 +133,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
 
+    // Phase GM: 전역 메트릭 (모든 worker + egress task 공유)
+    let metrics = Arc::new(GlobalMetrics::new(worker_count, &bwe_mode));
+
     // Worker-0: primary socket 사용
     let w0 = UdpTransport::from_socket_with_id(
         primary_socket,
@@ -140,6 +145,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         0,
         bwe_mode,
         remb_bitrate,
+        Arc::clone(&metrics),
     );
     tokio::spawn(async move { w0.run().await; });
 
@@ -157,6 +163,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 i as u8,
                 bwe_mode,
                 remb_bitrate,
+                Arc::clone(&metrics),
             );
             tokio::spawn(async move { w.run().await; });
         }

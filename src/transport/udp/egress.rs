@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::room::participant::{EgressPacket, TrackKind};
 
 use super::UdpTransport;
-use super::metrics::EgressTimingAtomics;
+use crate::metrics::GlobalMetrics;
 use super::rtcp::{build_pli, build_remb};
 use super::twcc::build_twcc_feedback;
 
@@ -26,7 +26,7 @@ use super::twcc::build_twcc_feedback;
 impl UdpTransport {
     /// 모든 room의 모든 publisher에게 TWCC feedback 전송 (100ms 주기)
     /// Chrome GCC가 패킷 도착 시간 변화(delay gradient)를 분석해 비트레이트 자율 결정
-    pub(crate) async fn send_twcc_to_publishers(&mut self) {
+    pub(crate) async fn send_twcc_to_publishers(&self) {
         for room_entry in self.room_hub.rooms.iter() {
             let room = room_entry.value();
 
@@ -75,7 +75,7 @@ impl UdpTransport {
                 if let Err(e) = self.socket.send_to(&encrypted, pub_addr).await {
                     debug!("[TWCC] send FAILED user={} addr={}: {e}", publisher.user_id, pub_addr);
                 } else {
-                    self.metrics.twcc_sent += 1;
+                    self.metrics.twcc_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -83,7 +83,7 @@ impl UdpTransport {
 
     /// 모든 room의 모든 publisher에게 REMB 전송 (BWE_MODE=remb 시 사용)
     /// Chrome BWE에게 "이 만큼까지 보내도 된다"는 고정 대역폭 힌트 제공
-    pub(crate) async fn send_remb_to_publishers(&mut self) {
+    pub(crate) async fn send_remb_to_publishers(&self) {
         for room_entry in self.room_hub.rooms.iter() {
             let room = room_entry.value();
 
@@ -136,7 +136,7 @@ pub(crate) async fn run_egress_task(
     mut rx: mpsc::Receiver<EgressPacket>,
     participant: Arc<crate::room::participant::Participant>,
     socket: Arc<UdpSocket>,
-    timing: Arc<EgressTimingAtomics>,
+    metrics: Arc<GlobalMetrics>,
 ) {
     info!("[EGRESS] started user={}", participant.user_id);
 
@@ -157,7 +157,7 @@ pub(crate) async fn run_egress_task(
                 ctx.encrypt_rtcp(&plaintext)
             }
         };
-        timing.record(t0.elapsed().as_micros() as u64);
+        metrics.egress_encrypt.record(t0.elapsed().as_micros() as u64);
 
         if let Ok(encrypted) = result {
             let _ = socket.send_to(&encrypted, addr).await;

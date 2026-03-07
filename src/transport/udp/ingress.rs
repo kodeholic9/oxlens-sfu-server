@@ -25,7 +25,7 @@ use super::twcc;
 
 impl UdpTransport {
     /// SRTP hot path — publish RTP decrypt → fan-out to subscriber egress queues
-    pub(crate) async fn handle_srtp(&mut self, buf: &[u8], remote: std::net::SocketAddr) {
+    pub(crate) async fn handle_srtp(&self, buf: &[u8], remote: std::net::SocketAddr) {
         let seq_num = self.dbg_rtp_count.fetch_add(1, Ordering::Relaxed);
 
         // O(1) lookup: addr → (participant, pc_type, room)
@@ -74,7 +74,7 @@ impl UdpTransport {
                         p
                     }
                     Err(e) => {
-                        self.metrics.decrypt_fail += 1;
+                        self.metrics.decrypt_fail.fetch_add(1, Ordering::Relaxed);
                         if is_detail {
                             debug!("[DBG:RTCP:PUB] decrypt FAILED user={}: {e}", sender.user_id);
                         }
@@ -100,7 +100,7 @@ impl UdpTransport {
                     p
                 }
                 Err(e) => {
-                    self.metrics.decrypt_fail += 1;
+                    self.metrics.decrypt_fail.fetch_add(1, Ordering::Relaxed);
                     if seq_num < config::DBG_DETAIL_LIMIT {
                         debug!("[DBG:RTP] decrypt FAILED user={} addr={} srtp_len={}: {e}",
                             sender.user_id, remote, buf.len());
@@ -121,10 +121,10 @@ impl UdpTransport {
             match sender.rtp_cache.lock() {
                 Ok(mut cache) => {
                     cache.store(rtp_hdr.seq, &plaintext);
-                    self.metrics.rtp_cache_stored += 1;
+                    self.metrics.rtp_cache_stored.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
-                    self.metrics.rtp_cache_lock_fail += 1;
+                    self.metrics.rtp_cache_lock_fail.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -133,7 +133,7 @@ impl UdpTransport {
         if let Some(twcc_seq) = twcc::parse_twcc_seq(&plaintext, config::TWCC_EXTMAP_ID) {
             if let Ok(mut rec) = sender.twcc_recorder.lock() {
                 rec.record(twcc_seq, Instant::now());
-                self.metrics.twcc_recorded += 1;
+                self.metrics.twcc_recorded.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -164,7 +164,7 @@ impl UdpTransport {
             let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
             if target.egress_tx.try_send(EgressPacket::Rtp(plaintext.clone())).is_err() {
-                self.metrics.egress_drop += 1;
+                self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -177,7 +177,7 @@ impl UdpTransport {
     /// - NACK (PT=205): 서버에서 RTX 재전송 (기존 Phase C 로직)
     /// - RR/PLI/REMB: 해당 publisher의 publish PC로 transparent relay
     async fn handle_subscribe_rtcp(
-        &mut self,
+        &self,
         buf: &[u8],
         remote: std::net::SocketAddr,
         subscriber: &Arc<crate::room::participant::Participant>,
@@ -185,7 +185,7 @@ impl UdpTransport {
         seq_num: u64,
     ) {
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
-        self.metrics.sub_rtcp_received += 1;
+        self.metrics.sub_rtcp_received.fetch_add(1, Ordering::Relaxed);
 
         // RTCP인지 확인 (RFC 5761: PT 72-79)
         let is_rtcp = buf.get(1)
@@ -193,7 +193,7 @@ impl UdpTransport {
             .unwrap_or(false);
 
         if !is_rtcp {
-            self.metrics.sub_rtcp_not_rtcp += 1;
+            self.metrics.sub_rtcp_not_rtcp.fetch_add(1, Ordering::Relaxed);
             if is_detail {
                 trace!("[DBG:SUB] non-RTCP from subscribe PC user={} addr={} byte0=0x{:02X} byte1=0x{:02X}",
                     subscriber.user_id, remote,
@@ -208,11 +208,11 @@ impl UdpTransport {
             let mut ctx = subscriber.subscribe.inbound_srtp.lock().unwrap();
             match ctx.decrypt_rtcp(buf) {
                 Ok(p) => {
-                    self.metrics.sub_rtcp_decrypted += 1;
+                    self.metrics.sub_rtcp_decrypted.fetch_add(1, Ordering::Relaxed);
                     p
                 }
                 Err(e) => {
-                    self.metrics.decrypt_fail += 1;
+                    self.metrics.decrypt_fail.fetch_add(1, Ordering::Relaxed);
                     if is_detail {
                         debug!("[DBG:RTCP:SUB] SRTCP decrypt FAILED user={} addr={}: {e}",
                             subscriber.user_id, remote);
@@ -231,7 +231,7 @@ impl UdpTransport {
         }
 
         // (1) NACK 처리 (RTX 재전송 — 기존 로직)
-        self.metrics.nack_received += parsed.nack_blocks.len() as u64;
+        self.metrics.nack_received.fetch_add(parsed.nack_blocks.len() as u64, Ordering::Relaxed);
         for nack_block in &parsed.nack_blocks {
             self.handle_nack_block(nack_block, subscriber, room, is_detail);
         }
@@ -244,8 +244,8 @@ impl UdpTransport {
         // RR/PLI relay count — plaintext는 이미 복호화된 RTCP이므로 & 0x7F 마스크 불필요
         for block in &parsed.relay_blocks {
             let pt = plaintext.get(block.offset + 1).copied().unwrap_or(0);
-            if pt == config::RTCP_PT_RR { self.metrics.rr_relayed += 1; }
-            if pt == config::RTCP_PT_PSFB { self.metrics.pli_sent += 1; }
+            if pt == config::RTCP_PT_RR { self.metrics.rr_relayed.fetch_add(1, Ordering::Relaxed); }
+            if pt == config::RTCP_PT_PSFB { self.metrics.pli_sent.fetch_add(1, Ordering::Relaxed); }
         }
 
         // media_ssrc → publisher 매핑 + RTCP 블록 그룹핑
@@ -315,7 +315,7 @@ impl UdpTransport {
 
     /// 단일 NACK RTCP 블록 처리: 캐시 조회 → RTX 조립 → 전송
     fn handle_nack_block(
-        &mut self,
+        &self,
         nack_data: &[u8],
         subscriber: &Arc<crate::room::participant::Participant>,
         room: &Arc<Room>,
@@ -337,7 +337,7 @@ impl UdpTransport {
             let publisher = match publisher {
                 Some(p) => p,
                 None => {
-                    self.metrics.nack_publisher_not_found += 1;
+                    self.metrics.nack_publisher_not_found.fetch_add(1, Ordering::Relaxed);
                     if is_detail {
                         debug!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", nack.media_ssrc);
                     }
@@ -353,7 +353,7 @@ impl UdpTransport {
             let rtx_ssrc = match rtx_ssrc {
                 Some(s) => s,
                 None => {
-                    self.metrics.nack_no_rtx_ssrc += 1;
+                    self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
                     if is_detail {
                         debug!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", nack.media_ssrc);
                     }
@@ -373,12 +373,12 @@ impl UdpTransport {
             };
 
             let cache_miss = lost_seqs.len() - rtx_packets.len();
-            self.metrics.rtx_cache_miss += cache_miss as u64;
-            self.metrics.rtx_sent += rtx_packets.len() as u64;
+            self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
+            self.metrics.rtx_sent.fetch_add(rtx_packets.len() as u64, Ordering::Relaxed);
 
             if cache_miss > 0 {
                 // 진단 로그: miss된 seq와 캐시 슬롯 상태 확인 (처음 10건)
-                if self.metrics.rtx_cache_miss <= 10 {
+                if self.metrics.rtx_cache_miss.load(Ordering::Relaxed) <= 10 {
                     let cache = publisher.rtp_cache.lock().unwrap();
                     let missed: Vec<String> = lost_seqs.iter()
                         .filter(|&&s| rtx_packets.iter().all(|(ls, _, _)| *ls != s))
@@ -395,14 +395,14 @@ impl UdpTransport {
                         .collect();
                     debug!("[DBG:RTX] MISS {}/{} ssrc=0x{:08X} user={} cached_3s={} samples=[{}]",
                         cache_miss, lost_seqs.len(), nack.media_ssrc,
-                        publisher.user_id, self.metrics.rtp_cache_stored, missed.join(", "));
+                        publisher.user_id, self.metrics.rtp_cache_stored.load(Ordering::Relaxed), missed.join(", "));
                 }
             }
 
             // Phase W-3: RTX도 egress 큐 경유
             for (_lost_seq, _rtx_seq, rtx_pkt) in rtx_packets {
                 if subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt)).is_err() {
-                    self.metrics.egress_drop += 1;
+                    self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -416,13 +416,13 @@ impl UdpTransport {
     /// SR 외 다른 RTCP도 함께 있을 수 있으나, compound 통째로 릴레이한다.
     /// (publish → subscribe 방향에는 NACK이 없으므로 분리 불필요)
     fn relay_publish_rtcp(
-        &mut self,
+        &self,
         plaintext: &[u8],
         sender: &Arc<crate::room::participant::Participant>,
         room: &Arc<Room>,
         _is_detail: bool,
     ) {
-        self.metrics.sr_relayed += 1;
+        self.metrics.sr_relayed.fetch_add(1, Ordering::Relaxed);
 
         // Phase W-3: egress 큐로 SR relay 전달 (DashMap iter 직접 순회, Vec 할당 없음)
         let plaintext_owned = plaintext.to_vec();
@@ -432,7 +432,7 @@ impl UdpTransport {
             let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
             if target.egress_tx.try_send(EgressPacket::Rtcp(plaintext_owned.clone())).is_err() {
-                self.metrics.egress_drop += 1;
+                self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

@@ -107,6 +107,10 @@ src/
 ├── config.rs               Global constants
 ├── error.rs                Error types (1xxx~9xxx)
 ├── state.rs                AppState (RoomHub + Router + ServerCert)
+├── metrics/                관측 전용 모듈 (0xLENS 경계)
+│   ├── mod.rs              GlobalMetrics + AtomicTimingStat + flush
+│   ├── env.rs              EnvironmentMeta (불변 환경 정보)
+│   └── tokio_snapshot.rs   TokioRuntimeSnapshot (3초 delta)
 ├── signaling/
 │   ├── opcode.rs           Opcode constants
 │   ├── message.rs          Packet types & payloads
@@ -118,13 +122,12 @@ src/
 │   ├── demux_conn.rs       Conn trait adapter (mpsc ↔ DTLSConn bridge)
 │   ├── dtls.rs             DTLS (cert, fingerprint, handshake, key export)
 │   ├── srtp.rs             SRTP context (encrypt/decrypt)
-│   └── udp/                Single-port UDP loop + RoomHub integration
+│   └── udp/                Single-port UDP loop (순수 미디어 파이프라인)
 │       ├── mod.rs           UdpTransport 본체 + run() + STUN + DTLS + worker
-│       ├── ingress.rs       Publish RTP/RTCP 수신 (hot path)
+│       ├── ingress.rs       Publish RTP/RTCP 수신 (hot path, &self)
 │       ├── egress.rs        Subscriber 송신 (egress task, PLI, TWCC)
 │       ├── rtcp.rs          RTCP/RTP 파싱·조립 헬퍼 (NACK, RTX, PLI, REMB)
-│       ├── twcc.rs          TWCC 도착 시간 기록 + feedback RTCP 빌더
-│       └── metrics.rs       B구간 계측 (TimingStat, ServerMetrics)
+│       └── twcc.rs          TWCC 도착 시간 기록 + feedback RTCP 빌더
 ├── media/
 │   ├── router.rs           SSRC routing table
 │   └── track.rs            Track context
@@ -215,7 +218,7 @@ async-trait = "0.1"
 | TW | TWCC Transport-Wide Congestion Control (REMB 대체) | 0.3.8 | ✅ |
 | TV | Telemetry Visibility (환경메타 + Egress timing + Tokio RuntimeMetrics) | 0.3.9 | ✅ |
 | HP | Hot Path Vec alloc 제거 + egress_drop 방어 | 0.3.10 | ✅ |
-| GM | GlobalMetrics 리팩터링 (Arc + 전체 Atomic, &mut self 제거) | 0.4.0 | |
+| GM | GlobalMetrics 리팩터링 (Arc + 전체 Atomic, &mut self 제거) + 모듈 분리 | 0.4.0 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -290,6 +293,14 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.4.0 — GlobalMetrics 리팩터링 + 모듈 분리 (Phase GM)
+- `ServerMetrics` → `GlobalMetrics` (Arc 공유, 전체 Atomic) — &mut self 감염 제거
+- `EgressTimingAtomics` → `AtomicTimingStat` 일반화, spawn atomics 3개 흡수
+- `src/metrics/` 모듈 분리 (mod.rs, env.rs, tokio_snapshot.rs)
+- `src/transport/udp/metrics.rs` 제거 → udp/ = 순수 미디어 파이프라인
+- hot path 4개 메서드 + egress 2개 메서드 `&self` 복귀
+- 어드민 JSON 포맷 변경 없음 (zero admin impact)
 
 ### v0.3.10 — Hot Path 병목 제거 + egress_drop 방어
 - ingress fan-out: `other_participants()` Vec 할당 → `DashMap iter` 직접 순회 (0 alloc)
@@ -458,7 +469,7 @@ Bytes 8-11: media_ssrc (big-endian)
 
 - 수집 구간: S(SDP/코덱), A(Publisher), B(SFU 서버), C(Subscriber)
 - 전달: 클라이언트 → OP_TELEMETRY(30) → 서버 passthrough → /admin/ws
-- 서버 B구간: udp.rs `ServerMetrics` → 3초 flush → admin_tx
+- 서버 B구간: `GlobalMetrics` (Arc, 전체 Atomic) → 3초 flush → admin_tx
 - 어드민: `livechat-admin/` (WS 접속, 실시간 개요, 상세, SDP, SFU 패널, Contract, 스냅샷)
 
 ---

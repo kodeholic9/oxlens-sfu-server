@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - 2026-03-07
+
+### Changed (Phase GM: GlobalMetrics 리팩터링)
+- `ServerMetrics` → `GlobalMetrics` (Arc 공유, 전체 AtomicU64/AtomicU32)
+- `EgressTimingAtomics` → `AtomicTimingStat`로 일반화 후 `GlobalMetrics`에 흡수
+- spawn fan-out atomics 3개 (`spawn_rtp_relayed`, `spawn_sr_relayed`, `spawn_encrypt_fail`) → `GlobalMetrics`에 흡수
+- `EnvironmentMeta`, `TokioRuntimeSnapshot` → `GlobalMetrics` 내부 필드로 통합
+- ingress.rs: `handle_srtp`, `handle_subscribe_rtcp`, `handle_nack_block`, `relay_publish_rtcp` — `&mut self` → `&self` 복귀
+- egress.rs: `send_twcc_to_publishers`, `send_remb_to_publishers` — `&mut self` → `&self`
+- egress.rs: `run_egress_task` 시그니처 — `Arc<EgressTimingAtomics>` → `Arc<GlobalMetrics>`
+- mod.rs: UdpTransport 필드 대폭 축소 (metrics/env_meta/tokio_snapshot/egress_timing/spawn atomics 제거 → `Arc<GlobalMetrics>` 1개)
+- mod.rs: `from_socket`, `from_socket_with_id` — `pub` → `pub(crate)` (private type leak 해소)
+- lib.rs: `Arc<GlobalMetrics>` 한 번 생성 → 모든 worker에 Arc::clone 공유
+- 어드민 JSON 포맷 변경 없음 (어드민 코드 수정 불필요)
+
+### Added (Phase MR: 모듈 분리)
+- `src/metrics/mod.rs` — GlobalMetrics + AtomicTimingStat (관측 전용 모듈)
+- `src/metrics/env.rs` — EnvironmentMeta
+- `src/metrics/tokio_snapshot.rs` — TokioRuntimeSnapshot
+
+### Removed
+- `src/transport/udp/metrics.rs` — `src/metrics/`로 이동 (udp/ = 순수 미디어 파이프라인)
+- `TimingStat` 구조체 (mutable accumulator → AtomicTimingStat으로 대체)
+- `ServerMetrics` 구조체 (GlobalMetrics로 대체)
+- `EgressTimingAtomics` 구조체 (AtomicTimingStat으로 일반화)
+
+### 목적
+- hot path 메서드의 `&mut self` 감염 제거 → `&self`로 복귀
+- 메트릭 소유권 파편화 해소 (5가지 형태 → Arc<GlobalMetrics> 1개)
+- 새 카운터 추가 시 보일러플레이트 최소화 (new/to_json/reset 3곳 → flush 1곳)
+- transport/udp/ = 순수 미디어 코어, src/metrics/ = 관측 인프라 — 관심사 분리
+
 ## [0.3.10] - 2026-03-07
 
 ### Changed (Hot Path 병목 제거)
