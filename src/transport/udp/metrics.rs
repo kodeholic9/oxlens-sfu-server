@@ -91,6 +91,8 @@ pub(crate) struct ServerMetrics {
     pub(crate) nack_publisher_not_found: u64,
     pub(crate) nack_no_rtx_ssrc: u64,
     pub(crate) rtp_cache_lock_fail: u64,
+    // Egress 큐 포화 드롭 (v0.3.10)
+    pub(crate) egress_drop: u64,
 }
 
 impl ServerMetrics {
@@ -121,6 +123,7 @@ impl ServerMetrics {
             nack_publisher_not_found: 0,
             nack_no_rtx_ssrc: 0,
             rtp_cache_lock_fail: 0,
+            egress_drop: 0,
         }
     }
 
@@ -163,6 +166,7 @@ impl ServerMetrics {
             "nack_pub_not_found": self.nack_publisher_not_found,
             "nack_no_rtx": self.nack_no_rtx_ssrc,
             "cache_lock_fail": self.rtp_cache_lock_fail,
+            "egress_drop": self.egress_drop,
         })
     }
 
@@ -192,6 +196,7 @@ impl ServerMetrics {
         self.nack_publisher_not_found = 0;
         self.nack_no_rtx_ssrc = 0;
         self.rtp_cache_lock_fail = 0;
+        self.egress_drop = 0;
     }
 }
 

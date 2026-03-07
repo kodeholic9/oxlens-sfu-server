@@ -148,22 +148,24 @@ impl UdpTransport {
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
         }
 
-        // Phase W-3: egress 큐로 전달 (Mutex 경합 없음, subscriber별 egress task가 독점 encrypt)
-        let targets = room.other_participants(&sender.user_id);
-
+        // Phase W-3: egress 큐로 전달 (DashMap iter 직접 순회, Vec 할당 없음)
         if is_detail {
-            let target_info: Vec<String> = targets.iter()
-                .filter(|t| t.is_subscribe_ready())
-                .map(|t| format!("{}@{}", t.user_id, t.subscribe.get_address()
+            let target_info: Vec<String> = room.participants.iter()
+                .filter(|e| e.key() != &sender.user_id && e.value().is_subscribe_ready())
+                .map(|e| format!("{}@{}", e.value().user_id, e.value().subscribe.get_address()
                     .map(|a| a.to_string()).unwrap_or("none".into())))
                 .collect();
             debug!("[DBG:RELAY] #{} from={} targets=[{}]",
                 seq_num, sender.user_id, target_info.join(", "));
         }
 
-        for target in &targets {
+        for entry in room.participants.iter() {
+            if entry.key() == &sender.user_id { continue; }
+            let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
-            let _ = target.egress_tx.try_send(EgressPacket::Rtp(plaintext.clone()));
+            if target.egress_tx.try_send(EgressPacket::Rtp(plaintext.clone())).is_err() {
+                self.metrics.egress_drop += 1;
+            }
         }
     }
 
@@ -256,9 +258,8 @@ impl UdpTransport {
         }
 
         for (media_ssrc, blocks) in &publisher_rtcp {
-            // publisher 찾기
-            let publisher = room.all_participants().into_iter()
-                .find(|p| p.get_tracks().iter().any(|t| t.ssrc == *media_ssrc));
+            // publisher 찾기 (zero-alloc DashMap iter)
+            let publisher = room.find_by_track_ssrc(*media_ssrc);
 
             let publisher = match publisher {
                 Some(p) => p,
@@ -330,9 +331,8 @@ impl UdpTransport {
                     subscriber.user_id, nack.media_ssrc, nack.pid, nack.blp, lost_seqs);
             }
 
-            // 해당 media_ssrc의 publisher 찾기
-            let publisher = room.all_participants().into_iter()
-                .find(|p| p.get_tracks().iter().any(|t| t.ssrc == nack.media_ssrc));
+            // 해당 media_ssrc의 publisher 찾기 (zero-alloc DashMap iter)
+            let publisher = room.find_by_track_ssrc(nack.media_ssrc);
 
             let publisher = match publisher {
                 Some(p) => p,
@@ -401,7 +401,9 @@ impl UdpTransport {
 
             // Phase W-3: RTX도 egress 큐 경유
             for (_lost_seq, _rtx_seq, rtx_pkt) in rtx_packets {
-                let _ = subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt));
+                if subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt)).is_err() {
+                    self.metrics.egress_drop += 1;
+                }
             }
         }
     }
@@ -422,13 +424,16 @@ impl UdpTransport {
     ) {
         self.metrics.sr_relayed += 1;
 
-        // Phase W-3: egress 큐로 SR relay 전달
-        let targets = room.other_participants(&sender.user_id);
+        // Phase W-3: egress 큐로 SR relay 전달 (DashMap iter 직접 순회, Vec 할당 없음)
         let plaintext_owned = plaintext.to_vec();
 
-        for target in &targets {
+        for entry in room.participants.iter() {
+            if entry.key() == &sender.user_id { continue; }
+            let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
-            let _ = target.egress_tx.try_send(EgressPacket::Rtcp(plaintext_owned.clone()));
+            if target.egress_tx.try_send(EgressPacket::Rtcp(plaintext_owned.clone())).is_err() {
+                self.metrics.egress_drop += 1;
+            }
         }
     }
 }

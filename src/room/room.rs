@@ -166,6 +166,20 @@ impl Room {
             .map(|e| e.value().clone())
             .collect()
     }
+
+    /// SSRC로 publisher 찾기 (zero-alloc, DashMap iter 직접 순회)
+    /// NACK/RTCP relay에서 all_participants().find() 대체
+    pub fn find_by_track_ssrc(&self, ssrc: u32) -> Option<Arc<Participant>> {
+        self.participants.iter().find_map(|entry| {
+            let p = entry.value();
+            let tracks = p.tracks.lock().unwrap();
+            if tracks.iter().any(|t| t.ssrc == ssrc) {
+                Some(Arc::clone(p))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 // ============================================================================
