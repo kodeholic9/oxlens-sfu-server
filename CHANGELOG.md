@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.10] - 2026-03-07
+
+### Changed (Hot Path 병목 제거)
+- `handle_srtp` fan-out: `room.other_participants()` Vec alloc → `room.participants.iter()` DashMap 직접 순회 (0 alloc)
+- `relay_publish_rtcp`: 동일 Vec 할당 제거
+- `handle_nack_block`: `all_participants().into_iter().find()` → `room.find_by_track_ssrc()` (0 alloc)
+- `handle_subscribe_rtcp` RTCP relay: 동일 Vec 할당 제거
+
+### Added
+- `Room::find_by_track_ssrc()` — DashMap iter 직접 순회로 SSRC 기반 publisher 검색 (zero-alloc)
+- `ServerMetrics::egress_drop` 카운터 — `try_send` 실패(큐 포화) 시 카운팅
+  - `handle_srtp` fan-out, `relay_publish_rtcp` SR relay, `handle_nack_block` RTX 전송 3곳
+- 어드민: RTCP grid에 `eg_drop` 표시 + egress_drop > 0 시 노란 경고 배너
+- 어드민: 스냅샷에 egress_drop 포함
+- SFU 패널 높이 280px → 420px
+
+### 목적
+- 패킷당 Vec alloc + Arc clone N회 제거로 hot path 메모리 압력 최소화
+- egress 큐 포화 시 클라이언트 렉이 서버 내부 큐 문제인지 외부 네트워크 문제인지 구분 가능
+
 ## [0.3.9] - 2026-03-07
 
 ### Added (Phase TV: Telemetry Visibility — 텔레메트리 가시성 확보)

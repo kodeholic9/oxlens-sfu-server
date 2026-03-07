@@ -214,6 +214,8 @@ async-trait = "0.1"
 | W-3 | Subscriber Egress Task (LiveKit 패턴, 30인 0%/15ms) | 0.3.7 | ✅ |
 | TW | TWCC Transport-Wide Congestion Control (REMB 대체) | 0.3.8 | ✅ |
 | TV | Telemetry Visibility (환경메타 + Egress timing + Tokio RuntimeMetrics) | 0.3.9 | ✅ |
+| HP | Hot Path Vec alloc 제거 + egress_drop 방어 | 0.3.10 | ✅ |
+| GM | GlobalMetrics 리팩터링 (Arc + 전체 Atomic, &mut self 제거) | 0.4.0 | |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -288,6 +290,12 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.3.10 — Hot Path 병목 제거 + egress_drop 방어
+- ingress fan-out: `other_participants()` Vec 할당 → `DashMap iter` 직접 순회 (0 alloc)
+- NACK/RTCP relay: `all_participants().find()` → `room.find_by_track_ssrc()` (0 alloc)
+- `egress_drop` 카운터: `try_send` 실패 시 silent drop → 카운팅
+- 어드민: egress_drop 표시 + 노란 경고 배너
 
 ### v0.3.9 — Telemetry Visibility (텔레메트리 가시성 확보)
 - 서버: `EnvironmentMeta` (build_mode, log_level, worker_count, bwe_mode, version)

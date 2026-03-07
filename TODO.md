@@ -152,6 +152,21 @@
 - [x] Contract 체크: runtime_busy (85% WARN, 95% FAIL)
 - [x] 스냅샷 내보내기 연동
 
+## Phase HP: Hot Path 병목 제거 (v0.3.10)
+- [x] handle_srtp fan-out: other_participants() Vec → DashMap iter (0 alloc)
+- [x] relay_publish_rtcp: 동일 Vec 할당 제거
+- [x] handle_nack_block/subscribe_rtcp: all_participants().find() → find_by_track_ssrc() (0 alloc)
+- [x] egress_drop 카운터: try_send 실패 시 silent drop → 카운팅
+- [x] 어드민: eg_drop 표시 + 경고 배너
+
+## Phase GM: GlobalMetrics 리팩터링 (v0.4.0)
+- [ ] AtomicTimingStat 구현 (EgressTimingAtomics 일반화)
+- [ ] GlobalMetrics 구조체 (Arc 공유, 전체 Atomic)
+- [ ] ServerMetrics + EgressTimingAtomics + spawn atomics 통합
+- [ ] UdpTransport &mut self → &self 복귀
+- [ ] egress task 파라미터 정리 (timing 제거, metrics 통합)
+- [ ] 상세 설계: doc/NEXT-SESSION-GLOBALMETRICS.md 참조
+
 ## Benchmark
 - [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화
 - [x] RPi 4B fan-out 한계 테스트 (fo1→499, 13회, loss 0.002%, CPU 69%)
