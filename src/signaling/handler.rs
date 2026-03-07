@@ -24,7 +24,9 @@ use tokio::time::{Duration, Instant, interval_at};
 use tracing::{debug, info, trace, warn};
 
 use crate::config;
+use crate::config::RoomMode;
 use crate::room::participant::{Participant, TrackKind};
+use crate::room::floor::FloorAction;
 use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
@@ -186,6 +188,10 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::MUTE_UPDATE     => Some(handle_mute_update(session, state, &packet).await),
         opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
         opcode::TELEMETRY      => { handle_telemetry(session, state, &packet); None }
+        // Floor Control (MCPTT/MBCP)
+        opcode::FLOOR_REQUEST   => Some(handle_floor_request(session, state, &packet).await),
+        opcode::FLOOR_RELEASE   => Some(handle_floor_release(session, state, &packet).await),
+        opcode::FLOOR_PING      => Some(handle_floor_ping(session, state, &packet)),
         _ => {
             warn!("unknown opcode: {}", packet.op);
             Some(Packet::err(packet.op, packet.pid, 3001, "invalid opcode"))
@@ -228,6 +234,7 @@ fn handle_room_list(state: &AppState, packet: &Packet) -> Packet {
                 "room_id": room.id,
                 "name": room.name,
                 "capacity": room.capacity,
+                "mode": room.mode.to_string(),
                 "participants": room.participant_count(),
             })
         })
@@ -251,13 +258,15 @@ fn handle_room_create(state: &AppState, packet: &Packet) -> Packet {
     };
 
     let now = current_ts();
-    let room = state.rooms.create(req.name.clone(), req.capacity, now);
-    info!("ROOM_CREATE id={} name={}", room.id, room.name);
+    let mode = req.mode.unwrap_or(RoomModeField::Conference).to_config();
+    let room = state.rooms.create(req.name.clone(), req.capacity, mode, now);
+    info!("ROOM_CREATE id={} name={} mode={}", room.id, room.name, room.mode);
 
     Packet::ok(opcode::ROOM_CREATE, packet.pid, serde_json::json!({
         "room_id": room.id,
         "name": room.name,
         "capacity": room.capacity,
+        "mode": room.mode.to_string(),
     }))
 }
 
@@ -348,6 +357,7 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     // IP/port는 AppState에서 (.env PUBLIC_IP / UDP_PORT fallback)
     Packet::ok(opcode::ROOM_JOIN, packet.pid, serde_json::json!({
         "room_id": req.room_id,
+        "mode": room.mode.to_string(),
         "participants": members,
         "server_config": {
             "ice": {
@@ -533,6 +543,15 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
 
     let user_id = session.user_id.as_ref().unwrap();
 
+    // Floor: 발화자였으면 자동 release
+    if let Ok(room) = state.rooms.get(&req.room_id) {
+        if room.mode == RoomMode::Ptt {
+            if let Some(action) = room.floor.on_participant_leave(user_id) {
+                apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
+            }
+        }
+    }
+
     match state.rooms.remove_participant(&req.room_id, user_id) {
         Ok(p) => {
             info!("ROOM_LEAVE user={} room={}", user_id, req.room_id);
@@ -620,11 +639,161 @@ async fn handle_message(session: &Session, state: &AppState, packet: &Packet) ->
 }
 
 // ============================================================================
+// Floor Control (MCPTT/MBCP)
+// ============================================================================
+
+async fn handle_floor_request(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: FloorRequestMsg = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::FLOOR_REQUEST, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room = match state.rooms.get(&req.room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::FLOOR_REQUEST, packet.pid, 2001, "room not found"),
+    };
+
+    if room.mode != RoomMode::Ptt {
+        return Packet::err(opcode::FLOOR_REQUEST, packet.pid, 2020, "not a PTT room");
+    }
+
+    let now = current_ts();
+    let action = room.floor.request(user_id, now);
+    apply_floor_action(opcode::FLOOR_REQUEST, packet.pid, &action, &room, user_id)
+}
+
+async fn handle_floor_release(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: FloorReleaseMsg = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::FLOOR_RELEASE, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room = match state.rooms.get(&req.room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::FLOOR_RELEASE, packet.pid, 2001, "room not found"),
+    };
+
+    if room.mode != RoomMode::Ptt {
+        return Packet::err(opcode::FLOOR_RELEASE, packet.pid, 2020, "not a PTT room");
+    }
+
+    let action = room.floor.release(user_id);
+    apply_floor_action(opcode::FLOOR_RELEASE, packet.pid, &action, &room, user_id)
+}
+
+fn handle_floor_ping(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: FloorPingMsg = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::FLOOR_PING, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room = match state.rooms.get(&req.room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::FLOOR_PING, packet.pid, 2001, "room not found"),
+    };
+
+    let now = current_ts();
+    let action = room.floor.ping(user_id, now);
+    match action {
+        FloorAction::PingOk => Packet::ok(opcode::FLOOR_PING, packet.pid, serde_json::json!({})),
+        _ => Packet::err(opcode::FLOOR_PING, packet.pid, 2021, "not current speaker"),
+    }
+}
+
+/// FloorAction → 응답 패킷 + 브로드캐스트
+fn apply_floor_action(
+    op: u16,
+    pid: u64,
+    action: &FloorAction,
+    room: &crate::room::room::Room,
+    user_id: &str,
+) -> Packet {
+    match action {
+        FloorAction::Granted { speaker } => {
+            // 전체에 Floor Taken 브로드캐스트
+            let taken = Packet::new(
+                opcode::FLOOR_TAKEN,
+                0,
+                serde_json::json!({
+                    "room_id": room.id,
+                    "speaker": speaker,
+                }),
+            );
+            broadcast_to_others(room, user_id, &taken);
+
+            Packet::ok(op, pid, serde_json::json!({
+                "granted": true,
+                "speaker": speaker,
+            }))
+        }
+        FloorAction::Denied { reason, current_speaker } => {
+            Packet::err(op, pid, 2010, &format!("{} (speaker={})", reason, current_speaker))
+        }
+        FloorAction::Released { prev_speaker } => {
+            // 전체에 Floor Idle 브로드캐스트
+            let idle = Packet::new(
+                opcode::FLOOR_IDLE,
+                0,
+                serde_json::json!({
+                    "room_id": room.id,
+                    "prev_speaker": prev_speaker,
+                }),
+            );
+            broadcast_to_room(room, &idle);
+
+            Packet::ok(op, pid, serde_json::json!({}))
+        }
+        FloorAction::Revoked { prev_speaker, cause } => {
+            // 발화자에게 Revoke
+            let revoke = Packet::new(
+                opcode::FLOOR_REVOKE,
+                0,
+                serde_json::json!({
+                    "room_id": room.id,
+                    "cause": cause,
+                }),
+            );
+            // prev_speaker에게 직접 전송
+            if let Some(p) = room.get_participant(prev_speaker) {
+                let json = serde_json::to_string(&revoke).unwrap_or_default();
+                let _ = p.ws_tx.send(json);
+            }
+            // 전체에 Floor Idle
+            let idle = Packet::new(
+                opcode::FLOOR_IDLE,
+                0,
+                serde_json::json!({
+                    "room_id": room.id,
+                    "prev_speaker": prev_speaker,
+                    "cause": cause,
+                }),
+            );
+            broadcast_to_room(room, &idle);
+
+            Packet::ok(op, pid, serde_json::json!({}))
+        }
+        _ => Packet::ok(op, pid, serde_json::json!({})),
+    }
+}
+
+// ============================================================================
 // Cleanup (WS disconnect)
 // ============================================================================
 
 async fn cleanup(session: &Session, state: &AppState) {
     if let (Some(room_id), Some(user_id)) = (&session.current_room, &session.user_id) {
+        // Floor: 발화자였으면 자동 release (disconnect 시)
+        if let Ok(room) = state.rooms.get(room_id) {
+            if room.mode == RoomMode::Ptt {
+                if let Some(action) = room.floor.on_participant_leave(user_id) {
+                    apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
+                }
+            }
+        }
+
         // Get tracks before removing (for tracks_update broadcast)
         let tracks = if let Ok(room) = state.rooms.get(room_id) {
             if let Some(p) = room.get_participant(user_id) {

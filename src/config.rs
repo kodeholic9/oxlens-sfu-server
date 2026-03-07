@@ -129,6 +129,32 @@ pub const RTCP_FMT_TWCC: u8 = 15;
 /// TWCC feedback 전송 주기 (ms)
 pub const TWCC_FEEDBACK_INTERVAL_MS: u64 = 100;
 
+// --- Floor Control (MCPTT/MBCP) ---
+/// Room 모드
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomMode {
+    /// 일반 화상회의 (동시 발화 가능)
+    Conference,
+    /// 무전기 모드 (Floor Control, 1인 발화)
+    Ptt,
+}
+
+impl std::fmt::Display for RoomMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoomMode::Conference => write!(f, "conference"),
+            RoomMode::Ptt => write!(f, "ptt"),
+        }
+    }
+}
+
+/// T2: 최대 Talk Burst 시간 (ms) — 초과 시 서버가 Floor Revoke
+pub const FLOOR_MAX_BURST_MS: u64 = 30_000;
+/// T_FLOOR_PING: 발화자 생존 확인 주기 (ms) — 클라이언트가 전송
+pub const FLOOR_PING_INTERVAL_MS: u64 = 2_000;
+/// T_FLOOR_TIMEOUT: Floor PING 미수신 시 revoke (ms)
+pub const FLOOR_PING_TIMEOUT_MS: u64 = 5_000;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;

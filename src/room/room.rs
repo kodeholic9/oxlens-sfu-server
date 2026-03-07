@@ -24,8 +24,10 @@ use std::sync::Arc;
 use tracing::{debug, trace};
 
 use crate::config;
+use crate::config::RoomMode;
 use crate::error::{LightError, LightResult};
 use crate::room::participant::{Participant, PcType};
+use crate::room::floor::FloorController;
 
 // ============================================================================
 // Room
@@ -35,7 +37,11 @@ pub struct Room {
     pub id:       String,
     pub name:     String,
     pub capacity: usize,
+    pub mode:     RoomMode,
     pub created_at: u64,
+
+    /// Floor Control (PTT 모드에서만 활성)
+    pub floor: FloorController,
 
     /// Primary index: user_id → Participant
     pub participants: DashMap<String, Arc<Participant>>,
@@ -48,13 +54,15 @@ pub struct Room {
 }
 
 impl Room {
-    pub fn new(id: String, name: String, capacity: Option<usize>, created_at: u64) -> Self {
+    pub fn new(id: String, name: String, capacity: Option<usize>, mode: RoomMode, created_at: u64) -> Self {
         Self {
             id,
             name,
             capacity: capacity.unwrap_or(config::ROOM_DEFAULT_CAPACITY)
                 .min(config::ROOM_MAX_CAPACITY),
+            mode,
             created_at,
+            floor: FloorController::new(),
             participants: DashMap::new(),
             by_ufrag:     DashMap::new(),
             by_addr:      DashMap::new(),
@@ -204,9 +212,9 @@ impl RoomHub {
         }
     }
 
-    pub fn create(&self, name: String, capacity: Option<usize>, created_at: u64) -> Arc<Room> {
+    pub fn create(&self, name: String, capacity: Option<usize>, mode: RoomMode, created_at: u64) -> Arc<Room> {
         let id = uuid::Uuid::new_v4().to_string();
-        let room = Arc::new(Room::new(id.clone(), name, capacity, created_at));
+        let room = Arc::new(Room::new(id.clone(), name, capacity, mode, created_at));
         self.rooms.insert(id, room.clone());
         room
     }

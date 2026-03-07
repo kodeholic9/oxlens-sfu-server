@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-03-07
+
+### Added (Floor Control — MCPTT/MBCP 기반 PTT 시그널링)
+- `src/room/floor.rs` — FloorController 상태 머신 (IDLE/TAKEN 2-state, T2/T_FLOOR_TIMEOUT 타이머)
+- `config.rs` — RoomMode(Conference/Ptt), FLOOR_MAX_BURST_MS, FLOOR_PING_INTERVAL_MS, FLOOR_PING_TIMEOUT_MS
+- `signaling/opcode.rs` — FLOOR_REQUEST(40), FLOOR_RELEASE(41), FLOOR_PING(42), FLOOR_TAKEN(141), FLOOR_IDLE(142), FLOOR_REVOKE(143)
+- `signaling/message.rs` — FloorRequestMsg, FloorReleaseMsg, FloorPingMsg, RoomModeField
+- `signaling/handler.rs` — handle_floor_request/release/ping, apply_floor_action, leave/cleanup 시 floor 퇴장 처리
+
+### Changed
+- `room/room.rs` — Room에 mode: RoomMode, floor: FloorController 필드 추가
+- `room/room.rs` — RoomHub::create에 mode 파라미터 추가
+- `signaling/handler.rs` — ROOM_CREATE/ROOM_LIST/ROOM_JOIN 응답에 mode 필드 포함
+- `lib.rs` — 기본 방 첫 번째를 "무전 대화방" (PTT 모드)로 변경
+
 ## [0.4.0] - 2026-03-07
 
 ### Changed (Phase GM: GlobalMetrics 리팩터링)

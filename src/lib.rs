@@ -284,10 +284,10 @@ fn detect_local_ip() -> String {
 
 /// 서버 기동 시 기본 방 생성 (테스트/개발용)
 fn create_default_rooms(state: &AppState) {
-    let defaults = [
-        ("회의실-1", 10),
-        ("회의실-2", 10),
-        ("대회의실", 20),
+    let defaults: [(&str, usize, config::RoomMode); 3] = [
+        ("무전 대화방", 10, config::RoomMode::Ptt),
+        ("회의실-2", 10, config::RoomMode::Conference),
+        ("대회의실", 20, config::RoomMode::Conference),
     ];
 
     let now = std::time::SystemTime::now()
@@ -295,9 +295,9 @@ fn create_default_rooms(state: &AppState) {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    for (name, capacity) in defaults {
-        let room = state.rooms.create(name.to_string(), Some(capacity), now);
-        info!("default room created: {} (id={}, cap={})", name, room.id, capacity);
+    for (name, capacity, mode) in defaults {
+        let room = state.rooms.create(name.to_string(), Some(capacity), mode, now);
+        info!("default room created: {} (id={}, cap={}, mode={})", name, room.id, capacity, room.mode);
     }
 }
 

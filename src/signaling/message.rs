@@ -56,6 +56,8 @@ pub struct RoomCreateRequest {
     pub name: String,
     #[serde(default)]
     pub capacity: Option<usize>,
+    #[serde(default)]
+    pub mode: Option<RoomModeField>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +94,44 @@ pub struct MuteUpdateRequest {
 pub struct MessageRequest {
     pub room_id: String,
     pub content: String,
+}
+
+// --- Floor Control (MCPTT/MBCP) ---
+
+#[derive(Debug, Deserialize)]
+pub struct FloorRequestMsg {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FloorReleaseMsg {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FloorPingMsg {
+    pub room_id: String,
+}
+
+/// ROOM_CREATE 요청의 mode 필드 용
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomModeField {
+    Conference,
+    Ptt,
+}
+
+impl Default for RoomModeField {
+    fn default() -> Self { RoomModeField::Conference }
+}
+
+impl RoomModeField {
+    pub fn to_config(&self) -> crate::config::RoomMode {
+        match self {
+            RoomModeField::Conference => crate::config::RoomMode::Conference,
+            RoomModeField::Ptt => crate::config::RoomMode::Ptt,
+        }
+    }
 }
 
 // --- Event payloads (Server → Client) ---
