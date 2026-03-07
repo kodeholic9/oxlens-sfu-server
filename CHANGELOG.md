@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.9] - 2026-03-07
+
+### Added (Phase TV: Telemetry Visibility — 텔레메트리 가시성 확보)
+
+#### 서버
+- **환경 메타데이터** (`metrics.rs: EnvironmentMeta`)
+  - `build_mode` (`release`/`debug`, `cfg!(debug_assertions)` 컴파일 타임 결정)
+  - `log_level` (`RUST_LOG` 또는 `LOG_LEVEL` 환경변수)
+  - `worker_count`, `bwe_mode`, `version` — 서버 시작 시 1회 캡처
+  - 3초 flush마다 `env` 섹션으로 JSON에 포함
+- **Egress encrypt timing** (`metrics.rs: EgressTimingAtomics`)
+  - egress task에서 encrypt 전/후 `Instant::now()` 측정 (~40ns/pkt)
+  - `Arc<AtomicU64>` 3종 (sum, count, max) — lock-free, CAS max
+  - 3초 flush 시 swap+JSON 생성 → `egress_encrypt` 섹션
+- **Tokio RuntimeMetrics** (`metrics.rs: TokioRuntimeSnapshot`)
+  - `.cargo/config.toml`에 `tokio_unstable` cfg 플래그 추가
+  - 3초마다 `Handle::current().metrics()` atomic load → delta 계산
+  - 1등급 (핵심): `busy_ratio`, `alive_tasks`, `global_queue_depth`, `budget_forced_yield_count`, `io_driver_ready_count`
+  - 2등급 (per-worker): `busy_ratio`, `poll_count`, `steal_count`, `noop_count`
+  - 3등급 (정보): `num_workers`, `num_blocking_threads`
+  - hot path 비용 0 (3초에 1번 atomic load)
+
+#### 어드민 대시보드
+- SFU 패널에 **Egress Encrypt** 타이밍 표시 (avg/max ms)
+- SFU 패널에 **Tokio Runtime** 섹션 추가
+  - busy ratio (%), alive tasks, global queue, budget yield, io ready
+  - per-worker 상세: busy%, polls, steals
+  - 색상 임계값: >85% 노랑, >95% 빨강
+- SFU 패널에 **Environment** 메타 표시 (version·build·bwe·workers·log_level)
+- Contract 체크리스트에 `runtime_busy` 항목 추가 (85% WARN, 95% FAIL)
+- 스냅샷에 egress_encrypt, env, tokio runtime, per-worker 상세 포함
+
+### 설계 결정
+- `tokio-metrics` 크레이트 미사용 — `Handle::current().metrics()` 직접 접근 (외부 의존성 0)
+- `tokio_unstable`은 API 시그니처 불안정 표시이지 기능 불안정이 아님 (tokio 1.x 내 안정)
+- Egress timing은 Atomic (not Mutex) — subscriber별 독립 task에서 경합 미미
+- CAS loop max 패턴: `compare_exchange_weak` + `Relaxed` (정확도보다 성능 우선)
+
 ## [0.3.8] - 2026-03-07
 
 ### Added (Phase TW: TWCC Transport-Wide Congestion Control)

@@ -1,0 +1,5 @@
+# Tokio RuntimeMetrics API 활성화
+# "unstable" = API 시그니처가 향후 변경 가능하다는 의미 (기능 불안정 아님)
+# tokio 1.x 내에서 안정적, LiveKit 등 프로덕션 SFU에서도 사용하는 패턴
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

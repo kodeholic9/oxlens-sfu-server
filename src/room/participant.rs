@@ -167,6 +167,18 @@ impl RtpCache {
         self.slots[idx] = Some(plaintext.to_vec());
     }
 
+    /// 진단용: 슬롯에 저장된 seq 확인 (None=비어있음, Some(seq)=다른 seq 점유)
+    pub fn slot_seq(&self, seq: u16) -> Option<u16> {
+        let idx = (seq as usize) % config::RTP_CACHE_SIZE;
+        self.slots[idx].as_ref().and_then(|pkt| {
+            if pkt.len() >= config::RTP_HEADER_MIN_SIZE {
+                Some(u16::from_be_bytes([pkt[2], pkt[3]]))
+            } else {
+                None
+            }
+        })
+    }
+
     /// seq로 캐시된 RTP 조회
     pub fn get(&self, seq: u16) -> Option<&[u8]> {
         let idx = (seq as usize) % config::RTP_CACHE_SIZE;

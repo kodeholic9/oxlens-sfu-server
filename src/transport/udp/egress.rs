@@ -7,6 +7,7 @@
 //! - send_pli_to_publishers: subscribe ready → PLI 요청
 
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -14,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::room::participant::{EgressPacket, TrackKind};
 
 use super::UdpTransport;
+use super::metrics::EgressTimingAtomics;
 use super::rtcp::{build_pli, build_remb};
 use super::twcc::build_twcc_feedback;
 
@@ -134,6 +136,7 @@ pub(crate) async fn run_egress_task(
     mut rx: mpsc::Receiver<EgressPacket>,
     participant: Arc<crate::room::participant::Participant>,
     socket: Arc<UdpSocket>,
+    timing: Arc<EgressTimingAtomics>,
 ) {
     info!("[EGRESS] started user={}", participant.user_id);
 
@@ -143,6 +146,7 @@ pub(crate) async fn run_egress_task(
             None => continue,
         };
 
+        let t0 = Instant::now();
         let result = match pkt {
             EgressPacket::Rtp(plaintext) => {
                 let mut ctx = participant.subscribe.outbound_srtp.lock().unwrap();
@@ -153,6 +157,7 @@ pub(crate) async fn run_egress_task(
                 ctx.encrypt_rtcp(&plaintext)
             }
         };
+        timing.record(t0.elapsed().as_micros() as u64);
 
         if let Ok(encrypted) = result {
             let _ = socket.send_to(&encrypted, addr).await;

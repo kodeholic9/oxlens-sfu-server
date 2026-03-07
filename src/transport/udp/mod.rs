@@ -50,7 +50,7 @@ use crate::transport::demux_conn::{DemuxConn, DtlsPacketTx};
 use crate::transport::dtls::{self, ServerCert};
 use crate::transport::stun;
 
-use metrics::ServerMetrics;
+use metrics::{ServerMetrics, EnvironmentMeta, EgressTimingAtomics, TokioRuntimeSnapshot};
 use rtcp::current_ts;
 use egress::{run_egress_task, send_pli_to_publishers};
 
@@ -118,6 +118,10 @@ pub struct UdpTransport {
     pub(crate) bwe_mode: BweMode,
     // REMB bitrate (bps, .env REMB_BITRATE_BPS)
     pub(crate) remb_bitrate: u64,
+    // Phase v0.3.9: 텔레메트리 가시성
+    pub(crate) env_meta: EnvironmentMeta,
+    pub(crate) tokio_snapshot: TokioRuntimeSnapshot,
+    pub(crate) egress_timing: Arc<EgressTimingAtomics>,
 }
 
 impl UdpTransport {
@@ -145,6 +149,9 @@ impl UdpTransport {
             worker_id: 0,
             bwe_mode: BweMode::Twcc,
             remb_bitrate: config::REMB_BITRATE_BPS,
+            env_meta: EnvironmentMeta::capture(1, &BweMode::Twcc),
+            tokio_snapshot: TokioRuntimeSnapshot::new(),
+            egress_timing: Arc::new(EgressTimingAtomics::new()),
         })
     }
 
@@ -168,6 +175,9 @@ impl UdpTransport {
         bwe_mode: BweMode,
         remb_bitrate: u64,
     ) -> Self {
+        // worker_count: Linux=resolve_worker_count, Windows=1
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(1);
         Self {
             socket,
             room_hub,
@@ -183,6 +193,9 @@ impl UdpTransport {
             worker_id,
             bwe_mode,
             remb_bitrate,
+            env_meta: EnvironmentMeta::capture(worker_count, &bwe_mode),
+            tokio_snapshot: TokioRuntimeSnapshot::new(),
+            egress_timing: Arc::new(EgressTimingAtomics::new()),
         }
     }
 
@@ -256,6 +269,10 @@ impl UdpTransport {
             map.insert("spawn_rtp_relayed".into(), serde_json::json!(rtp_relayed));
             map.insert("spawn_sr_relayed".into(), serde_json::json!(sr_relayed));
             map.insert("spawn_encrypt_fail".into(), serde_json::json!(enc_fail));
+            // v0.3.9: 환경 메타 + egress encrypt timing + Tokio 런타임
+            map.insert("env".into(), self.env_meta.to_json());
+            map.insert("egress_encrypt".into(), self.egress_timing.flush_to_json());
+            map.insert("tokio_runtime".into(), self.tokio_snapshot.sample());
         }
         let _ = self.admin_tx.send(json.to_string());
         self.metrics.reset();
@@ -360,6 +377,7 @@ impl UdpTransport {
         let cert = Arc::clone(&self.cert);
         let socket = Arc::clone(&self.socket);
         let room_hub = Arc::clone(&self.room_hub);
+        let egress_timing = Arc::clone(&self.egress_timing);
 
         tokio::spawn(async move {
             info!("[DBG:DTLS] handshake starting user={} pc={} addr={}",
@@ -394,7 +412,8 @@ impl UdpTransport {
                                 if let Some(rx) = egress_rx {
                                     let eg_socket = Arc::clone(&socket);
                                     let eg_participant = Arc::clone(&participant);
-                                    tokio::spawn(run_egress_task(rx, eg_participant, eg_socket));
+                                    let eg_timing = Arc::clone(&egress_timing);
+                                    tokio::spawn(run_egress_task(rx, eg_participant, eg_socket, eg_timing));
                                     info!("[EGRESS] spawned user={}", participant.user_id);
                                 }
 

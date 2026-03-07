@@ -143,6 +143,15 @@
   - 30인 loss 0.000%/15ms, 35인 7.0%, 40인 22.8% (RPi 한계)
 - [ ] W-4: recvmmsg batch 수신 (선택적, pps 5만+ 시)
 
+## Phase TV: Telemetry Visibility (v0.3.9)
+- [x] 환경 메타데이터 (build_mode, log_level, worker_count, bwe_mode, version)
+- [x] Egress encrypt timing (Arc<AtomicU64>, lock-free CAS max)
+- [x] Tokio RuntimeMetrics (busy_ratio, alive_tasks, global_queue, budget_yield, io_ready)
+- [x] Per-worker 상세 (busy_ratio, poll_count, steal_count, noop_count)
+- [x] 어드민 대시보드 표시 (Egress Encrypt, Tokio Runtime, Environment)
+- [x] Contract 체크: runtime_busy (85% WARN, 95% FAIL)
+- [x] 스냅샷 내보내기 연동
+
 ## Benchmark
 - [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화
 - [x] RPi 4B fan-out 한계 테스트 (fo1→499, 13회, loss 0.002%, CPU 69%)

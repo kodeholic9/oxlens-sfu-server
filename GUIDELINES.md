@@ -213,6 +213,7 @@ async-trait = "0.1"
 | W-2 | Multi-worker (SO_REUSEPORT, 30인 0.1%) | 0.3.6 | ✅ |
 | W-3 | Subscriber Egress Task (LiveKit 패턴, 30인 0%/15ms) | 0.3.7 | ✅ |
 | TW | TWCC Transport-Wide Congestion Control (REMB 대체) | 0.3.8 | ✅ |
+| TV | Telemetry Visibility (환경메타 + Egress timing + Tokio RuntimeMetrics) | 0.3.9 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -287,6 +288,17 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.3.9 — Telemetry Visibility (텔레메트리 가시성 확보)
+- 서버: `EnvironmentMeta` (build_mode, log_level, worker_count, bwe_mode, version)
+- 서버: `EgressTimingAtomics` — egress task encrypt timing (lock-free Atomic CAS)
+- 서버: `TokioRuntimeSnapshot` — Tokio 런타임 지표 delta 계산
+  - 1등급: busy_ratio, alive_tasks, global_queue, budget_yield, io_ready
+  - 2등급: per-worker busy/polls/steals/noops
+- `.cargo/config.toml`: `tokio_unstable` cfg 플래그
+- 어드민: SFU 패널에 Egress Encrypt, Tokio Runtime, Environment 섹션 표시
+- 어드민: Contract 체크 `runtime_busy` 추가 (85% WARN, 95% FAIL)
+- 어드민: 스냅샷에 전체 새 지표 포함
 
 ### v0.3.8 — TWCC Transport-Wide Congestion Control
 - 서버: `transport/udp/twcc.rs` 신규 모듈 (parse_twcc_seq + TwccRecorder + build_twcc_feedback)

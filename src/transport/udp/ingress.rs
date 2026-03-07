@@ -118,8 +118,14 @@ impl UdpTransport {
         // 비디오 RTP 캐시 (NACK → RTX 재전송용, audio는 skip)
         // PT 96 = VP8 (server_codec_policy)
         if rtp_hdr.pt == 96 {
-            if let Ok(mut cache) = sender.rtp_cache.lock() {
-                cache.store(rtp_hdr.seq, &plaintext);
+            match sender.rtp_cache.lock() {
+                Ok(mut cache) => {
+                    cache.store(rtp_hdr.seq, &plaintext);
+                    self.metrics.rtp_cache_stored += 1;
+                }
+                Err(_) => {
+                    self.metrics.rtp_cache_lock_fail += 1;
+                }
             }
         }
 
@@ -331,6 +337,7 @@ impl UdpTransport {
             let publisher = match publisher {
                 Some(p) => p,
                 None => {
+                    self.metrics.nack_publisher_not_found += 1;
                     if is_detail {
                         debug!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", nack.media_ssrc);
                     }
@@ -346,6 +353,7 @@ impl UdpTransport {
             let rtx_ssrc = match rtx_ssrc {
                 Some(s) => s,
                 None => {
+                    self.metrics.nack_no_rtx_ssrc += 1;
                     if is_detail {
                         debug!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", nack.media_ssrc);
                     }
@@ -368,9 +376,27 @@ impl UdpTransport {
             self.metrics.rtx_cache_miss += cache_miss as u64;
             self.metrics.rtx_sent += rtx_packets.len() as u64;
 
-            if is_detail && cache_miss > 0 {
-                trace!("[DBG:RTX] cache miss {}/{} seqs for ssrc=0x{:08X}",
-                    cache_miss, lost_seqs.len(), nack.media_ssrc);
+            if cache_miss > 0 {
+                // 진단 로그: miss된 seq와 캐시 슬롯 상태 확인 (처음 10건)
+                if self.metrics.rtx_cache_miss <= 10 {
+                    let cache = publisher.rtp_cache.lock().unwrap();
+                    let missed: Vec<String> = lost_seqs.iter()
+                        .filter(|&&s| rtx_packets.iter().all(|(ls, _, _)| *ls != s))
+                        .take(3)
+                        .map(|&s| {
+                            let idx = (s as usize) % crate::config::RTP_CACHE_SIZE;
+                            let slot_info = match cache.slot_seq(s) {
+                                None => "EMPTY".to_string(),
+                                Some(cached) if cached == s => "MATCH(bug?)".to_string(),
+                                Some(cached) => format!("OTHER({})", cached),
+                            };
+                            format!("seq={}(idx={})={}", s, idx, slot_info)
+                        })
+                        .collect();
+                    debug!("[DBG:RTX] MISS {}/{} ssrc=0x{:08X} user={} cached_3s={} samples=[{}]",
+                        cache_miss, lost_seqs.len(), nack.media_ssrc,
+                        publisher.user_id, self.metrics.rtp_cache_stored, missed.join(", "));
+                }
             }
 
             // Phase W-3: RTX도 egress 큐 경유
