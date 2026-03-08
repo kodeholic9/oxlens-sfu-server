@@ -1,6 +1,6 @@
 # Media Telemetry 지표 설명서
 
-> Light LiveChat SFU 서버의 미디어 품질 모니터링 시스템.
+> OxLens SFU 서버의 미디어 품질 모니터링 시스템.
 > 각 지표의 의미, 정상 범위, 이상 판별 기준을 설명한다.
 
 ---
@@ -205,7 +205,7 @@ WebRTC 프로토콜의 기대 계약이 이행되는지 자동 판정.
 
 ### 섹션 구성
 ```
-=== LIGHT-SFU TELEMETRY SNAPSHOT ===
+=== OXLENS-SFU TELEMETRY SNAPSHOT ===
 --- SDP STATE ---          ← 구간 S-1
 --- ENCODER/DECODER ---    ← 구간 S-2
 --- PUBLISH (3s window) --- ← 구간 A
@@ -217,7 +217,7 @@ WebRTC 프로토콜의 기대 계약이 이행되는지 자동 판정.
 
 ### Claude 분석 요청 템플릿
 ```
-아래는 light-sfu WebRTC SFU 서버의 telemetry 스냅샷입니다.
+아래는 OxLens SFU WebRTC 서버의 telemetry 스냅샷입니다.
 다음을 분석해주세요:
 1. WebRTC 프로토콜 계약 위반 항목과 영향
 2. 음질/화질/지연 문제의 근본 원인 추정

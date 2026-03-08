@@ -165,7 +165,7 @@ RUST_LOG=debug cargo run
 
 ## Design Targets
 
-- Room capacity: up to 20 participants
+- Room capacity: up to 30 participants
 - Single UDP port for all media (Bundle)
 - ICE-Lite (server never initiates connectivity checks)
 - 2PC: publish PC 불변, subscribe PC에서만 re-negotiation

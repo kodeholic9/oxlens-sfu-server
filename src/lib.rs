@@ -1,5 +1,5 @@
 // author: kodeholic (powered by Claude)
-//! light-livechat: High-performance SFU server with Bundle + ICE-Lite
+//! oxlens-sfu-server: High-performance SFU server with Bundle + ICE-Lite
 
 pub mod config;
 pub mod error;
@@ -67,11 +67,11 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 3. tracing 초기화 (LOG_DIR 있으면 일별 로테이션 파일 + 콘솔, 없으면 콘솔만)
     // ========================================================================
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| format!("light_livechat={}", log_level).into());
+        .unwrap_or_else(|_| format!("oxlens_sfu_server={}", log_level).into());
 
     if let Some(ref dir) = log_dir {
-        // 일별 로테이션 파일 (livechatd.YYYY-MM-DD.log)
-        let file_appender = tracing_appender::rolling::daily(dir, "livechatd.log");
+        // 일별 로테이션 파일 (oxsfud.YYYY-MM-DD.log)
+        let file_appender = tracing_appender::rolling::daily(dir, "oxsfud.log");
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         // _guard를 들고 있어야 flush됨 — Box::leak으로 프로세스 수명 동안 유지
         Box::leak(Box::new(_guard));
@@ -191,7 +191,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], ws_port));
-    info!("light-livechat v{} listening on {}", env!("CARGO_PKG_VERSION"), addr);
+    info!("oxlens-sfu-server v{} listening on {}", env!("CARGO_PKG_VERSION"), addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 

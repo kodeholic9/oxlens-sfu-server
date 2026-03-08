@@ -2,6 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
+> **명칭 변경**: v0.5.2까지는 `light-livechat` / `livechatd`로 개발.
+> v0.5.3부터 `oxlens-sfu-server` / `oxsfud`로 현행화.
+
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.5.2] - 2026-03-08

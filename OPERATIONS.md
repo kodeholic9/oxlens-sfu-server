@@ -1,4 +1,4 @@
-# Light LiveChat — 운영 가이드
+# OxLens SFU Server — 운영 가이드
 
 ## 1. 포트 구성
 
@@ -20,14 +20,14 @@
 
 | 순서 | 조건 | 경로 |
 |------|------|------|
-| 1 | `--env` 인자 지정 | `livechatd --env /opt/livechat/.env` |
-| 2 | CWD (현재 작업 디렉토리) | `./. env` |
-| 3 | 실행파일 디렉토리 | `/opt/livechat/.env` (바이너리와 같은 폴더) |
+| 1 | `--env` 인자 지정 | `oxsfud --env /opt/oxsfu/.env` |
+| 2 | CWD (현재 작업 디렉토리) | `./.env` |
+| 3 | 실행파일 디렉토리 | `/opt/oxsfu/.env` (바이너리와 같은 폴더) |
 | 4 | 없음 | 환경변수 또는 `config.rs` 기본값 |
 
 기동 시 어떤 경로를 로드했는지 stderr로 출력됩니다:
 ```
-[env] loaded: /opt/livechat/.env
+[env] loaded: /opt/oxsfu/.env
 ```
 
 ### 2.2 설정 항목
@@ -50,7 +50,7 @@ WS_PORT=1974
 UDP_PORT=19740
 
 # ── 로그 ──
-LOG_DIR=/var/log/livechat
+LOG_DIR=/var/log/oxsfu
 LOG_LEVEL=info
 ```
 
@@ -58,13 +58,13 @@ LOG_LEVEL=info
 
 ```bash
 # 기본: CWD의 .env 자동 탐색
-./livechatd
+./oxsfud
 
 # 명시적 경로
-./livechatd --env /opt/livechat/production.env
+./oxsfud --env /opt/oxsfu/production.env
 
 # .env 없이 환경변수만 (Docker, systemd 등)
-PUBLIC_IP=1.2.3.4 LOG_LEVEL=debug ./livechatd
+PUBLIC_IP=1.2.3.4 LOG_LEVEL=debug ./oxsfud
 
 # 개발: .env 없이 기본값 (내부망 IP 자동 감지, 콘솔 로그)
 cargo run
@@ -79,7 +79,7 @@ cargo run
 | `LOG_DIR` 설정 | 동작 |
 |----------------|------|
 | 미설정 또는 빈 문자열 | **콘솔(stdout)** 출력 |
-| 경로 지정 + 디렉토리 존재 | **일별 로테이션 파일** (`livechatd.log.YYYY-MM-DD`) |
+| 경로 지정 + 디렉토리 존재 | **일별 로테이션 파일** (`oxsfud.log.YYYY-MM-DD`) |
 | 경로 지정 + 디렉토리 없음 | **콘솔 fallback** (디렉토리 자동 생성하지 않음) |
 
 파일 출력 시 ANSI 색상 코드는 자동 제거됩니다.
@@ -96,22 +96,22 @@ debug  진단용 (패킷 단위 로그 앞 50건, RTCP 상세)
 trace  패킷 레벨 (요약 로그, 매우 많은 출력)
 ```
 
-### 3.3 light_livechat 로그만 남기기
+### 3.3 oxlens_sfu_server 로그만 남기기
 
 `RUST_LOG`를 사용하면 의존성 크레이트(dtls, webrtc-srtp, tokio 등)의 로그를 제외하고
-**light_livechat 모듈 로그만** 남길 수 있습니다.
+**oxlens_sfu_server 모듈 로그만** 남길 수 있습니다.
 
 ```env
-# .env — light_livechat만 info 레벨로 (의존성 로그 전부 차단)
-RUST_LOG=light_livechat=info
+# .env — oxlens_sfu_server만 info 레벨로 (의존성 로그 전부 차단)
+RUST_LOG=oxlens_sfu_server=info
 ```
 
 ```env
-# .env — light_livechat만 debug, 나머지 전부 차단
-RUST_LOG=light_livechat=debug
+# .env — oxlens_sfu_server만 debug, 나머지 전부 차단
+RUST_LOG=oxlens_sfu_server=debug
 ```
 
-`RUST_LOG`를 설정하지 않으면 `LOG_LEVEL` 값이 자동으로 `light_livechat={LOG_LEVEL}`로 변환되어
+`RUST_LOG`를 설정하지 않으면 `LOG_LEVEL` 값이 자동으로 `oxlens_sfu_server={LOG_LEVEL}`로 변환되어
 기본적으로 의존성 로그는 차단됩니다.
 
 즉, 대부분의 경우 `.env`에 `LOG_LEVEL=info`만 써도 의도한 대로 동작합니다.
@@ -120,10 +120,10 @@ RUST_LOG=light_livechat=debug
 
 ```env
 # 시그널링은 debug, 미디어는 info, 나머지 의존성은 차단
-RUST_LOG=light_livechat::signaling=debug,light_livechat::transport=info
+RUST_LOG=oxlens_sfu_server::signaling=debug,oxlens_sfu_server::transport=info
 
 # UDP hot path만 trace (패킷 단위 추적, 로그 폭발 주의)
-RUST_LOG=light_livechat::transport::udp=trace,light_livechat=info
+RUST_LOG=oxlens_sfu_server::transport::udp=trace,oxlens_sfu_server=info
 
 # 의존성 크레이트 포함 전체 debug (DTLS 핸드셰이크 디버깅 등)
 RUST_LOG=debug
@@ -133,20 +133,20 @@ RUST_LOG=debug
 
 ```bash
 # 로그 디렉토리 생성 (최초 1회)
-sudo mkdir -p /var/log/livechat
-sudo chown livechat:livechat /var/log/livechat
+sudo mkdir -p /var/log/oxsfu
+sudo chown oxsfu:oxsfu /var/log/oxsfu
 
 # 로그 파일 확인
-ls -la /var/log/livechat/
-# livechatd.log.2026-03-05
-# livechatd.log.2026-03-04
+ls -la /var/log/oxsfu/
+# oxsfud.log.2026-03-05
+# oxsfud.log.2026-03-04
 # ...
 
 # 실시간 tail
-tail -f /var/log/livechat/livechatd.log.*
+tail -f /var/log/oxsfu/oxsfud.log.*
 
 # 오래된 로그 정리 (30일 이전)
-find /var/log/livechat -name "livechatd.log.*" -mtime +30 -delete
+find /var/log/oxsfu -name "oxsfud.log.*" -mtime +30 -delete
 ```
 
 ---
@@ -164,7 +164,7 @@ cargo run
 ### 4.2 Windows (PowerShell)
 
 ```powershell
-$env:RUST_LOG="light_livechat=debug"
+$env:RUST_LOG="oxlens_sfu_server=debug"
 cargo run
 
 # 또는 .env 파일 생성 후
@@ -174,7 +174,7 @@ cargo run
 ### 4.3 Windows (cmd)
 
 ```cmd
-set RUST_LOG=light_livechat=debug
+set RUST_LOG=oxlens_sfu_server=debug
 cargo run
 ```
 
@@ -182,10 +182,10 @@ cargo run
 
 ```
 [env] loaded: .env (CWD)
-2026-03-05 12:30:01.234  INFO config: PUBLIC_IP=121.160.xxx.xxx WS_PORT=1974 UDP_PORT=19740 LOG_DIR=/var/log/livechat
+2026-03-05 12:30:01.234  INFO config: PUBLIC_IP=121.160.xxx.xxx WS_PORT=1974 UDP_PORT=19740 LOG_DIR=/var/log/oxsfu
 2026-03-05 12:30:01.235  INFO DTLS fingerprint: sha-256 AB:CD:EF:...
 2026-03-05 12:30:01.236  INFO UDP listening on port 19740
-2026-03-05 12:30:01.237  INFO light-livechat v0.3.4 listening on 0.0.0.0:1974
+2026-03-05 12:30:01.237  INFO oxlens-sfu-server v0.3.4 listening on 0.0.0.0:1974
 ```
 
 ### 4.5 클라이언트 접속 시 로그 예시
@@ -207,7 +207,7 @@ cargo run
 cargo build --release
 ```
 
-산출물: `target/release/livechatd` (단일 바이너리, 의존성 없음)
+산출물: `target/release/oxsfud` (단일 바이너리, 의존성 없음)
 
 ### 5.2 배포 절차
 
@@ -217,44 +217,44 @@ cp .env.example .env
 vi .env   # PUBLIC_IP, LOG_DIR 설정
 
 # 2. 로그 디렉토리 생성
-mkdir -p /var/log/livechat
+mkdir -p /var/log/oxsfu
 
 # 3. 빌드 & 실행
 cargo build --release
-./target/release/livechatd
+./target/release/oxsfud
 # 또는
-./target/release/livechatd --env /opt/livechat/.env
+./target/release/oxsfud --env /opt/oxsfu/.env
 ```
 
 ### 5.3 deploy 스크립트
 
-기존 `deploy-livechat.sh`의 순서: `stop → backup → build → start`
+기존 `deploy-oxlens.sh`의 순서: `stop → backup → build → start`
 
 ```bash
-# 바이너리명: livechatd
+# 바이너리명: oxsfud
 # .env는 실행파일과 같은 디렉토리에 배치하면 자동 탐색
 ```
 
 ### 5.4 systemd 서비스
 
 ```ini
-# /etc/systemd/system/livechatd.service
+# /etc/systemd/system/oxsfud.service
 [Unit]
-Description=Light LiveChat SFU Server
+Description=OxLens SFU Server
 After=network.target
 
 [Service]
 Type=simple
-User=livechat
-Group=livechat
-WorkingDirectory=/opt/livechat
-ExecStart=/opt/livechat/livechatd --env /opt/livechat/.env
+User=oxsfu
+Group=oxsfu
+WorkingDirectory=/opt/oxsfu
+ExecStart=/opt/oxsfu/oxsfud --env /opt/oxsfu/.env
 Restart=always
 RestartSec=3
 
 # .env에서 로그/포트 관리하므로 Environment 불필요
 # 필요시 오버라이드:
-# Environment=RUST_LOG=light_livechat=debug
+# Environment=RUST_LOG=oxlens_sfu_server=debug
 
 StandardOutput=journal
 StandardError=journal
@@ -266,12 +266,12 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable livechatd
-sudo systemctl start livechatd
-sudo systemctl status livechatd
+sudo systemctl enable oxsfud
+sudo systemctl start oxsfud
+sudo systemctl status oxsfud
 
 # 로그 확인 (LOG_DIR 미설정 시 journald 사용)
-sudo journalctl -u livechatd -f
+sudo journalctl -u oxsfud -f
 ```
 
 ---
@@ -298,19 +298,19 @@ sudo firewall-cmd --reload
 WebSocket은 Nginx 뒤에 둘 수 있지만, UDP 미디어는 직접 노출해야 합니다.
 
 ```nginx
-upstream livechat_ws {
+upstream oxsfu_ws {
     server 127.0.0.1:1974;
 }
 
 server {
     listen 443 ssl;
-    server_name livechat.example.com;
+    server_name sfu.oxlens.com;
 
-    ssl_certificate     /etc/letsencrypt/live/livechat.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/livechat.example.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/sfu.oxlens.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/sfu.oxlens.com/privkey.pem;
 
     location /ws {
-        proxy_pass http://livechat_ws;
+        proxy_pass http://oxsfu_ws;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -334,7 +334,7 @@ server {
 ### 8.1 프로세스 확인
 
 ```bash
-ps aux | grep livechatd
+ps aux | grep oxsfud
 ss -tlnp | grep 1974     # TCP (WS)
 ss -ulnp | grep 19740    # UDP (Media)
 ```
@@ -350,13 +350,13 @@ ss -un | grep :19740 | wc -l               # UDP
 
 ```bash
 # 파일 로그 사용 시
-tail -f /var/log/livechat/livechatd.log.* | grep -E "ERROR|WARN"
+tail -f /var/log/oxsfu/oxsfud.log.* | grep -E "ERROR|WARN"
 
 # journald 사용 시
-journalctl -u livechatd -f | grep -E "ERROR|WARN"
+journalctl -u oxsfud -f | grep -E "ERROR|WARN"
 
 # 방 입장/퇴장 추적
-grep "ROOM_JOIN\|participant removed" /var/log/livechat/livechatd.log.*
+grep "ROOM_JOIN\|participant removed" /var/log/oxsfu/oxsfud.log.*
 ```
 
 ---
@@ -398,12 +398,12 @@ WARN DTLS handshake timeout (10s) user=U0042
 DTLS 핸드셰이크나 SRTP 내부 오류를 봐야 할 때만 의존성 로그를 킵니다:
 
 ```bash
-RUST_LOG=debug ./livechatd
+RUST_LOG=debug ./oxsfud
 # 또는
-RUST_LOG=dtls=debug,webrtc_srtp=debug,light_livechat=info ./livechatd
+RUST_LOG=dtls=debug,webrtc_srtp=debug,oxlens_sfu_server=info ./oxsfud
 ```
 
-운영 환경에서는 반드시 원복: `RUST_LOG=light_livechat=info`
+운영 환경에서는 반드시 원복: `RUST_LOG=oxlens_sfu_server=info`
 
 ---
 

@@ -1,5 +1,5 @@
 [package]
-name = "light-livechat"
+name = "oxlens-sfu-server"
 version = "0.5.2"
 edition = "2024"
 description = "High-performance SFU server — 2PC / SDP-free architecture"
@@ -7,7 +7,7 @@ authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
 license = "Apache-2.0"
 
 [[bin]]
-name = "livechatd"
+name = "oxsfud"
 path = "src/main.rs"
 
 [dependencies]

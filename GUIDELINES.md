@@ -1,21 +1,22 @@
 ---
-name: light-livechat
+name: oxlens-sfu-server
 description: |
   Rust + Tokio + Axum 기반 SFU (Selective Forwarding Unit) 서버 프로젝트.
-  Conference 모드 우선, PTT 추후 지원. mini-livechat의 후속 프로젝트.
-  "light-livechat", "SFU", "light sfu", "DTLS", "SRTP 릴레이", "Room", "RoomHub",
-  "Participant", "DemuxConn", "ICE-Lite", "SDP answer" 등의 키워드가 나오면 이 스킬을 참조할 것.
+  Conference 모드 우선, PTT 확장 지원.
+  "oxlens-sfu-server", "OxLens SFU", "SFU", "DTLS", "SRTP 릴레이", "Room", "RoomHub",
+  "Participant", "DemuxConn", "ICE-Lite" 등의 키워드가 나오면 이 스킬을 참조할 것.
 ---
 
-# Light LiveChat — 프로젝트 지침서
+# OxLens SFU Server — 프로젝트 지침서
 
 ## 1. 프로젝트 개요
 
-- **목적**: 경량 Conference SFU 서버 (PTT 추후 확장)
+- **목적**: 경량 Conference SFU 서버 (PTT 확장)
 - **언어/프레임워크**: Rust + Tokio + Axum
-- **로컬 경로**: `D:\X.WORK\GitHub\repository\light-livechat\`
-- **참조 프로젝트**: `D:\X.WORK\GitHub\repository\mini-livechat\` (검증된 패턴 이식 원본)
-- **설계 규모**: 방당 최대 20명, 단일 인스턴스
+- **로컬 경로**: `D:\X.WORK\GitHub\repository\oxlens-sfu-server\`
+- **SDK 코어**: `D:\X.WORK\GitHub\repository\oxlens-sdk-core\`
+- **참조 프로젝트**: `D:\X.WORK\GitHub\repository\oxlens-home\` (SDP 조립 참조)
+- **설계 규모**: 방당 최대 30명(RPi 기준), 단일 인스턴스
 
 ---
 
@@ -30,7 +31,7 @@ description: |
 ### 2.3 설계 토론 → 코딩 순서
 
 1. **구조 논의**: 뭘 만들지, 왜 이렇게 만드는지 합의
-2. **기존 코드 확인**: light-livechat 현재 상태 읽기
+2. **기존 코드 확인**: oxlens-sfu-server 현재 상태 읽기
 3. **코딩**: 합의된 구조대로 작성
 4. **빌드 확인**: 부장님이 `cargo build` 실행하여 결과 공유
 5. **에러 수정**: 빌드 에러 메시지 기반으로 정확히 수정 (추측 금지)
@@ -40,7 +41,7 @@ description: |
 
 - 에러 메시지를 **전문 그대로** 받아서 수정 (컴파일러가 맞다)
 - API 시그니처 추측 → 빌드 에러 → 핑퐁 반복 **금지**
-- 모르면 mini-livechat 소스에서 검증된 패턴 확인 후 이식
+- 모르면 기존 검증된 패턴 확인 후 이식
 - 워닝도 즉시 정리 (unused import, unused variable)
 
 ---
@@ -334,7 +335,7 @@ Bytes 8-11: media_ssrc (big-endian)
 - 수집 구간: S(SDP/코덱), A(Publisher), B(SFU 서버), C(Subscriber)
 - 전달: 클라이언트 → OP_TELEMETRY(30) → 서버 passthrough → /admin/ws
 - 서버 B구간: `GlobalMetrics` (Arc, 전체 Atomic) → 3초 flush → admin_tx
-- 어드민: `livechat-admin/` (WS 접속, 실시간 개요, 상세, SDP, SFU 패널, Contract, 스냅샷)
+- 어드민: `oxlens-admin/` (WS 접속, 실시간 개요, 상세, SDP, SFU 패널, Contract, 스냅샷)
 
 ---
 
@@ -351,4 +352,4 @@ Bytes 8-11: media_ssrc (big-endian)
 
 - 빌드 에러는 에러 메시지 전문 기반으로 수정
 - 설계 결정 시 대안과 trade-off 명시
-- 20명 규모 기준으로 성능 판단 (과도한 최적화 경계)
+- 30명(RPi 기준) 규모로 성능 판단 (과도한 최적화 경계)

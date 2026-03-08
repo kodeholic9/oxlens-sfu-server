@@ -1004,39 +1004,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 
 [[package]]
-name = "light-livechat"
-version = "0.5.2"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "crc32fast",
- "dashmap",
- "dotenvy",
- "dtls",
- "futures-util",
- "getrandom 0.3.4",
- "hmac",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "socket2 0.5.10",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "webrtc-srtp",
- "webrtc-util",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1210,6 +1177,39 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "oxlens-sfu-server"
+version = "0.5.2"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "dashmap",
+ "dotenvy",
+ "dtls",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "socket2 0.5.10",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+ "webrtc-srtp",
+ "webrtc-util",
+]
 
 [[package]]
 name = "p256"
