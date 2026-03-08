@@ -355,7 +355,7 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
 
     // Build server_config response (SDP-free!)
     // IP/port는 AppState에서 (.env PUBLIC_IP / UDP_PORT fallback)
-    Packet::ok(opcode::ROOM_JOIN, packet.pid, serde_json::json!({
+    let mut response = serde_json::json!({
         "room_id": req.room_id,
         "mode": room.mode.to_string(),
         "participants": members,
@@ -374,9 +374,21 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
             },
             "codecs": server_codec_policy(),
             "extmap": server_extmap_policy(state.bwe_mode),
+            "max_bitrate_bps": config::resolve_remb_bitrate(),
         },
         "tracks": existing_tracks,
-    }))
+    });
+
+    // Phase E-5: PTT 모드 — 가상 SSRC 정보 추가
+    // subscribe SDP에 원본 SSRC 대신 가상 SSRC를 선언해야 Chrome이 올바르게 demux
+    if room.mode == RoomMode::Ptt {
+        response["ptt_virtual_ssrc"] = serde_json::json!({
+            "audio": room.audio_rewriter.virtual_ssrc(),
+            "video": room.video_rewriter.virtual_ssrc(),
+        });
+    }
+
+    Packet::ok(opcode::ROOM_JOIN, packet.pid, response)
 }
 
 // ============================================================================
@@ -667,8 +679,12 @@ async fn handle_floor_request(session: &Session, state: &AppState, packet: &Pack
     // PTT Granted → audio rewriter 화자 전환 + PLI 전송
     if let FloorAction::Granted { speaker } = &action {
         state.metrics.ptt_floor_granted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.metrics.ptt_speaker_switches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         room.audio_rewriter.switch_speaker(speaker);
         room.video_rewriter.switch_speaker(speaker);
+        // Phase E-5: PLI 반복 전송 (3회, 500ms 간격)
+        // Chrome이 track.muted 상태에서 unmute 후 키프레임을 받아야 디코딩 시작
+        // 단발 PLI로는 타이밍이 안 맞을 수 있으므로 반복 전송
         if let Some(participant) = room.get_participant(speaker) {
             if participant.is_publish_ready() {
                 let video_ssrc = {
@@ -678,19 +694,35 @@ async fn handle_floor_request(session: &Session, state: &AppState, packet: &Pack
                         .map(|t| t.ssrc)
                 };
                 if let (Some(ssrc), Some(pub_addr)) = (video_ssrc, participant.publish.get_address()) {
-                    let pli_plain = crate::transport::udp::build_pli(ssrc);
-                    let encrypted = {
-                        let mut ctx = participant.publish.outbound_srtp.lock().unwrap();
-                        ctx.encrypt_rtcp(&pli_plain).ok()
-                    };
-                    if let Some(enc) = encrypted {
-                        let socket = &state.udp_socket;
-                        if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                            warn!("[FLOOR] PLI send FAILED user={} ssrc=0x{:08X}: {e}", speaker, ssrc);
-                        } else {
-                            info!("[FLOOR] PLI sent user={} ssrc=0x{:08X} (floor granted)", speaker, ssrc);
+                    // 즉시 1회 + 500ms/1000ms 후 추가 2회 = 총 3회
+                    let p = Arc::clone(&participant);
+                    let socket = state.udp_socket.clone();
+                    let speaker_id = speaker.to_string();
+                    tokio::spawn(async move {
+                        // hard_unmute의 getUserMedia + replaceTrack 완료 시간 확보
+                        // 0ms: soft_off 복귀용, 500ms/1500ms: hard_off 복귀용
+                        let delays = [0u64, 500, 1500];
+                        for (i, &delay_ms) in delays.iter().enumerate() {
+                            if delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            let pli_plain = crate::transport::udp::build_pli(ssrc);
+                            let encrypted = {
+                                let mut ctx = p.publish.outbound_srtp.lock().unwrap();
+                                ctx.encrypt_rtcp(&pli_plain).ok()
+                            };
+                            if let Some(enc) = encrypted {
+                                if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                                    warn!("[FLOOR] PLI send FAILED user={} ssrc=0x{:08X} #{}: {e}",
+                                        speaker_id, ssrc, i);
+                                    break;
+                                } else {
+                                    info!("[FLOOR] PLI sent user={} ssrc=0x{:08X} #{} (floor granted)",
+                                        speaker_id, ssrc, i);
+                                }
+                            }
                         }
-                    }
+                    });
                 }
             }
         }
@@ -719,6 +751,7 @@ async fn handle_floor_release(session: &Session, state: &AppState, packet: &Pack
 
     // Release/Released 시 rewriter 정리
     if matches!(&action, FloorAction::Released { .. }) {
+        state.metrics.ptt_floor_released.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         room.audio_rewriter.clear_speaker();
         room.video_rewriter.clear_speaker();
     }

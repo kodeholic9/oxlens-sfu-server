@@ -139,7 +139,13 @@
 - [x] E-4: NACK 역매핑 (가상seq→원본seq, RtpCache 조회) — v0.5.1
 - [x] E-4: Subscribe RTCP relay 가상SSRC→원본SSRC 변환 — v0.5.1
 - [x] PTT 메트릭 7개 카운터 + 어드민 PTT 상태 스냅샷 — v0.5.1
-- [ ] E-5: 클라이언트 SDK PTT 지원 (Floor UI + 에스컬레이션 면트 연동)
+- [x] E-5: 클라이언트 PTT Subscribe SDP 연동 — v0.5.2
+  - 서버: ROOM_JOIN 응답에 ptt_virtual_ssrc, PLI 3회 반복, 메트릭 5개 추가
+  - 클라이언트: buildPttSubscribeSdp, __ptt__ 가상 스트림 바인딩, onunmute 처리
+  - 3인 PTT 영상+음성 정상 확인
+  - WebRTC 기반 PTT 영상 한계 문서화 (doc/PTT-E5-클라이언트연동-2026-03-08.md)
+- [ ] PTT 오디오 지연 원인 분석 및 최적화
+- [ ] PTT 영상 개선: 서버 키프레임 캐싱 + 화자 전환 시 즉시 주입 (LiveKit 패턴)
 
 ## Phase W: UDP Worker 멀티코어 분산
 - [x] W-1: Fan-out spawn — handle_srtp/relay_publish_rtcp fan-out을 tokio::spawn 분리 — v0.3.5

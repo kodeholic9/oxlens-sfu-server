@@ -21,14 +21,6 @@ description: |
 
 ## 2. 작업 원칙
 
-### 2.1 mini-livechat 참조 패턴
-
-mini-livechat에서 검증된 코드를 이식할 때:
-1. **API 추측 금지** — 반드시 mini 소스를 직접 읽고 확인
-2. **크레이트 버전 통일** — 0.17.x 계열 유지 (dtls, webrtc-srtp, webrtc-util)
-3. **구조는 단순화** — mini의 이원 구조(MediaPeerHub + ChannelHub)를 RoomHub 일원 구조로 통합
-4. **re-nego는 최대한 늦게, 최대한 단순하게** — mini가 여기서 실패함
-
 ### 2.2 Phase 기반 점진적 구현
 
 - 한 Phase에서 하나의 관심사만 다룬다
@@ -38,9 +30,9 @@ mini-livechat에서 검증된 코드를 이식할 때:
 ### 2.3 설계 토론 → 코딩 순서
 
 1. **구조 논의**: 뭘 만들지, 왜 이렇게 만드는지 합의
-2. **기존 코드 확인**: mini-livechat 소스 + light-livechat 현재 상태 읽기
+2. **기존 코드 확인**: light-livechat 현재 상태 읽기
 3. **코딩**: 합의된 구조대로 작성
-4. **빌드 확인**: 부장이 `cargo build` 실행하여 결과 공유
+4. **빌드 확인**: 부장님이 `cargo build` 실행하여 결과 공유
 5. **에러 수정**: 빌드 에러 메시지 기반으로 정확히 수정 (추측 금지)
 6. **문서 갱신**: CHANGELOG, TODO, README, 버전
 
@@ -157,6 +149,7 @@ async-trait = "0.1"
 ## 6. 시그널링 프로토콜
 
 ### 패킷 형식
+
 ```json
 { "op": 11, "pid": 42, "d": { ... } }                    // 요청/이벤트
 { "op": 11, "pid": 42, "ok": true, "d": { ... } }        // 성공 응답
@@ -164,66 +157,68 @@ async-trait = "0.1"
 ```
 
 ### Client → Server
-| op | Name | 설명 |
-|----|------|------|
-| 1 | HEARTBEAT | keepalive |
-| 3 | IDENTIFY | 인증 (token → user_id) |
-| 10 | ROOM_CREATE | 방 생성 |
-| 11 | ROOM_JOIN | 입장 (ICE params + DTLS fingerprint 응답) |
-| 12 | ROOM_LEAVE | 퇴장 |
-| 15 | SDP_OFFER | 재협상 (Phase 3+) |
-| 16 | ICE_CANDIDATE | Trickle ICE (ICE-Lite에서 무시) |
-| 17 | MUTE_UPDATE | 트랙 mute/unmute 상태 변경 |
-| 20 | MESSAGE | 데이터 메시지 |
-| 30 | TELEMETRY | 클라이언트 telemetry 보고 (SDP/stats) |
+
+| op  | Name          | 설명                                      |
+| --- | ------------- | ----------------------------------------- |
+| 1   | HEARTBEAT     | keepalive                                 |
+| 3   | IDENTIFY      | 인증 (token → user_id)                    |
+| 10  | ROOM_CREATE   | 방 생성                                   |
+| 11  | ROOM_JOIN     | 입장 (ICE params + DTLS fingerprint 응답) |
+| 12  | ROOM_LEAVE    | 퇴장                                      |
+| 15  | SDP_OFFER     | 재협상 (Phase 3+)                         |
+| 16  | ICE_CANDIDATE | Trickle ICE (ICE-Lite에서 무시)           |
+| 17  | MUTE_UPDATE   | 트랙 mute/unmute 상태 변경                |
+| 20  | MESSAGE       | 데이터 메시지                             |
+| 30  | TELEMETRY     | 클라이언트 telemetry 보고 (SDP/stats)     |
 
 ### Server → Client
-| op | Name | 설명 |
-|----|------|------|
-| 0 | HELLO | heartbeat_interval |
-| 100 | ROOM_EVENT | participant_joined / participant_left |
-| 101 | TRACK_EVENT | track_added / track_removed |
-| 102 | TRACK_STATE | 트랙 mute/unmute 상태 브로드캐스트 |
-| 103 | MESSAGE_EVENT | 메시지 릴레이 |
-| 110 | ADMIN_TELEMETRY | 서버 → 어드민 telemetry 중계 |
+
+| op  | Name            | 설명                                  |
+| --- | --------------- | ------------------------------------- |
+| 0   | HELLO           | heartbeat_interval                    |
+| 100 | ROOM_EVENT      | participant_joined / participant_left |
+| 101 | TRACK_EVENT     | track_added / track_removed           |
+| 102 | TRACK_STATE     | 트랙 mute/unmute 상태 브로드캐스트    |
+| 103 | MESSAGE_EVENT   | 메시지 릴레이                         |
+| 110 | ADMIN_TELEMETRY | 서버 → 어드민 telemetry 중계          |
 
 ---
 
 ## 7. 구현 로드맵
 
-| Phase | 내용 | 버전 | 상태 |
-|-------|------|------|------|
-| 0 | STUN / ICE-Lite | 0.1.1 | ✅ |
-| 1 | DTLS + SRTP 모듈 | 0.1.2 | ✅ |
-| 1.5 | Room 3-index + 시그널링 핸들러 | 0.1.2 | ✅ |
-| 2 | UDP ↔ RoomHub 통합 (전체 파이프라인) | 0.1.3 | ✅ |
-| 3 | SDP Negotiation (브라우저 연동) | 0.1.4 | ✅ |
-| 3.5 | 디버그 로그 + 영상 렌더링 수정 | 0.1.4 | ✅ |
-| A-1 | 2PC / SDP-free 아키텍처 전환 | 0.1.5 | ✅ |
-| A-2 | 클라이언트 SdpBuilder (fake SDP 조립) | 0.1.6 | ✅ |
-| A-3 | PLI keyframe request (subscribe ready → PLI) | 0.1.7 | ✅ |
-| B | Multi-party 스트림 매핑 + SDP mid 안정화 | 0.1.8 | ✅ |
-| B-2 | BUNDLE demux 수정 + inactive m-line 처리 | 0.1.9 | ✅ |
-| C | NACK 기반 RTX 재전송 (서버 캐시) | 0.2.0 | ✅ |
-| C-2 | RTCP Transparent Relay (SR/RR/PLI/REMB) | 0.2.2 | ✅ |
-| C-3 | Mute/Unmute 시그널링 (MUTE_UPDATE/TRACK_STATE) | 0.2.3 | ✅ |
-| D | Hardening (좀비/타임아웃/shutdown/로그, 인증 제외) | 0.2.1 | ✅ |
-| T-1 | Media Telemetry 1단계 (SDP/클라이언트 수집 + 어드민 전달) | 0.3.0 | ✅ |
-| T-2 | Media Telemetry 2단계 (서버 B구간 계측) | 0.3.1 | ✅ |
-| T-3 | Media Telemetry 3단계 (어드민 SFU 서버 패널 + server_metrics 표시) | 0.3.2 | ✅ |
-| T-4/5 | Media Telemetry 4+5 (시계열 차트 + Contract + 스냅샷) | 0.3.3 | ✅ |
-| Q | Media Quality (REMB + RR fix + JB delta) | 0.3.4 | ✅ |
-| BM | Fan-out Benchmark (RPi 499sub, loss 0.002%) | 0.3.4 | ✅ |
-| W-1 | Fan-out spawn (tokio::spawn 분리, 30인 PASS) | 0.3.5 | ✅ |
-| W-2 | Multi-worker (SO_REUSEPORT, 30인 0.1%) | 0.3.6 | ✅ |
-| W-3 | Subscriber Egress Task (LiveKit 패턴, 30인 0%/15ms) | 0.3.7 | ✅ |
-| TW | TWCC Transport-Wide Congestion Control (REMB 대체) | 0.3.8 | ✅ |
-| TV | Telemetry Visibility (환경메타 + Egress timing + Tokio RuntimeMetrics) | 0.3.9 | ✅ |
-| HP | Hot Path Vec alloc 제거 + egress_drop 방어 | 0.3.10 | ✅ |
-| GM | GlobalMetrics 리팩터링 (Arc + 전체 Atomic, &mut self 제거) + 모듈 분리 | 0.4.0 | ✅ |
-| E-0~4 | PTT 미디어 파이프라인 (게이팅+리라이팅+키프레임+NACK역매핑+메트릭) | 0.5.1 | ✅ |
-| E-5 | 클라이언트 SDK PTT 지원 | 0.5.x | |
-| — | Simulcast / SVC (optional) | 0.3.x | |
+| Phase | 내용                                                                   | 버전   | 상태 |
+| ----- | ---------------------------------------------------------------------- | ------ | ---- |
+| 0     | STUN / ICE-Lite                                                        | 0.1.1  | ✅   |
+| 1     | DTLS + SRTP 모듈                                                       | 0.1.2  | ✅   |
+| 1.5   | Room 3-index + 시그널링 핸들러                                         | 0.1.2  | ✅   |
+| 2     | UDP ↔ RoomHub 통합 (전체 파이프라인)                                   | 0.1.3  | ✅   |
+| 3     | SDP Negotiation (브라우저 연동)                                        | 0.1.4  | ✅   |
+| 3.5   | 디버그 로그 + 영상 렌더링 수정                                         | 0.1.4  | ✅   |
+| A-1   | 2PC / SDP-free 아키텍처 전환                                           | 0.1.5  | ✅   |
+| A-2   | 클라이언트 SdpBuilder (fake SDP 조립)                                  | 0.1.6  | ✅   |
+| A-3   | PLI keyframe request (subscribe ready → PLI)                           | 0.1.7  | ✅   |
+| B     | Multi-party 스트림 매핑 + SDP mid 안정화                               | 0.1.8  | ✅   |
+| B-2   | BUNDLE demux 수정 + inactive m-line 처리                               | 0.1.9  | ✅   |
+| C     | NACK 기반 RTX 재전송 (서버 캐시)                                       | 0.2.0  | ✅   |
+| C-2   | RTCP Transparent Relay (SR/RR/PLI/REMB)                                | 0.2.2  | ✅   |
+| C-3   | Mute/Unmute 시그널링 (MUTE_UPDATE/TRACK_STATE)                         | 0.2.3  | ✅   |
+| D     | Hardening (좀비/타임아웃/shutdown/로그, 인증 제외)                     | 0.2.1  | ✅   |
+| T-1   | Media Telemetry 1단계 (SDP/클라이언트 수집 + 어드민 전달)              | 0.3.0  | ✅   |
+| T-2   | Media Telemetry 2단계 (서버 B구간 계측)                                | 0.3.1  | ✅   |
+| T-3   | Media Telemetry 3단계 (어드민 SFU 서버 패널 + server_metrics 표시)     | 0.3.2  | ✅   |
+| T-4/5 | Media Telemetry 4+5 (시계열 차트 + Contract + 스냅샷)                  | 0.3.3  | ✅   |
+| Q     | Media Quality (REMB + RR fix + JB delta)                               | 0.3.4  | ✅   |
+| BM    | Fan-out Benchmark (RPi 499sub, loss 0.002%)                            | 0.3.4  | ✅   |
+| W-1   | Fan-out spawn (tokio::spawn 분리, 30인 PASS)                           | 0.3.5  | ✅   |
+| W-2   | Multi-worker (SO_REUSEPORT, 30인 0.1%)                                 | 0.3.6  | ✅   |
+| W-3   | Subscriber Egress Task (LiveKit 패턴, 30인 0%/15ms)                    | 0.3.7  | ✅   |
+| TW    | TWCC Transport-Wide Congestion Control (REMB 대체)                     | 0.3.8  | ✅   |
+| TV    | Telemetry Visibility (환경메타 + Egress timing + Tokio RuntimeMetrics) | 0.3.9  | ✅   |
+| HP    | Hot Path Vec alloc 제거 + egress_drop 방어                             | 0.3.10 | ✅   |
+| GM    | GlobalMetrics 리팩터링 (Arc + 전체 Atomic, &mut self 제거) + 모듈 분리 | 0.4.0  | ✅   |
+| E-0~4 | PTT 미디어 파이프라인 (게이팅+리라이팅+키프레임+NACK역매핑+메트릭)     | 0.5.1  | ✅   |
+| E-5   | PTT 클라이언트 Subscribe SDP 연동 + 메트릭 5개                       | 0.5.2  | ✅   |
+| —     | Simulcast / SVC (optional)                                             | 0.3.x  |      |
 
 ---
 
@@ -247,181 +242,32 @@ async-trait = "0.1"
 
 ---
 
-## 10. 버전 변경 이력 (v0.1.5+)
-
-### v0.1.5 — 2PC / SDP-free 아키텍처 전환
-- 서버: SDP 완전 제거, server_config(JSON) 응답으로 전환
-- 클라이언트: publish PC + subscribe PC 분리 (2PC)
-- SdpBuilder: server_config → fake remote SDP 조립
-
-### v0.1.7 — PLI keyframe request
-- 서버: `build_pli()` (RFC 4585, 12바이트) + `SrtpContext::encrypt_rtcp()`
-- subscribe SRTP ready 시점에 모든 publisher에게 PLI 전송
-- 비디오 표시 지연: 10-20초 → 1-2초
-
-### v0.1.8 — Multi-party + SDP mid 안정화
-- 클라이언트: `remoteStreams: Map<userId, MediaStream>` 다중 스트림 매핑
-- 참가자별 `<audio>` 요소 독립 생성 (브라우저 자동 믹싱)
-- `_nextMid` 카운터: mid 순차 할당, 재사용 시 기존 mid 유지
-- inactive m-line: `active: false` + mid 보존 (SDP m-line 삭제 불가 규칙)
-
-### v0.2.3 — Mute/Unmute 시그널링
-- MUTE_UPDATE (op 17): 클라이언트 → 서버 트랙 mute/unmute 상태 변경
-- TRACK_STATE (op 102): 서버 → 다른 참가자 mute 상태 브로드캐스트
-- Track.muted 필드 + set_track_muted() 메서드
-- Video unmute 시 PLI 자동 전송 (키프레임 요청)
-- AppState에 udp_socket 추가 (handler에서 PLI 전송용)
-- UdpTransport::from_socket() 생성자 추가
-
-### v0.2.2 — RTCP Transparent Relay (Phase C-2)
-- `split_compound_rtcp()` — compound 내 NACK/relay 대상 분류
-- `relay_publish_rtcp()` — publish SR → 모든 subscriber fan-out
-- `handle_nack_block()` — NACK 처리 메서드 추출
-- `assemble_compound()` — relay 블록 compound 재조립
-- subscribe RTCP(RR/PLI/REMB) → media_ssrc 기반 publisher 매핑 → relay
-- config: RTCP_PT_SR(200), RTCP_PT_RR(201), RTCP_PT_PSFB(206), RTCP_FMT_PLI(1), RTCP_FMT_REMB(15)
-
-### v0.2.1 — Hardening (Phase D, 인증 제외)
-- D-1: WS heartbeat timeout (90초 무활동 → 강제 종료 + cleanup)
-- D-2: Zombie reaper (30초 주기, last_seen + 120s 초과 시 제거 + broadcast)
-- D-3: DTLS 미완료 좀비도 reaper에 통합
-- D-4: Graceful shutdown (Ctrl+C → CancellationToken → 3s drain)
-- D-5: 로그 레벨 정리 (hot-path info→debug, summary→trace, 기본 info)
-- 의존성: `tokio-util = "0.7"` 추가
-
-### v0.2.0 — NACK 기반 RTX 재전송 (Phase C)
-- 서버: `RtpCache` 링버퍼(128) + NACK 파싱(PT=205) + RTX 조립(RFC 4588, PT=97)
-- 서버: `handle_subscribe_rtcp()` — subscribe PC RTCP 처리 분기 신설
-- 서버: Track에 `rtx_ssrc` 필드, video 트랙 등록 시 자동 할당
-- 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
-- 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
-- publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
-
-### v0.5.1 — PTT 미디어 파이프라인 (Phase E-0~E-4)
-- E-0: Floor Timer Task (2초 주기, T2/PING 타임아웃 revoke)
-- E-1: Relay Gate (미디어 게이팅 — floor holder만 RTP 통과)
-- E-2: Audio SSRC Rewriting (PttRewriter, Opus 오프셋 연산, marker bit)
-- E-4: Video SSRC Rewriting (VP8 키프레임 대기, is_vp8_keyframe, NACK 역매핑)
-- PTT 메트릭 7개 카운터 + 어드민 PTT 상태 스냅샷
-- AppState에 Arc<GlobalMetrics> 추가 (handler에서 메트릭 접근)
-
-### v0.4.0 — GlobalMetrics 리팩터링 + 모듈 분리 (Phase GM)
-- `ServerMetrics` → `GlobalMetrics` (Arc 공유, 전체 Atomic) — &mut self 감염 제거
-- `EgressTimingAtomics` → `AtomicTimingStat` 일반화, spawn atomics 3개 흡수
-- `src/metrics/` 모듈 분리 (mod.rs, env.rs, tokio_snapshot.rs)
-- `src/transport/udp/metrics.rs` 제거 → udp/ = 순수 미디어 파이프라인
-- hot path 4개 메서드 + egress 2개 메서드 `&self` 복귀
-- 어드민 JSON 포맷 변경 없음 (zero admin impact)
-
-### v0.3.10 — Hot Path 병목 제거 + egress_drop 방어
-- ingress fan-out: `other_participants()` Vec 할당 → `DashMap iter` 직접 순회 (0 alloc)
-- NACK/RTCP relay: `all_participants().find()` → `room.find_by_track_ssrc()` (0 alloc)
-- `egress_drop` 카운터: `try_send` 실패 시 silent drop → 카운팅
-- 어드민: egress_drop 표시 + 노란 경고 배너
-
-### v0.3.9 — Telemetry Visibility (텔레메트리 가시성 확보)
-- 서버: `EnvironmentMeta` (build_mode, log_level, worker_count, bwe_mode, version)
-- 서버: `EgressTimingAtomics` — egress task encrypt timing (lock-free Atomic CAS)
-- 서버: `TokioRuntimeSnapshot` — Tokio 런타임 지표 delta 계산
-  - 1등급: busy_ratio, alive_tasks, global_queue, budget_yield, io_ready
-  - 2등급: per-worker busy/polls/steals/noops
-- `.cargo/config.toml`: `tokio_unstable` cfg 플래그
-- 어드민: SFU 패널에 Egress Encrypt, Tokio Runtime, Environment 섹션 표시
-- 어드민: Contract 체크 `runtime_busy` 추가 (85% WARN, 95% FAIL)
-- 어드민: 스냅샷에 전체 새 지표 포함
-
-### v0.3.8 — TWCC Transport-Wide Congestion Control
-- 서버: `transport/udp/twcc.rs` 신규 모듈 (parse_twcc_seq + TwccRecorder + build_twcc_feedback)
-- RTP one-byte header extension에서 twcc seq# 추출, publisher별 도착 시간 링버퍼(8192슬롯) 기록
-- 100ms 주기 TWCC feedback RTCP 전송 (REMB 1초 타이머 대체)
-- 2-bit status vector chunk + recv_delta 인코딩 (draft-holmer-rmcat-transport-wide-cc)
-- `server_extmap_policy()`: transport-wide-cc extmap id=6 활성화
-- Chrome GCC delay gradient 분석 → 비트레이트 자율 결정 (고정 REMB 500kbps 대체)
-- REMB 코드 fallback용 보존 (`#[allow(dead_code)]`)
-
-### v0.3.4 — Media Quality (REMB + RR relay fix + JB delta)
-- 서버 자체 REMB 생성 (1초 주기) — Chrome BWE 대역폭 힌트
-- transport-wide-cc extmap 제거 → REMB 모드 전환 (TWCC 구현 전까지)
-- RR relay metrics 카운터 버그 수정 (`& 0x7F` 마스크 on plaintext)
-- SDK: jitterBufferDelay 누적값 → 3초 delta ms 전환
-- 어드민: jb_delay 표시/Contract 판정 SDK delta 직접 사용
-- available_bitrate 84kbps → 500kbps, Contract 4/8 → 7/8
-
-### v0.3.3 — 시계열 차트 + Contract + 스냅샷 (Phase T-4/5)
-- **어드민**: Canvas 시계열 차트 (3모드: 패킷 흐름, 품질 지표, SFU 내부)
-  - 패킷 흐름: pub/sub pps delta + 손실
-  - 품질 지표: jitter(ms) + JB delay(ms)
-  - SFU 내부: relay/decrypt/encrypt/lock_wait avg(ms) 시계열
-  - Y축 레이블, 그리드라인, 범례 표시
-- **어드민**: WebRTC Contract 체크리스트 (7항목 + TWCC 미구현 WARN)
-  - sdp_negotiation, encoder_healthy, sr_relay, rr_relay, nack_rtx, jitter_buffer, video_freeze, twcc
-  - ✅/❌/⚠️ 상태 + 상세 설명
-- **어드민**: 스냅샷 내보내기 — Claude 분석용 텍스트 포맷
-  - SDP STATE, ENCODER/DECODER, PUBLISH, SUBSCRIBE, NETWORK, SFU SERVER, CONTRACT CHECK
-  - 클립보드 복사 (플루백 포함)
-- SFU 패널 헤더에 Contract/스냅샷 버튼 추가
-
-### v0.3.2 — 어드민 SFU 서버 패널 (Phase T-3)
-- **어드민**: `server_metrics` 타입 메시지 수신 처리 + `renderServerMetrics()` 함수
-- **어드민 HTML**: 우측 컨텐츠에 "데이터 대기" SFU 서버 패널 추가
-- 타이밍 지표: relay/decrypt/encrypt/lock_wait (avg/max ms + count)
-- Fan-out: avg/min/max
-- RTCP 카운터: nack/rtx/miss/pli/SR/RR (3s window)
-- 실패 경고: encrypt_fail + decrypt_fail > 0 시 빨간 경고 표시
-- 임계값 색상: avg > 5ms 빨강, > 2ms 노란
-
-### v0.3.1 — 서버 B구간 계측 (Phase T-2)
-- **udp.rs**: `ServerMetrics` 구조체 — B-1~B-14 지표 수집
-  - `TimingStat`: sum/count/min/max 어퀴뮬레이터 (relay, decrypt, encrypt, lock_wait)
-  - RTCP 카운터: nack_received, rtx_sent, rtx_cache_miss, pli_sent, sr_relayed, rr_relayed
-  - fan_out: sum/count/min/max
-- **udp.rs**: hot path에 `Instant::now()` 기반 타이밍 삽입
-  - decrypt (RTP+RTCP), encrypt (per target), lock_wait (Mutex), relay total
-  - encrypt/decrypt 실패 카운트
-- **udp.rs**: `run()` 루프에 `tokio::select!` + 3초 타이머 → `flush_metrics()` → `admin_tx.send()`
-- **UdpTransport**: `admin_tx: broadcast::Sender<String>` 필드 추가
-- **lib.rs**: `from_socket()` 호출에 `admin_tx` 전달
-- `handle_srtp`, `handle_subscribe_rtcp`, `handle_nack_block`, `relay_publish_rtcp` → `&mut self`
-
-### v0.3.0 — Media Telemetry 1단계 (Phase T-1)
-- **서버**: OP_TELEMETRY(30) — 클라이언트 telemetry를 어드민으로 passthrough
-- **서버**: OP_ADMIN_TELEMETRY(110) — 어드민 전용 opcode (향후 서버 B구간용)
-- **서버**: AppState에 `admin_tx: broadcast::Sender<String>` 추가
-- **서버**: `/admin/ws` 어드민 WS 엔드포인트 (접속 시 rooms 스냅샷 + telemetry 스트림)
-- **SDK**: `_sendSdpTelemetry()` — 방 입장 2초 후 SDP 전문 + m-line 요약 보고 (구간 S-1)
-- **SDK**: `_startStatsMonitor()` → 3초 주기 telemetry 수집+전송으로 전환 (기존 콘솔 로그 대체)
-- **SDK**: `_collectPublishStats()` 구간 A, `_collectSubscribeStats()` 구간 C, `_collectCodecStats()` 구간 S-2
-- **어드민**: livechat-admin 완전 재작성 (SFU telemetry 대시보드)
-  - Room 목록, 실시간 개요 테이블, 참가자 상세 패널, SDP 상태 패널
-  - 시계열 버퍼 저장 (최근 100건, 향후 차트용)
-
-### v0.1.9 — BUNDLE demux + inactive m-line 처리
-- subscribe SDP에서 `sdes:mid` extmap 제거 (서버가 RTP mid 헤더 rewrite 안 함)
-  - Chrome BUNDLE demux를 SSRC 기반으로 fallback
-- inactive(port=0) m-line을 BUNDLE 그룹에서 제외
-  - Chrome re-nego 시 "should be rejected" 에러 해결
-- SDP validation: BUNDLE/mid 수 불일치 검증 제거 (의도적 불일치)
+## 10. 버전 변경 이력 (본 파일에서 이력은 관리하지 않음)
 
 ---
 
 ## 11. 주요 기술 패턴 (subscribe SDP)
 
 ### BUNDLE 그룹 규칙
+
 - active(sendonly) m-line만 BUNDLE에 포함
 - inactive(port=0) m-line은 BUNDLE에서 제외
 - 모든 m-line이 inactive면 첫 번째 mid를 BUNDLE에 넣음 (SDP 유효성)
 
 ### Mid 할당 전략
+
 - `_nextMid` 카운터: 새 트랙 추가 시만 increment, 절대 reset 안 함 (room exit 제외)
 - 트랙 제거: `active: false` 로 변경, mid 보존
 - 트랙 재활성화: 같은 track_id면 기존 mid 재사용
 
 ### Demux 방식
+
 - subscribe SDP에서 `sdes:mid` extmap 제거
 - Chrome이 SSRC 기반 demux로 fallback
 - 각 m-line에 SSRC 선언 필수 (sendonly 시)
 
 ### PLI 패킷 구조 (12바이트)
+
 ```
 Byte 0: 0x81 (V=2, P=0, FMT=1)
 Byte 1: 0xCE (PT=206 PSFB)
@@ -435,38 +281,45 @@ Bytes 8-11: media_ssrc (big-endian)
 ## 12. Phase C 설계 (NACK 기반 RTX 재전송) — ✅ 구현 완료 (v0.2.0)
 
 ### 개요
+
 - subscriber Chrome이 패킷 손실 감지 → NACK 전송 → 서버가 캐시에서 RTX 재전송
 - publisher 관여 없이 서버에서 직접 처리 (RTT 절반)
 
 ### 서버 측
 
 **C-1. RtpCache (SSRC별 링버퍼)**
+
 - `Vec<Option<Vec<u8>>>` 고정 크기 128
 - key = `seq % 128`, publisher RTP decrypt 후 저장
 - 오래된 패킷은 덮어쓰기로 자연 제거
 - SSRC당 1개, 비디오만 (audio는 NACK 불필요)
 
 **C-2. NACK 파싱**
+
 - subscriber subscribe PC에서 오는 RTCP (PT=205, FMT=1)
 - Generic NACK: PID(16bit) + BLP(16bit 비트마스크) → 손실 seq 목록 추출
 - 현재 `handle_srtp()`에서 subscribe PC RTCP를 무시 → NACK 파싱으로 변경
 
 **C-3. RTX 패킷 조립 (RFC 4588)**
+
 - PT = 97 (rtx), SSRC = RTX 전용 SSRC (별도 할당)
 - 페이로드: [원본 seq 2바이트] + [원본 RTP 페이로드]
 - RTX 전용 seq 카운터 별도 관리
 
 **C-4. RTX SSRC 관리**
+
 - participant별 video track에 RTX SSRC 추가 할당
 - tracks_update에 rtx_ssrc 필드 추가
 
 ### 클라이언트 측
 
 **C-5. subscribe SDP RTX SSRC 선언**
+
 - `a=ssrc-group:FID {video_ssrc} {rtx_ssrc}`
 - `a=ssrc:{rtx_ssrc} cname:light-sfu`
 
 ### 파일 변경 예상
+
 - `src/transport/udp.rs` — RtpCache 추가, NACK 파싱, RTX 조립/전송
 - `src/room/participant.rs` — RtpCache 필드, RTX SSRC 필드
 - `common/sdp-builder.mjs` — ssrc-group:FID 추가
@@ -488,13 +341,14 @@ Bytes 8-11: media_ssrc (big-endian)
 ## 14. 주의사항
 
 ### 절대 하지 말 것
+
 - re-nego 성급하게 구현 (mini 실패 원인)
 - 크레이트 API 추측으로 코드 작성 (빌드 에러 핑퐁)
 - 0.18+ webrtc-rs 크레이트 사용
 - Phase 건너뛰기 (이전 Phase 빌드 성공 없이 다음 진행)
 
 ### 항상 할 것
-- 새 모듈 작성 전 mini-livechat 해당 소스 확인
+
 - 빌드 에러는 에러 메시지 전문 기반으로 수정
 - 설계 결정 시 대안과 trade-off 명시
 - 20명 규모 기준으로 성능 판단 (과도한 최적화 경계)

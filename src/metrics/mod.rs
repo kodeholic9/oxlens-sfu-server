@@ -140,6 +140,16 @@ pub(crate) struct GlobalMetrics {
     pub(crate) ptt_floor_revoked:       AtomicU64,
     /// NACK 역매핑 (가상SSRC→원본SSRC) 처리된 NACK 수
     pub(crate) ptt_nack_remapped:       AtomicU64,
+    /// Floor Release 횟수
+    pub(crate) ptt_floor_released:      AtomicU64,
+    /// 화자 전환 횟수 (switch_speaker 호출)
+    pub(crate) ptt_speaker_switches:    AtomicU64,
+    /// 오디오 리라이팅 성공 횟수
+    pub(crate) ptt_audio_rewritten:     AtomicU64,
+    /// 비디오 리라이팅 성공 횟수
+    pub(crate) ptt_video_rewritten:     AtomicU64,
+    /// 비디오 rewriter Skip 횟수 (화자 불일치)
+    pub(crate) ptt_video_skip:          AtomicU64,
 
     // ---- Tokio RuntimeMetrics (flush 시점만, Mutex OK) ----
     tokio_snapshot: Mutex<TokioRuntimeSnapshot>,
@@ -189,6 +199,11 @@ impl GlobalMetrics {
             ptt_floor_granted:      AtomicU64::new(0),
             ptt_floor_revoked:      AtomicU64::new(0),
             ptt_nack_remapped:      AtomicU64::new(0),
+            ptt_floor_released:     AtomicU64::new(0),
+            ptt_speaker_switches:   AtomicU64::new(0),
+            ptt_audio_rewritten:    AtomicU64::new(0),
+            ptt_video_rewritten:    AtomicU64::new(0),
+            ptt_video_skip:         AtomicU64::new(0),
             tokio_snapshot:  Mutex::new(TokioRuntimeSnapshot::new()),
             env_meta:        EnvironmentMeta::capture(worker_count, bwe_mode),
         }
@@ -264,6 +279,11 @@ impl GlobalMetrics {
         let ptt_granted           = self.ptt_floor_granted.swap(0, Ordering::Relaxed);
         let ptt_revoked           = self.ptt_floor_revoked.swap(0, Ordering::Relaxed);
         let ptt_nack_remap        = self.ptt_nack_remapped.swap(0, Ordering::Relaxed);
+        let ptt_released          = self.ptt_floor_released.swap(0, Ordering::Relaxed);
+        let ptt_switches          = self.ptt_speaker_switches.swap(0, Ordering::Relaxed);
+        let ptt_audio_rw          = self.ptt_audio_rewritten.swap(0, Ordering::Relaxed);
+        let ptt_video_rw          = self.ptt_video_rewritten.swap(0, Ordering::Relaxed);
+        let ptt_video_skip        = self.ptt_video_skip.swap(0, Ordering::Relaxed);
 
         // Tokio runtime (Mutex, 3초 1회)
         let tokio_json = self.tokio_snapshot.lock().unwrap().sample();
@@ -271,21 +291,8 @@ impl GlobalMetrics {
         // 환경 메타 (immutable)
         let env_json = self.env_meta.to_json();
 
-        serde_json::json!({
-            "type": "server_metrics",
-            // timing
-            "relay":          relay_json,
-            "decrypt":        decrypt_json,
-            "encrypt":        encrypt_json,
-            "lock_wait":      lock_wait_json,
-            "egress_encrypt": egress_enc_json,
-            // fan-out
-            "fan_out": {
-                "avg": format!("{:.1}", fo_avg),
-                "min": if fo_min == u32::MAX { 0 } else { fo_min },
-                "max": fo_max,
-            },
-            // counters
+        // json! 매크로 재귀 한계 방지: 하위 객체 분할 조립
+        let counters_json = serde_json::json!({
             "encrypt_fail":       encrypt_fail,
             "decrypt_fail":       decrypt_fail,
             "nack_received":      nack_received,
@@ -308,19 +315,48 @@ impl GlobalMetrics {
             "spawn_rtp_relayed":  spawn_rtp_relayed,
             "spawn_sr_relayed":   spawn_sr_relayed,
             "spawn_encrypt_fail": spawn_encrypt_fail,
-            // PTT
-            "ptt": {
-                "rtp_gated":         ptt_rtp_gated,
-                "rtp_rewritten":     ptt_rtp_rewritten,
-                "video_pending_drop":ptt_video_pending,
-                "keyframe_arrived":  ptt_keyframe,
-                "floor_granted":     ptt_granted,
-                "floor_revoked":     ptt_revoked,
-                "nack_remapped":     ptt_nack_remap,
+        });
+
+        let ptt_json = serde_json::json!({
+            "rtp_gated":         ptt_rtp_gated,
+            "rtp_rewritten":     ptt_rtp_rewritten,
+            "audio_rewritten":   ptt_audio_rw,
+            "video_rewritten":   ptt_video_rw,
+            "video_skip":        ptt_video_skip,
+            "video_pending_drop":ptt_video_pending,
+            "keyframe_arrived":  ptt_keyframe,
+            "floor_granted":     ptt_granted,
+            "floor_released":    ptt_released,
+            "floor_revoked":     ptt_revoked,
+            "speaker_switches":  ptt_switches,
+            "nack_remapped":     ptt_nack_remap,
+        });
+
+        // 최종 조립: 필드 수를 ~15개로 제한하여 매크로 재귀 안전
+        let mut root = serde_json::json!({
+            "type": "server_metrics",
+            "relay":          relay_json,
+            "decrypt":        decrypt_json,
+            "encrypt":        encrypt_json,
+            "lock_wait":      lock_wait_json,
+            "egress_encrypt": egress_enc_json,
+            "fan_out": {
+                "avg": format!("{:.1}", fo_avg),
+                "min": if fo_min == u32::MAX { 0 } else { fo_min },
+                "max": fo_max,
             },
-            // environment & runtime
+            "ptt":            ptt_json,
             "env":            env_json,
             "tokio_runtime":  tokio_json,
-        })
+        });
+
+        // counters를 root에 flat merge
+        if let (Some(root_obj), Some(cnt_obj)) = (root.as_object_mut(), counters_json.as_object()) {
+            for (k, v) in cnt_obj {
+                root_obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        root
     }
 }

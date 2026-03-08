@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.2] - 2026-03-08
+
+### Added (Phase E-5: PTT 클라이언트 Subscribe SDP 연동)
+
+#### 서버 (handler.rs)
+- ROOM_JOIN 응답에 `ptt_virtual_ssrc` 필드 추가 (PTT 모드에서만)
+  - `{ audio: u32, video: u32 }` — subscribe SDP에 원본 SSRC 대신 선언할 가상 SSRC
+- Floor Granted 시 PLI 3회 반복 전송 (0ms, 500ms, 1500ms)
+  - hard_off 복귀 시 getUserMedia + replaceTrack 비동기 지연 커버
+  - tokio::spawn 비동기 타이머로 독립 실행
+
+#### 서버 (metrics/mod.rs, ingress.rs)
+- PTT 메트릭 5개 추가: `audio_rewritten`, `video_rewritten`, `video_skip`, `floor_released`, `speaker_switches`
+- ingress.rs: RewriteResult 분기에서 audio/video 분리 카운팅 + video Skip 카운팅
+
+#### 클라이언트 (sdp-builder.js)
+- `buildPttSubscribeSdp()` 신규 — 가상 SSRC 1쌍(audio+video)으로 2개 m-line only
+- `buildSubscribeRemoteSdp()` 3번째 파라미터 `options` 추가 (mode, pttVirtualSsrc)
+- PTT 분기를 empty tracks early return보다 앞으로 이동
+- `updateSubscribeRemoteSdp` options 패스스루
+
+#### 클라이언트 (livechat-sdk.js, media-session.js)
+- `_onJoinOk`: ROOM_JOIN 응답의 mode/ptt_virtual_ssrc를 MediaSession에 전달
+- `MediaSession.setup`: `_sdpOptions` 저장, PTT subscribe PC 생성 우회
+- `_setupSubscribePc`: PTT 모드일 때 트랙 없어도 subscribe PC 생성
+
+#### 클라이언트 UI (app.js)
+- PTT 가상 스트림 `stream.id === "light-ptt"` 감지 → `"__ptt__"` 키로 저장
+- PTT video track `onunmute`/`onmute` 이벤트 핸들러
+- `updatePttView("listening")`: `remoteStreams.get("__ptt__")` 사용
+- `updatePttView("idle")`: PTT 모드에서 `video.srcObject = null` 안 함
+- listening 상태에서 `video.play()` 강제 호출
+
+#### 어드민 (livechat-admin/app.js)
+- SFU 패널 PTT 메트릭: audio_rw, video_rw, vid_skip, released, switches 추가
+- 스냅샷 텍스트에 새 메트릭 포함
+
+### Fixed
+- VP8 키프레임 감지(`is_vp8_keyframe()`) 정상 동작 확인 — `kf_arrived=0`은 텔레메트리 3초 윈도우 타이밍 이슈
+
+### Known Issues (WebRTC 기반 PTT 한계)
+- 화자 교대 시 0.5-2초 영상 정지 (키프레임 대기)
+- hard_off 복귀 시 검은 화면 가능 (PLI 타이밍 불일치)
+- idle 구간에서 Chrome track muted 전이 → unmute 지연
+- 오디오 지연 관찰 → 추가 분석 필요
+
 ## [0.5.1] - 2026-03-08
 
 ### Added (Phase E: PTT 미디어 파이프라인 — 게이팅 + SSRC 리라이팅 + 키프레임 대기)

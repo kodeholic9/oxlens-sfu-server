@@ -177,6 +177,7 @@ impl UdpTransport {
                 if keyframe {
                     self.metrics.ptt_keyframe_arrived.fetch_add(1, Ordering::Relaxed);
                 }
+
                 room.video_rewriter.rewrite(&mut rewritten, &sender.user_id, keyframe)
             } else {
                 RewriteResult::Skip
@@ -184,6 +185,11 @@ impl UdpTransport {
             match result {
                 RewriteResult::Ok => {
                     self.metrics.ptt_rtp_rewritten.fetch_add(1, Ordering::Relaxed);
+                    if rtp_hdr.pt == 111 {
+                        self.metrics.ptt_audio_rewritten.fetch_add(1, Ordering::Relaxed);
+                    } else if rtp_hdr.pt == 96 {
+                        self.metrics.ptt_video_rewritten.fetch_add(1, Ordering::Relaxed);
+                    }
                     rewritten
                 }
                 RewriteResult::PendingKeyframe => {
@@ -194,7 +200,12 @@ impl UdpTransport {
                     }
                     return; // 키프레임 대기 중 — P-frame 드롭
                 }
-                RewriteResult::Skip => plaintext.clone(),
+                RewriteResult::Skip => {
+                    if rtp_hdr.pt == 96 {
+                        self.metrics.ptt_video_skip.fetch_add(1, Ordering::Relaxed);
+                    }
+                    plaintext.clone()
+                }
             }
         } else {
             plaintext.clone()
