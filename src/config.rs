@@ -75,6 +75,24 @@ pub const RTCP_FMT_PLI: u8 = 1;
 /// REMB feedback message type (FMT=15)
 pub const RTCP_FMT_REMB: u8 = 15;
 
+// --- RTCP APP — MBCP Floor Control over UDP (RFC 3550 Section 6.7) ---
+/// RTCP APP payload type
+pub const RTCP_PT_APP: u8 = 204;
+/// APP subtype: Floor Request (PTT 누름)
+pub const MBCP_SUBTYPE_FREQ: u8 = 0;
+/// APP subtype: Floor Release (PTT 뗌)
+pub const MBCP_SUBTYPE_FREL: u8 = 1;
+/// APP subtype: Floor Taken (서버 → 클라이언트, 누군가 발화 획득)
+pub const MBCP_SUBTYPE_FTKN: u8 = 2;
+/// APP subtype: Floor Idle (서버 → 클라이언트, 발화권 해제됨)
+pub const MBCP_SUBTYPE_FIDL: u8 = 3;
+/// APP subtype: Floor Revoke (서버 → 클라이언트, 강제 회수)
+pub const MBCP_SUBTYPE_FRVK: u8 = 4;
+/// APP subtype: Floor Ping (발화자 생존 확인)
+pub const MBCP_SUBTYPE_FPNG: u8 = 5;
+/// APP name: "MBCP" (4 bytes ASCII, RFC 3550 APP 패킷 식별자)
+pub const MBCP_APP_NAME: [u8; 4] = [b'M', b'B', b'C', b'P'];
+
 // --- REMB (Server-generated) ---
 /// 서버 자체 REMB 전송 주기 (ms) — publisher에게 대역폭 힘트 제공
 pub const REMB_INTERVAL_MS: u64 = 1_000;

@@ -63,138 +63,105 @@
 
 ## Phase A-2: 클라이언트 SdpBuilder ✅ (v0.1.6)
 - [x] SdpBuilder JS 모듈 개발 (sdp-builder.mjs)
-  - [x] buildPublishRemoteSdp(serverConfig) → recvonly fake SDP
-  - [x] buildSubscribeRemoteSdp(serverConfig, tracks[]) → sendonly × N fake SDP
-  - [x] updateSubscribeRemoteSdp(serverConfig, allTracks) → re-nego용 전체 재조립
-  - [x] validateSdp(sdp) → 디버깅용 구조 검증
 - [x] SdpBuilder 유닛테스트 74개 전부 통과
 - [x] livechat-sdk.js v2.0.0 (2PC/SDP-free 전환)
-  - [x] _pubPc + _subPc 2개 PC 관리
-  - [x] PUBLISH_TRACKS로 SSRC 서버 등록
-  - [x] tracks_update 수신 → subscribe PC re-negotiation
-- [x] handler.rs fingerprint 중복 접두어 버그 수정
-- [x] 브라우저 E2E 테스트 성공 (양방향 RTP, lost=0, jitter<0.003)
 
 ## Phase A-3: PLI 키프레임 요청 ✅ (v0.1.7)
-> 원인: 새 구독자 입장 시 VP8 키프레임 없이 P-frame만 수신 → Chrome 디코더 10~20초 대기
-> 해결: subscribe SRTP ready 시점에 publisher에게 RTCP PLI 전송
-
-### 서버 (light-livechat)
 - [x] RTCP PLI 패킷 생성 함수 (12바이트 고정, RFC 4585)
-  - FMT=1, PT=206, SSRC of sender=0, SSRC of media=publisher의 video SSRC
 - [x] SrtpContext.encrypt_rtcp() 추가
-- [x] PLI를 SRTP 암호화하여 publisher의 publish addr로 전송
 - [x] subscribe SRTP ready 이벤트 시점에 PLI 트리거
-  - udp.rs: DTLS handshake 완료 → PcType::Subscribe인 경우
-  - 해당 room의 모든 다른 참가자(publisher)에게 PLI 전송
-- [ ] PUBLISH_TRACKS 수신 시점에도 기존 구독자에게 PLI 전송 (late join) — Phase B에서
 
-### 검증
-- [ ] 서버 로그에 [DBG:PLI] 태그로 PLI 전송 확인
-- [ ] 브라우저 E2E: B 입장 후 1~2초 이내 비디오 표시 확인
-- [ ] 기존 기능 회귀 테스트 (audio relay, 정상 퇴장 등)
-
-## Phase B: 통합 테스트 + 다중 참가자
-- [x] 3명 동시 접속 테스트 — 영상+오디오 양방향 확인
-- [x] app.js 다중 참가자 비디오 대응 (remoteStreams Map + userId 매핑)
-- [x] app.js 다중 참가자 오디오 대응 (참가자별 <audio> 엘리먼트)
-- [ ] 참가자 중간 퇴장 → inactive m-line 처리 확인
-- [ ] 재입장 → 슬롯 재활용 확인
-- [ ] subscribe PC 사전 생성 옵션 검토 (joinRoom 시점)
-
-## Phase C: RTCP + 안정화
+## Phase C: RTCP + 안정화 ✅
 - [x] RTCP SR/RR transparent relay — v0.2.2
 - [x] NACK 수신 → 서버에서 RTX 재전송 — v0.2.0
-- [x] REMB 처리 (대역폭 추정 전달) — v0.2.2
-- [x] PLI 클라이언트 발 → 해당 publisher에 전달 — v0.2.2
-- [x] mute/unmute 이벤트 처리 (시그널링 + 브로드캐스트) — v0.2.3
-- [x] 서버 자체 REMB 생성 (Chrome BWE 대역폭 힌트) — v0.3.4
-- [x] RR relay metrics 카운터 버그 수정 — v0.3.4
-- [x] transport-wide-cc extmap 제거 (TWCC 구현 전 REMB 모드) — v0.3.4
-- [x] SDK jitterBufferDelay delta 계산 전환 — v0.3.4
-- [x] TWCC feedback 생성 (서버, REMB 대체) — v0.3.8
-- [ ] VP8 키프레임 캐시 (LRU) 검토
-  - RTP payload에서 VP8 I-frame 감지 (RFC 7741 descriptor + bit0)
-  - publisher별 마지막 키프레임 RTP 패킷 묶음(same timestamp) 캐시
-  - 새 구독자 입장 시 캐시된 키프레임 즉시 전달 (PLI 왕복 없이 200ms 이내)
-  - seq/timestamp rewrite 필요 — 복잡도 높음, 성능 효과 측정 후 결정
+- [x] REMB + PLI relay — v0.2.2
+- [x] mute/unmute 이벤트 처리 — v0.2.3
+- [x] TWCC feedback 생성 — v0.3.8
 
 ## Phase D: Hardening
 - [ ] IDENTIFY token verification (JWT or shared secret)
-- [x] Zombie session reaper (last_seen timeout) — v0.2.1
+- [x] Zombie session reaper — v0.2.1
 - [x] Heartbeat timeout → disconnect — v0.2.1
-- [x] DTLS handshake timeout cleanup (zombie reaper에 통합) — v0.2.1
-- [x] Graceful shutdown (drain connections) — v0.2.1
-- [x] Structured logging (info/debug/trace 레벨 정리) — v0.2.1
+- [x] Graceful shutdown — v0.2.1
 
-## Phase E: PTT Support
-- [x] Room mode field (Conference / PTT) — v0.5.0
-- [x] Floor control state machine (Idle → Taken → Idle) — v0.5.0
-- [x] FLOOR_REQUEST / FLOOR_RELEASE / FLOOR_PING opcodes — v0.5.0
-- [x] Floor indicator broadcast (FLOOR_TAKEN/FLOOR_IDLE/FLOOR_REVOKE) — v0.5.0
-- [x] E-0: Floor Timer Task (2초 주기, T2/PING 타임아웃 revoke) — v0.5.1
-- [x] E-1: Relay Gate (handle_srtp + relay_publish_rtcp PTT 게이팅) — v0.5.1
-- [x] E-2: Audio SSRC Rewriting (PttRewriter, Opus PT=111, 오프셋 연산) — v0.5.1
-- [x] E-4: Video SSRC Rewriting (VP8 PT=96, 키프레임 대기, is_vp8_keyframe) — v0.5.1
-- [x] E-4: NACK 역매핑 (가상seq→원본seq, RtpCache 조회) — v0.5.1
-- [x] E-4: Subscribe RTCP relay 가상SSRC→원본SSRC 변환 — v0.5.1
-- [x] PTT 메트릭 7개 카운터 + 어드민 PTT 상태 스냅샷 — v0.5.1
-- [x] E-5: 클라이언트 PTT Subscribe SDP 연동 — v0.5.2
-  - 서버: ROOM_JOIN 응답에 ptt_virtual_ssrc, PLI 3회 반복, 메트릭 5개 추가
-  - 클라이언트: buildPttSubscribeSdp, __ptt__ 가상 스트림 바인딩, onunmute 처리
-  - 3인 PTT 영상+음성 정상 확인
-  - WebRTC 기반 PTT 영상 한계 문서화 (doc/PTT-E5-클라이언트연동-2026-03-08.md)
-- [ ] PTT 오디오 지연 원인 분석 및 최적화
-- [ ] PTT 영상 개선: 서버 키프레임 캐싱 + 화자 전환 시 즉시 주입 (LiveKit 패턴)
+## Phase E: PTT Support ✅
+- [x] Floor control state machine — v0.5.0
+- [x] E-0~E-5: 게이팅 + SSRC 리라이팅 + 키프레임 + 클라이언트 연동 — v0.5.1~v0.5.2
 
-## Phase W: UDP Worker 멀티코어 분산
-- [x] W-1: Fan-out spawn — handle_srtp/relay_publish_rtcp fan-out을 tokio::spawn 분리 — v0.3.5
-  - 30인 loss 9.6%→1.3%, 4코어 균등 분산 확인
-- [x] W-2: Multi-worker (SO_REUSEPORT) — N개 독립 recv 루프, 커널 4-tuple hash 분배 — v0.3.6
-  - 30인 loss 0.1%, CPU 113% / 35인 FAIL (outbound_srtp Mutex 경합)
-- [x] W-3: Subscriber Egress Task (LiveKit 패턴) — subscriber별 독립 egress pipeline — v0.3.7
-  - 30인 loss 0.000%/15ms, 35인 7.0%, 40인 22.8% (RPi 한계)
-- [ ] W-4: recvmmsg batch 수신 (선택적, pps 5만+ 시)
+## Phase M: MBCP Floor Control over UDP ✅ (v0.5.3)
+- [x] M-1: RTCP APP 패킷 파서/빌더 (RFC 3550 Section 6.7) — v0.5.3
+- [x] M-1: ingress MBCP 수신 → floor.rs 상태 머신 연결 — v0.5.3
+- [x] M-1: MBCP 응답 브로드캐스트 (FTKN/FIDL/FRVK → subscriber egress) — v0.5.3
+- [x] M-1: WS + UDP 하이브리드 Floor 이벤트 동시 발행 — v0.5.3
+- [x] M-1: 유닛테스트 7개 (build/parse 라운드트립, 4바이트 정렬, compound 분류) — v0.5.3
 
-## Phase TV: Telemetry Visibility (v0.3.9)
-- [x] 환경 메타데이터 (build_mode, log_level, worker_count, bwe_mode, version)
-- [x] Egress encrypt timing (Arc<AtomicU64>, lock-free CAS max)
-- [x] Tokio RuntimeMetrics (busy_ratio, alive_tasks, global_queue, budget_yield, io_ready)
-- [x] Per-worker 상세 (busy_ratio, poll_count, steal_count, noop_count)
-- [x] 어드민 대시보드 표시 (Egress Encrypt, Tokio Runtime, Environment)
-- [x] Contract 체크: runtime_busy (85% WARN, 95% FAIL)
-- [x] 스냅샷 내보내기 연동
+## Phase W: UDP Worker 멀티코어 분산 ✅
+- [x] W-1: Fan-out spawn — v0.3.5
+- [x] W-2: Multi-worker (SO_REUSEPORT) — v0.3.6
+- [x] W-3: Subscriber Egress Task — v0.3.7
 
-## Phase HP: Hot Path 병목 제거 (v0.3.10)
-- [x] handle_srtp fan-out: other_participants() Vec → DashMap iter (0 alloc)
-- [x] relay_publish_rtcp: 동일 Vec 할당 제거
-- [x] handle_nack_block/subscribe_rtcp: all_participants().find() → find_by_track_ssrc() (0 alloc)
-- [x] egress_drop 카운터: try_send 실패 시 silent drop → 카운팅
-- [x] 어드민: eg_drop 표시 + 경고 배너
+---
 
-## Phase GM: GlobalMetrics 리팩터링 (v0.4.0) ✅
-- [x] AtomicTimingStat 구현 (EgressTimingAtomics 일반화)
-- [x] GlobalMetrics 구조체 (Arc 공유, 전체 Atomic)
-- [x] ServerMetrics + EgressTimingAtomics + spawn atomics 통합
-- [x] UdpTransport &mut self → &self 복귀
-- [x] egress task 파라미터 정리 (timing 제거, metrics 통합)
-- [x] `src/metrics/` 모듈 분리 (env.rs, tokio_snapshot.rs, mod.rs)
-- [x] `src/transport/udp/metrics.rs` 제거 (udp/ = 순수 미디어 코어)
+## 🔜 Next: oxlens-sdk-core (Android 네이티브 SDK)
 
-## Benchmark
-- [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화
-- [x] RPi 4B fan-out 한계 테스트 (fo1→499, 13회, loss 0.002%, CPU 69%)
-- [x] 벤치마크 리포트 문서화 (doc/BENCHMARK-FANOUT-20260306.md)
-- [x] Conference 벤치마크 (5/10/20/25/30인, 25인 PASS, 30인 FAIL)
-- [x] W-1 Conference 벤치마크 (25인 0%, 30인 1.3%, 35인 13.4%) — v0.3.5
-- [x] W-2 Conference 벤치마크 (30인 0.1%, 35인 17.8%) — v0.3.6
-- [x] W-3 Conference 벤치마크 (30인 0%, 35인 7%, 40인 22.8%) — v0.3.7
-- [ ] x86 서버 벤치마크 (50인+ 목표)
-- [ ] TWCC 전후 벤치마크 비교 (Chrome BWE 반응 확인, v0.3.8 vs v0.3.4)
+### 환경 구축
+- [x] WSL2 + Ubuntu 22.04 설치 — 2026-03-09
+- [x] depot_tools 설치 — 2026-03-09
+- [x] WebRTC Android 소스 fetch + gclient sync — 2026-03-09
+- [x] install-build-deps 완료 — 2026-03-09
+- [ ] libwebrtc arm64 첫 빌드 완료 (gn gen + ninja -j4)
+- [ ] libwebrtc.aar 생성 확인
+- [ ] Android Studio 설치 + SDK/NDK 셋업
+- [ ] oxlens-sdk-core 프로젝트 생성 (Kotlin, min API 28)
+- [ ] libwebrtc.aar 통합 + Gradle sync 확인
+
+### Rx 파이프라인 (수신)
+- [ ] C++ Interceptor: Dependencies 주입용 Proxy 클래스 작성
+- [ ] Opus silence frame 주입기 (NetEQ Hot 유지)
+- [ ] Sequence/Timestamp offset 보정 (서버 릴레이 로직 포팅)
+- [ ] SSRC 기반 Audio/Video 패킷 분류
+
+### Tx 파이프라인 (송신 FSM)
+- [ ] Stage 1 (Soft-Mute): `encoding.active = false`, 하드웨어 ON
+- [ ] Stage 2 (Hard-Mute): 하드웨어 OFF, Track 유지, "비디오 중단" 시그널
+- [ ] Stage 3 (Deep Sleep): ICE Ping 장주기 전환
+- [ ] Stage 전환 타임아웃 config 상수화 (1분, 10분)
+
+### ICE Keep-alive 최적화
+- [ ] `ice_candidate_pair_ping_interval` 동적 조정 (Stage별 10s/15s/30s+)
+- [ ] 한국 통신사(SKT/KT/LGU+) LTE/5G NAT 타임아웃 실측
+
+### 카메라 웜업 & 키프레임
+- [ ] Android `onFirstFrameAvailable()` 콜백 연동
+- [ ] 클라이언트 → 서버: CAMERA_READY 시그널 (opcode 추가)
+- [ ] 서버: CAMERA_READY 수신 → PLI 2발 (즉시 + 150ms)
+
+### MBCP 클라이언트 (네이티브 Floor Control)
+- [ ] RTCP APP 패킷 빌더 (FREQ/FREL/FPNG) — C++ 또는 Kotlin/JNI
+- [ ] RTCP APP 패킷 파서 (FTKN/FIDL/FRVK) — subscribe PC에서 수신
+- [ ] PTT 버튼 UI → MBCP FREQ/FREL 전송
+- [ ] sfu-labs bench 클라이언트에 MBCP 송수신 추가 (서버 검증용)
+
+### 서버 추가 작업
+- [ ] opcode 추가: CAMERA_READY, VIDEO_SUSPENDED, VIDEO_RESUMED
+- [ ] VIDEO_SUSPENDED/RESUMED 핸들러 → 수신자 UI placeholder 전환 브로드캐스트
+- [ ] 시그널링 단절 시 Full Cold Start 정책 구현
+
+### 시그널링 단절 예외 처리
+- [ ] 시그널링(TCP) 단절 감지 → 모든 캐시(SDP/DTLS/ICE) 파기
+- [ ] Full Cold Start (신규 SDP 교환) 수행
+- [ ] 좀비 세션 원천 차단 검증
+
+---
 
 ## Backlog
-- [ ] Simulcast / SVC (layer detection, adaptive quality)
-- [ ] TURN relay support (for restrictive NATs)
+- [ ] IDENTIFY token verification (JWT or shared secret)
+- [ ] VP8 키프레임 캐시 (서버, 화자 전환 시 즉시 주입)
+- [ ] PTT 오디오 지연 원인 분석 및 최적화
+- [ ] x86 서버 벤치마크 (50인+ 목표)
+- [ ] Simulcast / SVC
+- [ ] TURN relay support
 - [ ] Recording (RTP → file)
 - [ ] Data channel support
 - [ ] Horizontal scaling (multi-node)
+- [ ] 타우리 데스크톱: WebView 내장 WebRTC vs 네이티브 libwebrtc 결정

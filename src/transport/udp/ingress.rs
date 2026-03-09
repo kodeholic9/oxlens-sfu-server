@@ -5,22 +5,24 @@
 //! - handle_subscribe_rtcp: subscribe RTCP → NACK/RR/PLI/REMB 분기
 //! - handle_nack_block: NACK → cache 조회 → RTX 조립 → egress 큐
 //! - relay_publish_rtcp: publish RTCP(SR) → egress 큐 fan-out
+//! - handle_mbcp_from_publish: MBCP APP → Floor Control 처리 (Phase M-1)
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
-use tracing::{debug, trace};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, trace, warn};
 
 use crate::config;
 use crate::config::RoomMode;
-use crate::room::participant::{PcType, EgressPacket};
+use crate::room::participant::{PcType, EgressPacket, TrackKind};
+use crate::room::floor::FloorAction;
 use crate::room::room::Room;
 
 use super::UdpTransport;
 use super::rtcp::{
     parse_rtp_header, current_ts, split_compound_rtcp, parse_rtcp_nack,
-    expand_nack, build_rtx_packet, assemble_compound,
+    expand_nack, build_rtx_packet, assemble_compound, build_mbcp_app, MbcpMessage,
 };
 use super::twcc;
 
@@ -84,7 +86,14 @@ impl UdpTransport {
                 }
             };
 
+            // Phase M-1: Compound RTCP 파싱 — MBCP APP 블록 체크
+            let parsed = split_compound_rtcp(&plaintext);
+            if !parsed.mbcp_blocks.is_empty() {
+                self.handle_mbcp_from_publish(&parsed.mbcp_blocks, &sender, &room, is_detail).await;
+            }
+
             // Phase C-2a: SR relay — publisher의 SR을 모든 subscriber에게 전달
+            // (MBCP APP은 이미 위에서 처리했으므로 relay에서는 무시됨)
             self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail);
             return;
         }
@@ -233,6 +242,265 @@ impl UdpTransport {
     }
 
     // ========================================================================
+    // Phase M-1: MBCP Floor Control via RTCP APP (publish PC에서 수신)
+    // ========================================================================
+
+    /// Publish RTCP compound 내 MBCP APP 블록 처리
+    ///
+    /// 클라이언트가 SRTP 채널로 RTCP APP 패킷을 보내면 여기서 수신.
+    /// SSRC로 참가자를 이미 식별한 상태이므로, user_id를 바로 사용.
+    /// Floor 로직은 기존 floor.rs 상태 머신을 그대로 재사용.
+    async fn handle_mbcp_from_publish(
+        &self,
+        mbcp_blocks: &[MbcpMessage],
+        sender: &Arc<crate::room::participant::Participant>,
+        room: &Arc<Room>,
+        is_detail: bool,
+    ) {
+        if room.mode != RoomMode::Ptt {
+            if is_detail {
+                debug!("[MBCP] ignored — room {} is not PTT mode", room.id);
+            }
+            return;
+        }
+
+        let user_id = &sender.user_id;
+        let now = current_ts();
+
+        for msg in mbcp_blocks {
+            match msg.subtype {
+                config::MBCP_SUBTYPE_FREQ => {
+                    info!("[MBCP] FLOOR_REQUEST user={} ssrc=0x{:08X}", user_id, msg.ssrc);
+                    let action = room.floor.request(user_id, now);
+                    self.apply_mbcp_floor_action(&action, room, sender, is_detail).await;
+
+                    // Granted → rewriter 전환 + PLI (기존 WS 핸들러와 동일 로직)
+                    if let FloorAction::Granted { ref speaker } = action {
+                        self.metrics.ptt_floor_granted.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.ptt_speaker_switches.fetch_add(1, Ordering::Relaxed);
+                        room.audio_rewriter.switch_speaker(speaker);
+                        room.video_rewriter.switch_speaker(speaker);
+                        self.send_pli_burst(room, speaker).await;
+                    }
+                }
+                config::MBCP_SUBTYPE_FREL => {
+                    info!("[MBCP] FLOOR_RELEASE user={} ssrc=0x{:08X}", user_id, msg.ssrc);
+                    let action = room.floor.release(user_id);
+
+                    if matches!(&action, FloorAction::Released { .. }) {
+                        self.metrics.ptt_floor_released.fetch_add(1, Ordering::Relaxed);
+                        room.audio_rewriter.clear_speaker();
+                        room.video_rewriter.clear_speaker();
+                    }
+
+                    self.apply_mbcp_floor_action(&action, room, sender, is_detail).await;
+                }
+                config::MBCP_SUBTYPE_FPNG => {
+                    let action = room.floor.ping(user_id, now);
+                    if is_detail {
+                        debug!("[MBCP] FLOOR_PING user={} result={:?}", user_id, action);
+                    }
+                    // PING은 응답을 보내지 않음 (UDP이므로 단방향 heartbeat)
+                    // 서버는 last_ping 갱신만 하면 됨
+                }
+                _ => {
+                    // 클라이언트가 FTKN/FIDL/FRVK를 보내는 것은 프로토콜 위반
+                    warn!("[MBCP] unexpected subtype={} from user={}", msg.subtype, user_id);
+                }
+            }
+        }
+    }
+
+    /// FloorAction → MBCP APP 패킷 브로드캐스트 (서버 → 모든 subscriber)
+    ///
+    /// WS 시그널링의 apply_floor_action과 동일한 의미론이지만,
+    /// 메시지를 RTCP APP 패킷으로 조립해서 subscriber egress 큐에 넣는다.
+    async fn apply_mbcp_floor_action(
+        &self,
+        action: &FloorAction,
+        room: &Arc<Room>,
+        requester: &Arc<crate::room::participant::Participant>,
+        is_detail: bool,
+    ) {
+        match action {
+            FloorAction::Granted { speaker } => {
+                // 전체에 FTKN 브로드캐스트 (요청자 포함)
+                let ftkn = build_mbcp_app(
+                    config::MBCP_SUBTYPE_FTKN,
+                    0, // 서버 SSRC = 0
+                    Some(speaker),
+                );
+                self.broadcast_mbcp_to_subscribers(room, &ftkn);
+
+                // 요청자에게도 WS FLOOR_TAKEN 전송 (하이브리드: WS 클라이언트 호환)
+                self.send_ws_floor_taken(room, speaker);
+
+                if is_detail {
+                    debug!("[MBCP] FTKN broadcast speaker={}", speaker);
+                }
+            }
+            FloorAction::Denied { reason, current_speaker } => {
+                // 요청자에게만 거부 응답 — FRVK subtype 재사용 (cause에 이유)
+                // 네이티브 클라이언트는 FRVK 수신 시 subtype로 구분 가능
+                let deny_msg = format!("denied: {} (speaker={})", reason, current_speaker);
+                let frvk = build_mbcp_app(
+                    config::MBCP_SUBTYPE_FRVK,
+                    0,
+                    Some(&deny_msg),
+                );
+                self.send_mbcp_to_participant(requester, &frvk);
+
+                if is_detail {
+                    debug!("[MBCP] denied user={} reason={}", requester.user_id, reason);
+                }
+            }
+            FloorAction::Released { prev_speaker } => {
+                // 전체에 FIDL 브로드캐스트
+                let fidl = build_mbcp_app(
+                    config::MBCP_SUBTYPE_FIDL,
+                    0,
+                    Some(prev_speaker),
+                );
+                self.broadcast_mbcp_to_subscribers(room, &fidl);
+
+                // WS 호환 이벤트
+                self.send_ws_floor_idle(room, prev_speaker);
+
+                if is_detail {
+                    debug!("[MBCP] FIDL broadcast prev_speaker={}", prev_speaker);
+                }
+            }
+            FloorAction::Revoked { prev_speaker, cause } => {
+                // prev_speaker에게 FRVK
+                if let Some(p) = room.get_participant(prev_speaker) {
+                    let frvk = build_mbcp_app(
+                        config::MBCP_SUBTYPE_FRVK,
+                        0,
+                        Some(cause),
+                    );
+                    self.send_mbcp_to_participant(&p, &frvk);
+                }
+                // 전체에 FIDL
+                let fidl = build_mbcp_app(
+                    config::MBCP_SUBTYPE_FIDL,
+                    0,
+                    Some(prev_speaker),
+                );
+                self.broadcast_mbcp_to_subscribers(room, &fidl);
+
+                // WS 호환 이벤트
+                self.send_ws_floor_idle(room, prev_speaker);
+
+                if is_detail {
+                    debug!("[MBCP] FRVK → {} cause={}, FIDL broadcast", prev_speaker, cause);
+                }
+            }
+            _ => {} // PingOk, PingDenied — MBCP에서는 무응답
+        }
+    }
+
+    /// MBCP APP 패킷을 room 내 모든 subscriber egress 큐에 전달
+    fn broadcast_mbcp_to_subscribers(&self, room: &Arc<Room>, mbcp_pkt: &[u8]) {
+        let pkt = mbcp_pkt.to_vec();
+        for entry in room.participants.iter() {
+            let target = entry.value();
+            if !target.is_subscribe_ready() { continue; }
+            if target.egress_tx.try_send(EgressPacket::Rtcp(pkt.clone())).is_err() {
+                self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// MBCP APP 패킷을 특정 participant의 subscriber egress 큐에 전달
+    fn send_mbcp_to_participant(
+        &self,
+        participant: &Arc<crate::room::participant::Participant>,
+        mbcp_pkt: &[u8],
+    ) {
+        if !participant.is_subscribe_ready() { return; }
+        let pkt = mbcp_pkt.to_vec();
+        if participant.egress_tx.try_send(EgressPacket::Rtcp(pkt)).is_err() {
+            self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// WS 호환: Floor Taken 이벤트를 WS로도 전송 (웹 클라이언트용)
+    fn send_ws_floor_taken(&self, room: &Arc<Room>, speaker: &str) {
+        let json = serde_json::json!({
+            "op": crate::signaling::opcode::FLOOR_TAKEN,
+            "pid": 0,
+            "d": { "room_id": room.id, "speaker": speaker },
+        });
+        let msg = serde_json::to_string(&json).unwrap_or_default();
+        for entry in room.participants.iter() {
+            let _ = entry.value().ws_tx.send(msg.clone());
+        }
+    }
+
+    /// WS 호환: Floor Idle 이벤트를 WS로도 전송 (웹 클라이언트용)
+    fn send_ws_floor_idle(&self, room: &Arc<Room>, prev_speaker: &str) {
+        let json = serde_json::json!({
+            "op": crate::signaling::opcode::FLOOR_IDLE,
+            "pid": 0,
+            "d": { "room_id": room.id, "prev_speaker": prev_speaker },
+        });
+        let msg = serde_json::to_string(&json).unwrap_or_default();
+        for entry in room.participants.iter() {
+            let _ = entry.value().ws_tx.send(msg.clone());
+        }
+    }
+
+    /// Floor Granted 시 PLI burst 전송 (0ms + 500ms + 1500ms)
+    /// 기존 WS 핸들러의 PLI 3연발 로직과 동일
+    async fn send_pli_burst(&self, room: &Arc<Room>, speaker: &str) {
+        let participant = match room.get_participant(speaker) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if !participant.is_publish_ready() { return; }
+
+        let video_ssrc = {
+            let tracks = participant.tracks.lock().unwrap();
+            tracks.iter()
+                .find(|t| t.kind == TrackKind::Video)
+                .map(|t| t.ssrc)
+        };
+
+        let (ssrc, pub_addr) = match (video_ssrc, participant.publish.get_address()) {
+            (Some(s), Some(a)) => (s, a),
+            _ => return,
+        };
+
+        let p = Arc::clone(&participant);
+        let socket = self.socket.clone();
+        let speaker_id = speaker.to_string();
+        tokio::spawn(async move {
+            let delays = [0u64, 500, 1500];
+            for (i, &delay_ms) in delays.iter().enumerate() {
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                let pli_plain = super::rtcp::build_pli(ssrc);
+                let encrypted = {
+                    let mut ctx = p.publish.outbound_srtp.lock().unwrap();
+                    ctx.encrypt_rtcp(&pli_plain).ok()
+                };
+                if let Some(enc) = encrypted {
+                    if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                        warn!("[MBCP] PLI send FAILED user={} ssrc=0x{:08X} #{}: {e}",
+                            speaker_id, ssrc, i);
+                        break;
+                    } else {
+                        info!("[MBCP] PLI sent user={} ssrc=0x{:08X} #{} (floor granted)",
+                            speaker_id, ssrc, i);
+                    }
+                }
+            }
+        });
+    }
+
+    // ========================================================================
     // Subscribe RTCP — compound 파싱 → NACK 서버 처리 + 나머지 publisher 릴레이
     // ========================================================================
 
@@ -289,8 +557,9 @@ impl UdpTransport {
         let parsed = split_compound_rtcp(&plaintext);
 
         if is_detail {
-            debug!("[DBG:RTCP:SUB] user={} compound_len={} nack_blocks={} relay_blocks={}",
-                subscriber.user_id, plaintext.len(), parsed.nack_blocks.len(), parsed.relay_blocks.len());
+            debug!("[DBG:RTCP:SUB] user={} compound_len={} nack_blocks={} relay_blocks={} mbcp_blocks={}",
+                subscriber.user_id, plaintext.len(), parsed.nack_blocks.len(),
+                parsed.relay_blocks.len(), parsed.mbcp_blocks.len());
         }
 
         // (1) NACK 처리 (RTX 재전송 — 기존 로직)
@@ -300,11 +569,26 @@ impl UdpTransport {
         }
 
         // (2) 릴레이 대상 RTCP (RR, PLI, REMB) → publisher별로 모아서 전송
-        if parsed.relay_blocks.is_empty() {
-            return;
+        if !parsed.relay_blocks.is_empty() {
+            self.relay_subscribe_rtcp_blocks(&plaintext, &parsed, subscriber, room, is_detail).await;
         }
 
-        // RR/PLI relay count — plaintext는 이미 복호화된 RTCP이므로 & 0x7F 마스크 불필요
+        // (3) MBCP APP 블록 — subscribe PC에서도 MBCP를 보낼 수 있음 (드문 경우)
+        if !parsed.mbcp_blocks.is_empty() {
+            self.handle_mbcp_from_publish(&parsed.mbcp_blocks, subscriber, room, is_detail).await;
+        }
+    }
+
+    /// Subscribe RTCP의 릴레이 대상 블록을 publisher별로 모아서 전송
+    async fn relay_subscribe_rtcp_blocks(
+        &self,
+        plaintext: &[u8],
+        parsed: &super::rtcp::CompoundRtcpParsed,
+        _subscriber: &Arc<crate::room::participant::Participant>,
+        room: &Arc<Room>,
+        is_detail: bool,
+    ) {
+        // RR/PLI relay count
         for block in &parsed.relay_blocks {
             let pt = plaintext.get(block.offset + 1).copied().unwrap_or(0);
             if pt == config::RTCP_PT_RR { self.metrics.rr_relayed.fetch_add(1, Ordering::Relaxed); }
@@ -323,10 +607,8 @@ impl UdpTransport {
         let mut publisher_rtcp: HashMap<u32, Vec<&[u8]>> = HashMap::new();
         for block in &parsed.relay_blocks {
             if block.media_ssrc == 0 { continue; }
-            // PTT: 가상 SSRC로 도착한 RTCP는 현재 speaker의 원본 SSRC로 매핑
             let effective_ssrc = if ptt_audio_vssrc == Some(block.media_ssrc)
                 || ptt_video_vssrc == Some(block.media_ssrc) {
-                // 현재 speaker의 해당 미디어 타입 원본 SSRC 찾기
                 let is_video = ptt_video_vssrc == Some(block.media_ssrc);
                 room.floor.current_speaker()
                     .and_then(|uid| room.get_participant(&uid))
@@ -334,9 +616,9 @@ impl UdpTransport {
                         let tracks = p.tracks.lock().unwrap();
                         tracks.iter()
                             .find(|t| if is_video {
-                                t.kind == crate::room::participant::TrackKind::Video
+                                t.kind == TrackKind::Video
                             } else {
-                                t.kind == crate::room::participant::TrackKind::Audio
+                                t.kind == TrackKind::Audio
                             })
                             .map(|t| t.ssrc)
                     })
@@ -350,7 +632,6 @@ impl UdpTransport {
         }
 
         for (media_ssrc, blocks) in &publisher_rtcp {
-            // publisher 찾기 (zero-alloc DashMap iter)
             let publisher = room.find_by_track_ssrc(*media_ssrc);
 
             let publisher = match publisher {
@@ -370,10 +651,8 @@ impl UdpTransport {
                 None => continue,
             };
 
-            // 릴레이 대상 RTCP 블록들을 compound로 재조립
             let compound = assemble_compound(blocks);
 
-            // publisher의 publish session outbound_srtp로 encrypt
             let encrypted = {
                 let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
                 match ctx.encrypt_rtcp(&compound) {
@@ -416,7 +695,6 @@ impl UdpTransport {
         let nack_items = parse_rtcp_nack(nack_data);
 
         // Phase E-4: PTT 모드 NACK 역매핑
-        // subscriber는 가상 SSRC/seq를 보지만 RtpCache는 원본 seq 기준
         let is_ptt = room.mode == RoomMode::Ptt;
         let ptt_virtual_video_ssrc = if is_ptt {
             Some(room.video_rewriter.virtual_ssrc())
@@ -432,20 +710,17 @@ impl UdpTransport {
                     subscriber.user_id, nack.media_ssrc, nack.pid, nack.blp, lost_seqs);
             }
 
-            // PTT NACK 역매핑: 가상 SSRC로 NACK이 온 경우 원본 seq로 역산
             let (lookup_ssrc, cache_seqs) = if ptt_virtual_video_ssrc == Some(nack.media_ssrc) {
-                // 가상 SSRC로 NACK 도착 → 현재 speaker의 원본 SSRC로 변환
                 self.metrics.ptt_nack_remapped.fetch_add(1, Ordering::Relaxed);
                 let original_seqs: Vec<u16> = lost_seqs.iter()
                     .map(|&vs| room.video_rewriter.reverse_seq(vs))
                     .collect();
-                // 현재 speaker의 원본 video SSRC 찾기
                 let speaker_ssrc = room.floor.current_speaker()
                     .and_then(|uid| room.get_participant(&uid))
                     .and_then(|p| {
                         let tracks = p.tracks.lock().unwrap();
                         tracks.iter()
-                            .find(|t| t.kind == crate::room::participant::TrackKind::Video)
+                            .find(|t| t.kind == TrackKind::Video)
                             .map(|t| t.ssrc)
                     })
                     .unwrap_or(nack.media_ssrc);
@@ -454,7 +729,6 @@ impl UdpTransport {
                 (nack.media_ssrc, lost_seqs.clone())
             };
 
-            // 해당 media_ssrc의 publisher 찾기 (zero-alloc DashMap iter)
             let publisher = room.find_by_track_ssrc(lookup_ssrc);
 
             let publisher = match publisher {
@@ -468,7 +742,6 @@ impl UdpTransport {
                 }
             };
 
-            // RTX SSRC 찾기
             let rtx_ssrc = publisher.get_tracks().iter()
                 .find(|t| t.ssrc == lookup_ssrc)
                 .and_then(|t| t.rtx_ssrc);
@@ -484,7 +757,6 @@ impl UdpTransport {
                 }
             };
 
-            // 캐시 조회 + RTX 조립 (원본 seq로 캐시 조회)
             let rtx_packets: Vec<(u16, u16, Vec<u8>)> = {
                 let cache = publisher.rtp_cache.lock().unwrap();
                 cache_seqs.iter().filter_map(|&lost_seq| {
@@ -500,7 +772,6 @@ impl UdpTransport {
             self.metrics.rtx_sent.fetch_add(rtx_packets.len() as u64, Ordering::Relaxed);
 
             if cache_miss > 0 {
-                // 진단 로그: miss된 seq와 캐시 슬롯 상태 확인 (처음 10건)
                 if self.metrics.rtx_cache_miss.load(Ordering::Relaxed) <= 10 {
                     let cache = publisher.rtp_cache.lock().unwrap();
                     let missed: Vec<String> = cache_seqs.iter()
@@ -522,7 +793,6 @@ impl UdpTransport {
                 }
             }
 
-            // Phase W-3: RTX도 egress 큐 경유
             for (_lost_seq, _rtx_seq, rtx_pkt) in rtx_packets {
                 if subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt)).is_err() {
                     self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
