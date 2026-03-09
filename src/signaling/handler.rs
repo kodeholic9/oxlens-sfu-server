@@ -555,8 +555,11 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
 
     let user_id = session.user_id.as_ref().unwrap();
 
-    // Floor: 발화자였으면 자동 release + rewriter 정리
+    // PLI burst cancel + Floor release + rewriter 정리
     if let Ok(room) = state.rooms.get(&req.room_id) {
+        if let Some(p) = room.get_participant(user_id) {
+            p.cancel_pli_burst();
+        }
         if room.mode == RoomMode::Ptt {
             if let Some(action) = room.floor.on_participant_leave(user_id) {
                 apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
@@ -695,10 +698,13 @@ async fn handle_floor_request(session: &Session, state: &AppState, packet: &Pack
                 };
                 if let (Some(ssrc), Some(pub_addr)) = (video_ssrc, participant.publish.get_address()) {
                     // 즉시 1회 + 500ms/1000ms 후 추가 2회 = 총 3회
+                    // 이전 PLI burst cancel
+                    participant.cancel_pli_burst();
+
                     let p = Arc::clone(&participant);
                     let socket = state.udp_socket.clone();
                     let speaker_id = speaker.to_string();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         // hard_unmute의 getUserMedia + replaceTrack 완료 시간 확보
                         // 0ms: soft_off 복귀용, 500ms/1500ms: hard_off 복귀용
                         let delays = [0u64, 500, 1500];
@@ -723,6 +729,9 @@ async fn handle_floor_request(session: &Session, state: &AppState, packet: &Pack
                             }
                         }
                     });
+
+                    // AbortHandle 저장
+                    *participant.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
                 }
             }
         }
@@ -861,6 +870,13 @@ fn apply_floor_action(
 
 async fn cleanup(session: &Session, state: &AppState) {
     if let (Some(room_id), Some(user_id)) = (&session.current_room, &session.user_id) {
+        // PLI burst cancel (진행 중인 PLI burst task가 있으면 중단)
+        if let Ok(room) = state.rooms.get(room_id) {
+            if let Some(p) = room.get_participant(user_id) {
+                p.cancel_pli_burst();
+            }
+        }
+
         // Floor: 발화자였으면 자동 release + rewriter 정리 (disconnect 시)
         if let Ok(room) = state.rooms.get(room_id) {
             if room.mode == RoomMode::Ptt {

@@ -92,9 +92,21 @@ impl UdpTransport {
                 self.handle_mbcp_from_publish(&parsed.mbcp_blocks, &sender, &room, is_detail).await;
             }
 
-            // Phase C-2a: SR relay — publisher의 SR을 모든 subscriber에게 전달
-            // (MBCP APP은 이미 위에서 처리했으므로 relay에서는 무시됨)
-            self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail);
+            // Phase C-2a: SR relay — MBCP APP 블록을 제외한 나머지만 릴레이
+            // MBCP는 이미 위에서 처리 + broadcast_mbcp_to_subscribers로 전달하므로,
+            // relay에서 중복 전달하면 안 됨
+            if parsed.mbcp_blocks.is_empty() {
+                // MBCP 없으면 기존처럼 통째로 (불필요한 재조립 회피)
+                self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail);
+            } else if !parsed.relay_blocks.is_empty() {
+                // MBCP 있으면 relay 대상 블록만 재조립해서 전달
+                let relay_slices: Vec<&[u8]> = parsed.relay_blocks.iter()
+                    .map(|b| &plaintext[b.offset..b.offset + b.length])
+                    .collect();
+                let stripped = assemble_compound(&relay_slices);
+                self.relay_publish_rtcp(&stripped, &sender, &room, is_detail);
+            }
+            // MBCP만 있고 relay 대상 없으면 릴레이 스킵
             return;
         }
 
@@ -475,7 +487,11 @@ impl UdpTransport {
         let p = Arc::clone(&participant);
         let socket = self.socket.clone();
         let speaker_id = speaker.to_string();
-        tokio::spawn(async move {
+
+        // 이전 PLI burst가 진행 중이면 cancel
+        participant.cancel_pli_burst();
+
+        let handle = tokio::spawn(async move {
             let delays = [0u64, 500, 1500];
             for (i, &delay_ms) in delays.iter().enumerate() {
                 if delay_ms > 0 {
@@ -498,6 +514,9 @@ impl UdpTransport {
                 }
             }
         });
+
+        // AbortHandle 저장 (참가자 퇴장 시 cancel 가능하도록)
+        *participant.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
     }
 
     // ========================================================================

@@ -350,7 +350,10 @@ async fn run_floor_timer(
                         warn!("[FLOOR] timer revoke: user={} cause={} room={}",
                             prev_speaker, cause, room.id);
 
-                        // rewriter 정리
+                        // PLI burst cancel + rewriter 정리
+                        if let Some(p) = room.get_participant(prev_speaker) {
+                            p.cancel_pli_burst();
+                        }
                         room.audio_rewriter.clear_speaker();
                         room.video_rewriter.clear_speaker();
 
@@ -415,6 +418,9 @@ async fn run_zombie_reaper(
         let reaped = rooms.reap_zombies(now, config::ZOMBIE_TIMEOUT_MS);
 
         for (room_id, zombie) in &reaped {
+            // PLI burst cancel (좀비가 발화자였을 수 있음)
+            zombie.cancel_pli_burst();
+
             warn!("zombie reaped: user={} room={} last_seen={}ms ago",
                 zombie.user_id, room_id,
                 now.saturating_sub(zombie.last_seen.load(std::sync::atomic::Ordering::Relaxed)));

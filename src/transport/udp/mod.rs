@@ -206,7 +206,7 @@ impl UdpTransport {
                 result = self.socket.recv_from(&mut buf) => {
                     let (len, remote) = match result {
                         Ok(r) => r,
-                        Err(e) => { error!("[W{}] UDP recv error: {e}", self.worker_id); continue; }
+                        Err(e) => { debug!("[W{}] UDP recv error: {e}", self.worker_id); continue; }
                     };
 
                     let data = Bytes::copy_from_slice(&buf[..len]);

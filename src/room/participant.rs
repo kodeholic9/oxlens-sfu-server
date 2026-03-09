@@ -241,6 +241,10 @@ pub struct Participant {
     pub egress_tx: mpsc::Sender<EgressPacket>,
     /// egress task spawn 시 .take()으로 꼼냄 (1회용)
     pub egress_rx: Mutex<Option<mpsc::Receiver<EgressPacket>>>,
+
+    // --- PLI burst cancel (Phase M-1) ---
+    /// 진행 중인 PLI burst task의 AbortHandle (참가자 퇴장 시 cancel)
+    pub pli_burst_handle: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Participant {
@@ -274,6 +278,7 @@ impl Participant {
             rtx_seq:    AtomicU16::new(0),
             egress_tx,
             egress_rx:  Mutex::new(Some(egress_rx)),
+            pli_burst_handle: Mutex::new(None),
         }
     }
 
@@ -350,5 +355,12 @@ impl Participant {
     /// subscribe PC가 미디어 준비 완료인지
     pub fn is_subscribe_ready(&self) -> bool {
         self.subscribe.is_media_ready()
+    }
+
+    /// 진행 중인 PLI burst task cancel
+    pub fn cancel_pli_burst(&self) {
+        if let Some(handle) = self.pli_burst_handle.lock().unwrap().take() {
+            handle.abort();
+        }
     }
 }
