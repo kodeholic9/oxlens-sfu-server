@@ -63,7 +63,11 @@
 ## Backlog
 
 - [ ] IDENTIFY token verification (JWT or shared secret)
-- [ ] 서버 SSRC별 수신 패킷 카운터 (정밀 구간 손실 분리)
+- [ ] 정밀 구간 손실 분리 (transit_loss 오진 방지)
+  - 서버가 per-subscriber per-publisher 릴레이 패킷 수를 카운팅하여 텔레메트리에 포함
+  - {pub_user, sub_user, kind, relayed_count} → 클라이언트 양쪽 getStats()와 교차 검증
+  - pub_sent - server_relayed = A→SFU 구간 유실 / server_relayed - sub_recv = SFU→B 구간 유실
+  - 현재 transit_loss는 두 브라우저의 누적값 타이밍 차이로 오차 발생 → 서버 기준 팩트로 대체 필요
 - [ ] VP8 키프레임 캐시 (서버, 화자 전환 시 즉시 주입)
 - [ ] PTT 오디오 지연 원인 분석 및 최적화
 - [ ] x86 서버 벤치마크 (50인+ 목표)

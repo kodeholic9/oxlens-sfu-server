@@ -88,9 +88,7 @@ impl AtomicTimingStat {
 
 pub(crate) struct GlobalMetrics {
     // ---- Timing accumulators (AtomicTimingStat) ----
-    pub(crate) relay:           AtomicTimingStat,
     pub(crate) decrypt:         AtomicTimingStat,
-    pub(crate) encrypt:         AtomicTimingStat,
     pub(crate) lock_wait:       AtomicTimingStat,
     pub(crate) egress_encrypt:  AtomicTimingStat,
 
@@ -161,9 +159,7 @@ pub(crate) struct GlobalMetrics {
 impl GlobalMetrics {
     pub(crate) fn new(worker_count: usize, bwe_mode: &crate::config::BweMode) -> Self {
         Self {
-            relay:           AtomicTimingStat::new(),
             decrypt:         AtomicTimingStat::new(),
-            encrypt:         AtomicTimingStat::new(),
             lock_wait:       AtomicTimingStat::new(),
             egress_encrypt:  AtomicTimingStat::new(),
             fan_out_sum:     AtomicU64::new(0),
@@ -235,9 +231,7 @@ impl GlobalMetrics {
     /// 3초마다 worker-0에서 호출 — 전체 메트릭 swap(0) → JSON
     pub(crate) fn flush(&self) -> serde_json::Value {
         // Timing stats
-        let relay_json     = self.relay.flush_to_json();
         let decrypt_json   = self.decrypt.flush_to_json();
-        let encrypt_json   = self.encrypt.flush_to_json();
         let lock_wait_json = self.lock_wait.flush_to_json();
         let egress_enc_json = self.egress_encrypt.flush_to_json();
 
@@ -335,9 +329,7 @@ impl GlobalMetrics {
         // 최종 조립: 필드 수를 ~15개로 제한하여 매크로 재귀 안전
         let mut root = serde_json::json!({
             "type": "server_metrics",
-            "relay":          relay_json,
             "decrypt":        decrypt_json,
-            "encrypt":        encrypt_json,
             "lock_wait":      lock_wait_json,
             "egress_encrypt": egress_enc_json,
             "fan_out": {
