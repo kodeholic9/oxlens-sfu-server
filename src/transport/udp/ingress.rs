@@ -723,6 +723,7 @@ impl UdpTransport {
 
         for nack in &nack_items {
             let lost_seqs = expand_nack(nack.pid, nack.blp);
+            self.metrics.nack_seqs_requested.fetch_add(lost_seqs.len() as u64, Ordering::Relaxed);
 
             if is_detail {
                 debug!("[DBG:NACK] user={} media_ssrc=0x{:08X} pid={} blp=0x{:04X} seqs={:?}",

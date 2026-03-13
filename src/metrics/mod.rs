@@ -102,6 +102,7 @@ pub(crate) struct GlobalMetrics {
     pub(crate) encrypt_fail:    AtomicU64,
     pub(crate) decrypt_fail:    AtomicU64,
     pub(crate) nack_received:   AtomicU64,
+    pub(crate) nack_seqs_requested: AtomicU64,
     pub(crate) rtx_sent:        AtomicU64,
     pub(crate) rtx_cache_miss:  AtomicU64,
     pub(crate) pli_sent:        AtomicU64,
@@ -169,6 +170,7 @@ impl GlobalMetrics {
             encrypt_fail:    AtomicU64::new(0),
             decrypt_fail:    AtomicU64::new(0),
             nack_received:   AtomicU64::new(0),
+            nack_seqs_requested: AtomicU64::new(0),
             rtx_sent:        AtomicU64::new(0),
             rtx_cache_miss:  AtomicU64::new(0),
             pli_sent:        AtomicU64::new(0),
@@ -246,6 +248,7 @@ impl GlobalMetrics {
         let encrypt_fail   = self.encrypt_fail.swap(0, Ordering::Relaxed);
         let decrypt_fail   = self.decrypt_fail.swap(0, Ordering::Relaxed);
         let nack_received  = self.nack_received.swap(0, Ordering::Relaxed);
+        let nack_seqs_requested = self.nack_seqs_requested.swap(0, Ordering::Relaxed);
         let rtx_sent       = self.rtx_sent.swap(0, Ordering::Relaxed);
         let rtx_cache_miss = self.rtx_cache_miss.swap(0, Ordering::Relaxed);
         let pli_sent       = self.pli_sent.swap(0, Ordering::Relaxed);
@@ -290,6 +293,7 @@ impl GlobalMetrics {
             "encrypt_fail":       encrypt_fail,
             "decrypt_fail":       decrypt_fail,
             "nack_received":      nack_received,
+            "nack_seqs_requested": nack_seqs_requested,
             "rtx_sent":           rtx_sent,
             "rtx_cache_miss":     rtx_cache_miss,
             "pli_sent":           pli_sent,

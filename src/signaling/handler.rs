@@ -318,7 +318,8 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
         user_id, req.room_id, pub_ice.ufrag, sub_ice.ufrag);
 
     // Collect existing participants' tracks for the new joiner (rtx_ssrc 포함)
-    let existing_tracks: Vec<serde_json::Value> = room.other_participants(&user_id)
+    let others = room.other_participants(&user_id);
+    let existing_tracks: Vec<serde_json::Value> = others
         .iter()
         .flat_map(|p| {
             p.get_tracks().into_iter().map(|t| {
@@ -335,6 +336,14 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
             })
         })
         .collect();
+
+    // P1: existing_tracks 상세 로그 — subscribe 누락 추적용
+    let per_user: Vec<String> = others
+        .iter()
+        .map(|p| format!("{}({})", p.user_id, p.get_tracks().len()))
+        .collect();
+    info!("ROOM_JOIN user={} room={} existing_tracks={} from=[{}]",
+        user_id, req.room_id, existing_tracks.len(), per_user.join(", "));
 
     // Notify existing participants
     let event = Packet::new(
