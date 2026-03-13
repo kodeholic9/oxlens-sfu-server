@@ -1144,6 +1144,7 @@ fn build_rooms_snapshot(state: &AppState) -> serde_json::Value {
                         .collect();
                     serde_json::json!({
                         "user_id": &p.user_id,
+                        "joined_at": p.joined_at,
                         "pub_ready": p.is_publish_ready(),
                         "sub_ready": p.is_subscribe_ready(),
                         "tracks": tracks,
@@ -1155,6 +1156,7 @@ fn build_rooms_snapshot(state: &AppState) -> serde_json::Value {
                 "name": &room.name,
                 "capacity": room.capacity,
                 "mode": room.mode.to_string(),
+                "created_at": room.created_at,
                 "participants": participants,
             });
             // PTT 모드일 때 분석용 상태 정보 추가
@@ -1171,6 +1173,7 @@ fn build_rooms_snapshot(state: &AppState) -> serde_json::Value {
 
     serde_json::json!({
         "type": "snapshot",
+        "ts": current_ts(),
         "rooms": rooms,
     })
 }

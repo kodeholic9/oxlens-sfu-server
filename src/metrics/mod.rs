@@ -327,8 +327,13 @@ impl GlobalMetrics {
         });
 
         // 최종 조립: 필드 수를 ~15개로 제한하여 매크로 재귀 안전
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let mut root = serde_json::json!({
             "type": "server_metrics",
+            "ts": ts,
             "decrypt":        decrypt_json,
             "lock_wait":      lock_wait_json,
             "egress_encrypt": egress_enc_json,
