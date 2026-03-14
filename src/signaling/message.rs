@@ -96,6 +96,12 @@ pub struct MessageRequest {
     pub content: String,
 }
 
+/// 카메라 웜업 완료 알림 (PLI 트리거 + VIDEO_RESUMED 브로드캐스트)
+#[derive(Debug, Deserialize)]
+pub struct CameraReadyRequest {
+    pub room_id: String,
+}
+
 // --- Floor Control (MCPTT/MBCP) ---
 
 #[derive(Debug, Deserialize)]

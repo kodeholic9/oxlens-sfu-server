@@ -186,6 +186,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::ROOM_LEAVE      => Some(handle_room_leave(session, state, &packet).await),
         opcode::PUBLISH_TRACKS  => Some(handle_publish_tracks(session, state, &packet).await),
         opcode::MUTE_UPDATE     => Some(handle_mute_update(session, state, &packet).await),
+        opcode::CAMERA_READY    => Some(handle_camera_ready(session, state, &packet).await),
         opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
         opcode::TELEMETRY      => { handle_telemetry(session, state, &packet); None }
         // Floor Control (MCPTT/MBCP)
@@ -524,6 +525,20 @@ async fn handle_mute_update(session: &Session, state: &AppState, packet: &Packet
     );
     broadcast_to_others(&room, user_id, &state_event);
 
+    // Video mute → VIDEO_SUSPENDED 브로드캐스트 (카메라 off → 상대방 UI avatar 전환)
+    if req.muted && kind == TrackKind::Video {
+        let suspended = Packet::new(
+            opcode::VIDEO_SUSPENDED,
+            0,
+            serde_json::json!({
+                "user_id": user_id,
+                "room_id": room_id,
+            }),
+        );
+        broadcast_to_others(&room, user_id, &suspended);
+        info!("[MUTE] VIDEO_SUSPENDED broadcast user={}", user_id);
+    }
+
     // Video unmute → PLI 전송 (키프레임 요청)
     if !req.muted && kind == TrackKind::Video {
         if participant.is_publish_ready() {
@@ -550,6 +565,101 @@ async fn handle_mute_update(session: &Session, state: &AppState, packet: &Packet
         "ssrc": req.ssrc,
         "muted": req.muted,
     }))
+}
+
+// ============================================================================
+// CAMERA_READY — 카메라 웜업 완료 → PLI 2발 + VIDEO_RESUMED 브로드캐스트
+// ============================================================================
+
+async fn handle_camera_ready(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: CameraReadyRequest = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::CAMERA_READY, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room_id = match &session.current_room {
+        Some(r) => r,
+        None => return Packet::err(opcode::CAMERA_READY, packet.pid, 2004, "not in room"),
+    };
+
+    let room = match state.rooms.get(room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::CAMERA_READY, packet.pid, 2001, "room not found"),
+    };
+
+    let participant = match room.get_participant(user_id) {
+        Some(p) => p,
+        None => return Packet::err(opcode::CAMERA_READY, packet.pid, 2004, "not in room"),
+    };
+
+    // 비디오 SSRC 찾기
+    let video_ssrc = {
+        let tracks = participant.tracks.lock().unwrap();
+        tracks.iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .map(|t| t.ssrc)
+    };
+
+    let ssrc = match video_ssrc {
+        Some(s) => s,
+        None => {
+            info!("[CAMERA_READY] user={} no video track", user_id);
+            return Packet::ok(opcode::CAMERA_READY, packet.pid, serde_json::json!({}));
+        }
+    };
+
+    // PLI 2발: 즉시 1회 + 150ms 후 보험 1회
+    if participant.is_publish_ready() {
+        if let Some(pub_addr) = participant.publish.get_address() {
+            // 이전 PLI burst cancel
+            participant.cancel_pli_burst();
+
+            let p = Arc::clone(&participant);
+            let socket = state.udp_socket.clone();
+            let uid = user_id.to_string();
+            let handle = tokio::spawn(async move {
+                let delays = [0u64, 150];
+                for (i, &delay_ms) in delays.iter().enumerate() {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let pli_plain = crate::transport::udp::build_pli(ssrc);
+                    let encrypted = {
+                        let mut ctx = p.publish.outbound_srtp.lock().unwrap();
+                        ctx.encrypt_rtcp(&pli_plain).ok()
+                    };
+                    if let Some(enc) = encrypted {
+                        if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                            warn!("[CAMERA_READY] PLI send FAILED user={} ssrc=0x{:08X} #{}: {e}",
+                                uid, ssrc, i);
+                            break;
+                        } else {
+                            info!("[CAMERA_READY] PLI sent user={} ssrc=0x{:08X} #{}",
+                                uid, ssrc, i);
+                        }
+                    }
+                }
+            });
+
+            *participant.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+        }
+    }
+
+    // VIDEO_RESUMED 브로드캐스트 (상대방 UI 복원)
+    let resumed = Packet::new(
+        opcode::VIDEO_RESUMED,
+        0,
+        serde_json::json!({
+            "user_id": user_id,
+            "room_id": room_id,
+        }),
+    );
+    broadcast_to_others(&room, user_id, &resumed);
+
+    info!("[CAMERA_READY] user={} ssrc=0x{:08X} → PLI 2발 + VIDEO_RESUMED", user_id, ssrc);
+
+    Packet::ok(opcode::CAMERA_READY, packet.pid, serde_json::json!({}))
 }
 
 // ============================================================================
