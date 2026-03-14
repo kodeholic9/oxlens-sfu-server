@@ -7,6 +7,24 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.5] - 2026-03-13
+
+### Added (Phase TV-2: 델타 기반 손실 분석 + 스냅샷 타임스탬프 + 세션 추적)
+
+#### handler.rs
+
+- `build_rooms_snapshot()`: participant에 `joined_at` (입장 시각 ms) 필드 추가
+- `build_rooms_snapshot()`: room에 `created_at` (방 생성 시각 ms) 필드 추가
+- snapshot 루트에 `"ts": current_ts()` 추가
+
+#### metrics/mod.rs
+
+- `flush()` 최종 JSON에 `"ts": SystemTime millis` 추가
+
+### Changed
+
+- (서버 코드 변경은 위 2개 파일만 — 나머지는 클라이언트/어드민 측 변경)
+
 ## [0.5.4] - 2026-03-11
 
 ### Added (Phase T-6: 진단 공백 해소 — 인코더 심층 진단 + 구간별 손실 + 이벤트 타임라인)
