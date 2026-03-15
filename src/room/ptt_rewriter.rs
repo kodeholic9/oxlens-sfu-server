@@ -68,6 +68,13 @@ pub const TS_GUARD_GAP_AUDIO: u32 = 960;
 /// Video용 ts 간격: VP8 90kHz, ~33ms (1프레임분) = 3000 ticks
 pub const TS_GUARD_GAP_VIDEO: u32 = 3000;
 
+/// Opus DTX silence frame: TOC=0xf8 (48kHz, 20ms, code0) + silence data
+const OPUS_SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
+/// Opus PT (서버 코덱 정책)
+const OPUS_PT: u8 = 111;
+/// clear_speaker 시 주입할 silence 프레임 수
+const SILENCE_FLUSH_COUNT: usize = 3;
+
 impl PttRewriter {
     /// Audio용 PttRewriter (키프레임 대기 없음)
     pub fn new_audio() -> Self {
@@ -114,12 +121,68 @@ impl PttRewriter {
         s.pending_keyframe = self.require_keyframe;
     }
 
-    /// 발화권 해제/회수 — Floor Release/Revoke 시점에 호출
-    pub fn clear_speaker(&self) {
+    /// 발화권 해제/회수 — Floor Release/Revoke 시점에 호출.
+    /// Audio rewriter는 silence flush 프레임을 반환하고, Video는 None.
+    pub fn clear_speaker(&self) -> Option<Vec<Vec<u8>>> {
         let mut s = self.state.lock().unwrap();
         s.speaker = None;
         s.awaiting_first_packet = false;
         s.pending_keyframe = false;
+
+        // Audio rewriter만 silence flush 생성 (Video는 해당 없음)
+        if self.require_keyframe {
+            // Video rewriter → silence 불필요
+            return None;
+        }
+
+        // last_virtual_seq/ts가 0이면 아직 한 번도 리라이팅 안 함 → skip
+        if s.last_virtual_seq == 0 && s.last_virtual_ts == 0 {
+            return None;
+        }
+
+        let mut frames = Vec::with_capacity(SILENCE_FLUSH_COUNT);
+        for i in 0..SILENCE_FLUSH_COUNT {
+            let seq = s.last_virtual_seq.wrapping_add(1 + i as u16);
+            let ts = s.last_virtual_ts.wrapping_add(TS_GUARD_GAP_AUDIO * (1 + i as u32));
+
+            // RTP 헤더 (12바이트) + Opus silence payload (3바이트)
+            let mut pkt = vec![0u8; 12 + OPUS_SILENCE.len()];
+            // V=2, P=0, X=0, CC=0
+            pkt[0] = 0x80;
+            // PT = OPUS_PT, Marker=0
+            pkt[1] = OPUS_PT;
+            // Sequence Number
+            let seq_bytes = seq.to_be_bytes();
+            pkt[2] = seq_bytes[0];
+            pkt[3] = seq_bytes[1];
+            // Timestamp
+            let ts_bytes = ts.to_be_bytes();
+            pkt[4] = ts_bytes[0];
+            pkt[5] = ts_bytes[1];
+            pkt[6] = ts_bytes[2];
+            pkt[7] = ts_bytes[3];
+            // SSRC = virtual_ssrc
+            let ssrc_bytes = self.virtual_ssrc.to_be_bytes();
+            pkt[8]  = ssrc_bytes[0];
+            pkt[9]  = ssrc_bytes[1];
+            pkt[10] = ssrc_bytes[2];
+            pkt[11] = ssrc_bytes[3];
+            // Opus silence payload
+            pkt[12..].copy_from_slice(&OPUS_SILENCE);
+
+            frames.push(pkt);
+        }
+
+        // last_virtual 갱신 (다음 화자가 이어받을 때 연속성 유지)
+        s.last_virtual_seq = s.last_virtual_seq.wrapping_add(SILENCE_FLUSH_COUNT as u16);
+        s.last_virtual_ts = s.last_virtual_ts.wrapping_add(
+            TS_GUARD_GAP_AUDIO * SILENCE_FLUSH_COUNT as u32
+        );
+
+        info!("[PTT:REWRITE] silence flush {} frames, last_seq={} last_ts={}",
+            SILENCE_FLUSH_COUNT, s.last_virtual_seq, s.last_virtual_ts);
+
+        Some(frames)
     }
 
     /// RTP plaintext를 in-place 리라이팅.

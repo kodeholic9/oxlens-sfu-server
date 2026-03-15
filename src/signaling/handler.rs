@@ -25,7 +25,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config;
 use crate::config::RoomMode;
-use crate::room::participant::{Participant, TrackKind};
+use crate::room::participant::{EgressPacket, Participant, TrackKind};
 use crate::room::floor::FloorAction;
 use crate::signaling::message::*;
 use crate::signaling::opcode;
@@ -682,8 +682,20 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
         if room.mode == RoomMode::Ptt {
             if let Some(action) = room.floor.on_participant_leave(user_id) {
                 apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
-                room.audio_rewriter.clear_speaker();
+                let silence = room.audio_rewriter.clear_speaker();
                 room.video_rewriter.clear_speaker();
+                // Silence flush → 모든 subscriber egress로 fan-out
+                if let Some(frames) = silence {
+                    for entry in room.participants.iter() {
+                        if entry.value().is_subscribe_ready() {
+                            for frame in &frames {
+                                let _ = entry.value().egress_tx.try_send(
+                                    EgressPacket::Rtp(frame.clone())
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -880,8 +892,20 @@ async fn handle_floor_release(session: &Session, state: &AppState, packet: &Pack
     // Release/Released 시 rewriter 정리
     if matches!(&action, FloorAction::Released { .. }) {
         state.metrics.ptt_floor_released.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        room.audio_rewriter.clear_speaker();
+        let silence = room.audio_rewriter.clear_speaker();
         room.video_rewriter.clear_speaker();
+        // Silence flush → 모든 subscriber egress로 fan-out
+        if let Some(frames) = silence {
+            for entry in room.participants.iter() {
+                if entry.value().is_subscribe_ready() {
+                    for frame in &frames {
+                        let _ = entry.value().egress_tx.try_send(
+                            EgressPacket::Rtp(frame.clone())
+                        );
+                    }
+                }
+            }
+        }
     }
 
     apply_floor_action(opcode::FLOOR_RELEASE, packet.pid, &action, &room, user_id)
@@ -1001,8 +1025,20 @@ async fn cleanup(session: &Session, state: &AppState) {
             if room.mode == RoomMode::Ptt {
                 if let Some(action) = room.floor.on_participant_leave(user_id) {
                     apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
-                    room.audio_rewriter.clear_speaker();
+                    let silence = room.audio_rewriter.clear_speaker();
                     room.video_rewriter.clear_speaker();
+                    // Silence flush → 모든 subscriber egress로 fan-out
+                    if let Some(frames) = silence {
+                        for entry in room.participants.iter() {
+                            if entry.value().is_subscribe_ready() {
+                                for frame in &frames {
+                                    let _ = entry.value().egress_tx.try_send(
+                                        EgressPacket::Rtp(frame.clone())
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
