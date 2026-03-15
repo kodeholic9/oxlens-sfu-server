@@ -576,7 +576,7 @@ async fn handle_mute_update(session: &Session, state: &AppState, packet: &Packet
 // ============================================================================
 
 async fn handle_camera_ready(session: &Session, state: &AppState, packet: &Packet) -> Packet {
-    let req: CameraReadyRequest = match serde_json::from_value(packet.d.clone()) {
+    let _req: CameraReadyRequest = match serde_json::from_value(packet.d.clone()) {
         Ok(r) => r,
         Err(_) => return Packet::err(opcode::CAMERA_READY, packet.pid, 3002, "invalid payload"),
     };

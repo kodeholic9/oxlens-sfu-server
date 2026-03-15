@@ -132,6 +132,9 @@ impl UdpTransport {
             }
         };
 
+        // Relay counter: publisher → 서버 RTP 수신 성공
+        self.metrics.ingress_rtp_received.fetch_add(1, Ordering::Relaxed);
+
         // [DBG:RTP] Parse RTP header for logging
         let rtp_hdr = parse_rtp_header(&plaintext);
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
@@ -249,6 +252,8 @@ impl UdpTransport {
             if !target.is_subscribe_ready() { continue; }
             if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -855,6 +860,8 @@ impl UdpTransport {
             if !target.is_subscribe_ready() { continue; }
             if target.egress_tx.try_send(EgressPacket::Rtcp(plaintext_owned.clone())).is_err() {
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.egress_rtcp_relayed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

@@ -119,6 +119,14 @@ pub(crate) struct GlobalMetrics {
     pub(crate) nack_no_rtx_ssrc:    AtomicU64,
     pub(crate) rtp_cache_lock_fail: AtomicU64,
     pub(crate) egress_drop:         AtomicU64,
+    // ---- Relay counters (네트워크 vs gate 분리용) ----
+    /// publisher → 서버 RTP 수신 성공 (decrypt 성공 기준)
+    pub(crate) ingress_rtp_received:  AtomicU64,
+    /// 서버 → subscriber RTP relay 성공 (egress 큐 전달 성공)
+    pub(crate) egress_rtp_relayed:    AtomicU64,
+    /// 서버 → subscriber RTCP relay 성공 (SR relay)
+    pub(crate) egress_rtcp_relayed:   AtomicU64,
+
     // spawn fan-out (W-1 레거시, 현재 미사용이나 JSON 호환 유지)
     pub(crate) spawn_rtp_relayed:   AtomicU64,
     pub(crate) spawn_sr_relayed:    AtomicU64,
@@ -187,6 +195,9 @@ impl GlobalMetrics {
             nack_no_rtx_ssrc:    AtomicU64::new(0),
             rtp_cache_lock_fail: AtomicU64::new(0),
             egress_drop:         AtomicU64::new(0),
+            ingress_rtp_received:  AtomicU64::new(0),
+            egress_rtp_relayed:    AtomicU64::new(0),
+            egress_rtcp_relayed:   AtomicU64::new(0),
             spawn_rtp_relayed:   AtomicU64::new(0),
             spawn_sr_relayed:    AtomicU64::new(0),
             spawn_encrypt_fail:  AtomicU64::new(0),
@@ -265,6 +276,9 @@ impl GlobalMetrics {
         let nack_no_rtx        = self.nack_no_rtx_ssrc.swap(0, Ordering::Relaxed);
         let cache_lock_fail    = self.rtp_cache_lock_fail.swap(0, Ordering::Relaxed);
         let egress_drop        = self.egress_drop.swap(0, Ordering::Relaxed);
+        let ingress_rtp_received = self.ingress_rtp_received.swap(0, Ordering::Relaxed);
+        let egress_rtp_relayed   = self.egress_rtp_relayed.swap(0, Ordering::Relaxed);
+        let egress_rtcp_relayed  = self.egress_rtcp_relayed.swap(0, Ordering::Relaxed);
         let spawn_rtp_relayed  = self.spawn_rtp_relayed.swap(0, Ordering::Relaxed);
         let spawn_sr_relayed   = self.spawn_sr_relayed.swap(0, Ordering::Relaxed);
         let spawn_encrypt_fail = self.spawn_encrypt_fail.swap(0, Ordering::Relaxed);
@@ -310,6 +324,9 @@ impl GlobalMetrics {
             "nack_no_rtx":        nack_no_rtx,
             "cache_lock_fail":    cache_lock_fail,
             "egress_drop":        egress_drop,
+            "ingress_rtp_received": ingress_rtp_received,
+            "egress_rtp_relayed":   egress_rtp_relayed,
+            "egress_rtcp_relayed":  egress_rtcp_relayed,
             "spawn_rtp_relayed":  spawn_rtp_relayed,
             "spawn_sr_relayed":   spawn_sr_relayed,
             "spawn_encrypt_fail": spawn_encrypt_fail,
