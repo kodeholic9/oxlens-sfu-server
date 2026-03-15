@@ -794,7 +794,6 @@ impl UdpTransport {
 
             let cache_miss = cache_seqs.len() - rtx_packets.len();
             self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
-            self.metrics.rtx_sent.fetch_add(rtx_packets.len() as u64, Ordering::Relaxed);
 
             if cache_miss > 0 {
                 if self.metrics.rtx_cache_miss.load(Ordering::Relaxed) <= 10 {
@@ -825,6 +824,7 @@ impl UdpTransport {
                     self.metrics.rtx_budget_exceeded.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                self.metrics.rtx_sent.fetch_add(1, Ordering::Relaxed);
                 if subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt)).is_err() {
                     self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
                 }
