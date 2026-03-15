@@ -389,13 +389,17 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
         "tracks": existing_tracks,
     });
 
-    // Phase E-5: PTT 모드 — 가상 SSRC 정보 추가
-    // subscribe SDP에 원본 SSRC 대신 가상 SSRC를 선언해야 Chrome이 올바르게 demux
+    // Phase E-5: PTT 모드 — 가상 SSRC + 현재 floor 상태
     if room.mode == RoomMode::Ptt {
         response["ptt_virtual_ssrc"] = serde_json::json!({
             "audio": room.audio_rewriter.virtual_ssrc(),
             "video": room.video_rewriter.virtual_ssrc(),
         });
+        // 중도 참여자용: 현재 발화자 정보 (없으면 null)
+        response["floor_speaker"] = match room.floor.current_speaker() {
+            Some(s) => serde_json::json!(s),
+            None => serde_json::json!(null),
+        };
     }
 
     Packet::ok(opcode::ROOM_JOIN, packet.pid, response)
