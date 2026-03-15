@@ -185,6 +185,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::ROOM_JOIN       => Some(handle_room_join(session, state, &packet).await),
         opcode::ROOM_LEAVE      => Some(handle_room_leave(session, state, &packet).await),
         opcode::PUBLISH_TRACKS  => Some(handle_publish_tracks(session, state, &packet).await),
+        opcode::TRACKS_ACK      => Some(handle_tracks_ack(session, state, &packet).await),
         opcode::MUTE_UPDATE     => Some(handle_mute_update(session, state, &packet).await),
         opcode::CAMERA_READY    => Some(handle_camera_ready(session, state, &packet).await),
         opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
@@ -478,6 +479,116 @@ async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Pac
 
     Packet::ok(opcode::PUBLISH_TRACKS, packet.pid, serde_json::json!({
         "registered": new_tracks.len(),
+    }))
+}
+
+// ============================================================================
+// TRACKS_ACK — 클라이언트 subscribe SSRC 확인 → 불일치 시 TRACKS_RESYNC
+// ============================================================================
+
+async fn handle_tracks_ack(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: TracksAckRequest = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::TRACKS_ACK, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room_id = match &session.current_room {
+        Some(r) => r,
+        None => return Packet::err(opcode::TRACKS_ACK, packet.pid, 2004, "not in room"),
+    };
+
+    let room = match state.rooms.get(room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::TRACKS_ACK, packet.pid, 2001, "room not found"),
+    };
+
+    // Build expected SSRC set based on room mode
+    let expected: std::collections::HashSet<u32> = if room.mode == RoomMode::Ptt {
+        // PTT: 가상 SSRC 2개 (audio + video)
+        let mut set = std::collections::HashSet::new();
+        set.insert(room.audio_rewriter.virtual_ssrc());
+        set.insert(room.video_rewriter.virtual_ssrc());
+        set
+    } else {
+        // Conference: 다른 참가자들의 primary SSRC (RTX 제외)
+        room.other_participants(user_id)
+            .iter()
+            .flat_map(|p| p.get_tracks().into_iter().map(|t| t.ssrc))
+            .collect()
+    };
+
+    let client_set: std::collections::HashSet<u32> = req.ssrcs.into_iter().collect();
+
+    if client_set == expected {
+        debug!("TRACKS_ACK ok user={} ssrcs={}", user_id, client_set.len());
+        return Packet::ok(opcode::TRACKS_ACK, packet.pid, serde_json::json!({
+            "synced": true,
+        }));
+    }
+
+    // Mismatch → TRACKS_RESYNC 전송
+    state.metrics.tracks_ack_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let missing: Vec<u32> = expected.difference(&client_set).copied().collect();
+    let extra: Vec<u32> = client_set.difference(&expected).copied().collect();
+    warn!("TRACKS_ACK mismatch user={} expected={} client={} missing={:?} extra={:?}",
+        user_id, expected.len(), client_set.len(), missing, extra);
+
+    // Build full track list for resync
+    let resync_tracks: Vec<serde_json::Value> = if room.mode == RoomMode::Ptt {
+        // PTT: 가상 SSRC로 트랙 목록 생성
+        vec![
+            serde_json::json!({
+                "user_id": "__virtual__",
+                "kind": "audio",
+                "ssrc": room.audio_rewriter.virtual_ssrc(),
+                "track_id": "virtual_audio",
+            }),
+            serde_json::json!({
+                "user_id": "__virtual__",
+                "kind": "video",
+                "ssrc": room.video_rewriter.virtual_ssrc(),
+                "track_id": "virtual_video",
+            }),
+        ]
+    } else {
+        // Conference: 다른 참가자들의 전체 트랙 목록
+        room.other_participants(user_id)
+            .iter()
+            .flat_map(|p| {
+                p.get_tracks().into_iter().map(|t| {
+                    let mut j = serde_json::json!({
+                        "user_id": p.user_id,
+                        "kind": t.kind.to_string(),
+                        "ssrc": t.ssrc,
+                        "track_id": t.track_id,
+                    });
+                    if let Some(rs) = t.rtx_ssrc {
+                        j["rtx_ssrc"] = serde_json::json!(rs);
+                    }
+                    j
+                })
+            })
+            .collect()
+    };
+
+    // Send TRACKS_RESYNC to this client
+    let resync = Packet::new(
+        opcode::TRACKS_RESYNC,
+        0,
+        serde_json::json!({
+            "tracks": resync_tracks,
+        }),
+    );
+    let json = serde_json::to_string(&resync).unwrap_or_default();
+    let _ = session.ws_tx.send(json);
+
+    state.metrics.tracks_resync_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    info!("TRACKS_RESYNC sent user={} tracks={}", user_id, resync_tracks.len());
+
+    Packet::ok(opcode::TRACKS_ACK, packet.pid, serde_json::json!({
+        "synced": false,
+        "resync_sent": true,
     }))
 }
 

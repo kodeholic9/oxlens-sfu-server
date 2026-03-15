@@ -102,6 +102,13 @@ pub struct CameraReadyRequest {
     pub room_id: String,
 }
 
+/// 클라이언트가 인식한 subscribe SSRC 목록 (TRACKS_ACK)
+#[derive(Debug, Deserialize)]
+pub struct TracksAckRequest {
+    /// 클라이언트가 현재 인식하고 있는 active primary SSRC 목록 (RTX 제외)
+    pub ssrcs: Vec<u32>,
+}
+
 // --- Floor Control (MCPTT/MBCP) ---
 
 #[derive(Debug, Deserialize)]

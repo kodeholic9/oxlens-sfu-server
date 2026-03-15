@@ -129,6 +129,12 @@ pub(crate) struct GlobalMetrics {
     /// RTX budget 초과로 드롭된 RTX 수 (subscriber 보호)
     pub(crate) rtx_budget_exceeded:   AtomicU64,
 
+    // ---- Track sync counters ----
+    /// TRACKS_ACK 불일치 횟수 (client SSRC set ≠ expected)
+    pub(crate) tracks_ack_mismatch:   AtomicU64,
+    /// TRACKS_RESYNC 전송 횟수
+    pub(crate) tracks_resync_sent:    AtomicU64,
+
     // spawn fan-out (W-1 레거시, 현재 미사용이나 JSON 호환 유지)
     pub(crate) spawn_rtp_relayed:   AtomicU64,
     pub(crate) spawn_sr_relayed:    AtomicU64,
@@ -201,6 +207,8 @@ impl GlobalMetrics {
             egress_rtp_relayed:    AtomicU64::new(0),
             egress_rtcp_relayed:   AtomicU64::new(0),
             rtx_budget_exceeded:   AtomicU64::new(0),
+            tracks_ack_mismatch:   AtomicU64::new(0),
+            tracks_resync_sent:    AtomicU64::new(0),
             spawn_rtp_relayed:   AtomicU64::new(0),
             spawn_sr_relayed:    AtomicU64::new(0),
             spawn_encrypt_fail:  AtomicU64::new(0),
@@ -283,6 +291,8 @@ impl GlobalMetrics {
         let egress_rtp_relayed   = self.egress_rtp_relayed.swap(0, Ordering::Relaxed);
         let egress_rtcp_relayed  = self.egress_rtcp_relayed.swap(0, Ordering::Relaxed);
         let rtx_budget_exceeded  = self.rtx_budget_exceeded.swap(0, Ordering::Relaxed);
+        let tracks_ack_mismatch  = self.tracks_ack_mismatch.swap(0, Ordering::Relaxed);
+        let tracks_resync_sent   = self.tracks_resync_sent.swap(0, Ordering::Relaxed);
         let spawn_rtp_relayed  = self.spawn_rtp_relayed.swap(0, Ordering::Relaxed);
         let spawn_sr_relayed   = self.spawn_sr_relayed.swap(0, Ordering::Relaxed);
         let spawn_encrypt_fail = self.spawn_encrypt_fail.swap(0, Ordering::Relaxed);
@@ -332,6 +342,8 @@ impl GlobalMetrics {
             "egress_rtp_relayed":   egress_rtp_relayed,
             "egress_rtcp_relayed":  egress_rtcp_relayed,
             "rtx_budget_exceeded":  rtx_budget_exceeded,
+            "tracks_ack_mismatch": tracks_ack_mismatch,
+            "tracks_resync_sent":  tracks_resync_sent,
             "spawn_rtp_relayed":  spawn_rtp_relayed,
             "spawn_sr_relayed":   spawn_sr_relayed,
             "spawn_encrypt_fail": spawn_encrypt_fail,

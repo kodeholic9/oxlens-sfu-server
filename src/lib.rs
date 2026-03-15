@@ -1,4 +1,5 @@
 // author: kodeholic (powered by Claude)
+#![recursion_limit = "256"]
 //! oxlens-sfu-server: High-performance SFU server with Bundle + ICE-Lite
 
 pub mod config;
