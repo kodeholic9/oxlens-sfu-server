@@ -242,6 +242,10 @@ pub struct Participant {
     /// egress task spawn 시 .take()으로 꼼냄 (1회용)
     pub egress_rx: Mutex<Option<mpsc::Receiver<EgressPacket>>>,
 
+    // --- RTX budget (per-subscriber, 3s window) ---
+    /// 이 subscriber에게 보낸 RTX 패킷 수 (현재 3s 윈도우). flush_metrics에서 3초마다 reset.
+    pub rtx_budget_used: AtomicU64,
+
     // --- PLI burst cancel (Phase M-1) ---
     /// 진행 중인 PLI burst task의 AbortHandle (참가자 퇴장 시 cancel)
     pub pli_burst_handle: Mutex<Option<tokio::task::AbortHandle>>,
@@ -278,6 +282,7 @@ impl Participant {
             rtx_seq:    AtomicU16::new(0),
             egress_tx,
             egress_rx:  Mutex::new(Some(egress_rx)),
+            rtx_budget_used: AtomicU64::new(0),
             pli_burst_handle: Mutex::new(None),
         }
     }

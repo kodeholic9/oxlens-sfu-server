@@ -173,6 +173,11 @@ pub const FLOOR_PING_INTERVAL_MS: u64 = 2_000;
 /// T_FLOOR_TIMEOUT: Floor PING 미수신 시 revoke (ms)
 pub const FLOOR_PING_TIMEOUT_MS: u64 = 5_000;
 
+// --- RTX budget (per-subscriber, 3s window) ---
+/// subscriber별 3초당 최대 RTX 전송 수. 초과 시 RTX를 버려서 다른 참가자 보호.
+/// 정상 세션: ~10-30 RTX/3s, LTE lossy: 수백~수천. 200이면 정상은 통과, 폭풍은 차단.
+pub const RTX_BUDGET_PER_3S: u64 = 200;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;

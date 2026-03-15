@@ -240,6 +240,13 @@ impl UdpTransport {
 
     /// 3초마다 metrics 집계 → admin_tx로 push (GlobalMetrics가 swap+reset 통합 처리)
     fn flush_metrics(&self) {
+        // Per-subscriber RTX budget 리셋 (3s window)
+        for room_entry in self.room_hub.rooms.iter() {
+            for entry in room_entry.value().participants.iter() {
+                entry.value().rtx_budget_used.swap(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         let json = self.metrics.flush();
         let _ = self.admin_tx.send(json.to_string());
     }

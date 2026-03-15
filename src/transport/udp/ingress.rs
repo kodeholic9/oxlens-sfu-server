@@ -819,6 +819,12 @@ impl UdpTransport {
             }
 
             for (_lost_seq, _rtx_seq, rtx_pkt) in rtx_packets {
+                // RTX budget: subscriber별 3초당 상한 초과 시 드롭 (다른 참가자 egress 큐 보호)
+                let used = subscriber.rtx_budget_used.fetch_add(1, Ordering::Relaxed);
+                if used >= config::RTX_BUDGET_PER_3S {
+                    self.metrics.rtx_budget_exceeded.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 if subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt)).is_err() {
                     self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
                 }
