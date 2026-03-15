@@ -15,6 +15,7 @@
 //! Video: ts_guard_gap=3000 (VP8 90kHz, ~33ms), 키프레임 대기 있음
 
 use std::sync::Mutex;
+use std::time::Instant;
 use tracing::{debug, info};
 
 /// rewrite() 결과
@@ -61,6 +62,9 @@ struct RewriteState {
 
     /// 비디오 전용: 키프레임 도착 대기 중 (true = P-frame 드롭)
     pending_keyframe: bool,
+
+    /// clear_speaker 시점 기록 (idle 경과 시간 → ts_guard_gap 동적 계산)
+    cleared_at: Option<Instant>,
 }
 
 /// Audio용 ts 간격: Opus 48kHz, 20ms ptime = 960 samples
@@ -102,6 +106,7 @@ impl PttRewriter {
                 last_virtual_ts: 0,
                 awaiting_first_packet: false,
                 pending_keyframe: false,
+                cleared_at: None,
             }),
         }
     }
@@ -114,8 +119,35 @@ impl PttRewriter {
     /// 화자 전환 — Floor Granted 시점에 handler에서 호출
     pub fn switch_speaker(&self, user_id: &str) {
         let mut s = self.state.lock().unwrap();
-        info!("[PTT:REWRITE] switch_speaker={} virtual_ssrc=0x{:08X} keyframe_wait={}",
-            user_id, self.virtual_ssrc, self.require_keyframe);
+
+        // Audio: idle 경과 시간 → ts_guard_gap 동적 계산
+        // NetEQ가 arrival_time gap과 ts gap의 불일치를 jitter로 해석하지 않도록
+        // 실제 경과 시간을 ts에 반영. Video는 키프레임 게이팅이 대신 처리.
+        if !self.require_keyframe {
+            // Audio rewriter
+            let dynamic_ts_gap = if let Some(cleared) = s.cleared_at {
+                let elapsed_ms = cleared.elapsed().as_millis() as u32;
+                let gap = elapsed_ms.saturating_mul(48); // 48kHz: 48 samples/ms
+                let gap = gap.max(self.ts_guard_gap);     // 최소 960 (20ms)
+                info!("[PTT:REWRITE] dynamic ts_gap: idle={}ms → ts_gap={} (vs fixed={})",
+                    elapsed_ms, gap, self.ts_guard_gap);
+                gap
+            } else {
+                self.ts_guard_gap
+            };
+
+            // silence flush가 last_virtual_ts를 이미 +2880 올려놓았으므로
+            // (dynamic_gap - silence분)을 추가
+            let silence_ts = TS_GUARD_GAP_AUDIO * SILENCE_FLUSH_COUNT as u32;
+            let extra_gap = dynamic_ts_gap.saturating_sub(silence_ts);
+            s.virtual_base_ts = s.last_virtual_ts.wrapping_add(extra_gap);
+            // seq는 silence flush가 이미 +3 했으므로 +1만
+            s.virtual_base_seq = s.last_virtual_seq.wrapping_add(1);
+        }
+        s.cleared_at = None;
+
+        info!("[PTT:REWRITE] switch_speaker={} virtual_ssrc=0x{:08X} keyframe_wait={} v_base_seq={} v_base_ts={}",
+            user_id, self.virtual_ssrc, self.require_keyframe, s.virtual_base_seq, s.virtual_base_ts);
         s.speaker = Some(user_id.to_string());
         s.awaiting_first_packet = true;
         s.pending_keyframe = self.require_keyframe;
@@ -128,6 +160,7 @@ impl PttRewriter {
         s.speaker = None;
         s.awaiting_first_packet = false;
         s.pending_keyframe = false;
+        s.cleared_at = Some(Instant::now());
 
         // Audio rewriter만 silence flush 생성 (Video는 해당 없음)
         if self.require_keyframe {
@@ -220,20 +253,23 @@ impl PttRewriter {
         let orig_seq = u16::from_be_bytes([plaintext[2], plaintext[3]]);
         let orig_ts  = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
 
-        // 화자 전환 후 첫 패킷: 오프셋 기준값 설정
+        // 화자 전환 후 첫 패킷: origin base 설정
         let is_first = s.awaiting_first_packet;
         if is_first {
             s.origin_base_seq = orig_seq;
             s.origin_base_ts = orig_ts;
 
-            // 이전 화자의 마지막 가상 seq/ts에서 연속
-            s.virtual_base_seq = s.last_virtual_seq.wrapping_add(1);
-            s.virtual_base_ts = s.last_virtual_ts.wrapping_add(self.ts_guard_gap);
+            // Video: switch_speaker에서 base를 안 잡았으므로 여기서 기존 방식으로 계산
+            // Audio: switch_speaker에서 동적 ts_gap으로 이미 계산 완료
+            if self.require_keyframe {
+                s.virtual_base_seq = s.last_virtual_seq.wrapping_add(1);
+                s.virtual_base_ts = s.last_virtual_ts.wrapping_add(self.ts_guard_gap);
+            }
 
             s.awaiting_first_packet = false;
 
-            debug!("[PTT:REWRITE] first_pkt user={} orig_seq={} orig_ts={} → v_base_seq={} v_base_ts={} gap={}",
-                sender_user_id, orig_seq, orig_ts, s.virtual_base_seq, s.virtual_base_ts, self.ts_guard_gap);
+            debug!("[PTT:REWRITE] first_pkt user={} orig_seq={} orig_ts={} → v_base_seq={} v_base_ts={}",
+                sender_user_id, orig_seq, orig_ts, s.virtual_base_seq, s.virtual_base_ts);
         }
 
         // 오프셋 기반 상대 연산
