@@ -24,6 +24,7 @@ use super::rtcp::{
     parse_rtp_header, current_ts, split_compound_rtcp, parse_rtcp_nack,
     expand_nack, build_rtx_packet, assemble_compound, build_mbcp_app, MbcpMessage,
 };
+use super::rtcp_terminator::{self, RecvStats};
 use super::twcc;
 
 impl UdpTransport {
@@ -92,21 +93,35 @@ impl UdpTransport {
                 self.handle_mbcp_from_publish(&parsed.mbcp_blocks, &sender, &room, is_detail).await;
             }
 
-            // Phase C-2a: SR relay — MBCP APP 블록을 제외한 나머지만 릴레이
-            // MBCP는 이미 위에서 처리 + broadcast_mbcp_to_subscribers로 전달하므로,
-            // relay에서 중복 전달하면 안 됨
-            if parsed.mbcp_blocks.is_empty() {
-                // MBCP 없으면 기존처럼 통째로 (불필요한 재조립 회피)
-                self.relay_publish_rtcp(&plaintext, &sender, &room, is_detail);
-            } else if !parsed.relay_blocks.is_empty() {
-                // MBCP 있으면 relay 대상 블록만 재조립해서 전달
-                let relay_slices: Vec<&[u8]> = parsed.relay_blocks.iter()
-                    .map(|b| &plaintext[b.offset..b.offset + b.length])
-                    .collect();
-                let stripped = assemble_compound(&relay_slices);
-                self.relay_publish_rtcp(&stripped, &sender, &room, is_detail);
+            // RTCP Terminator: Publisher SR 소비 (RecvStats LSR/DLSR 갱신)
+            for sr_ref in &parsed.sr_blocks {
+                let sr_data = &plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length];
+                if let Some((ssrc, ntp_hi, ntp_lo)) = rtcp_terminator::parse_sr_ntp(sr_data) {
+                    let mut stats_map = sender.recv_stats.lock().unwrap();
+                    if let Some(stats) = stats_map.get_mut(&ssrc) {
+                        stats.on_sr_received(ntp_hi, ntp_lo);
+                    }
+                    if is_detail {
+                        debug!("[RTCP:TERM] consumed SR from user={} ssrc=0x{:08X}",
+                            sender.user_id, ssrc);
+                    }
+                }
             }
-            // MBCP만 있고 relay 대상 없으면 릴레이 스킵
+
+            // SR + PLI/REMB 릴레이 (SR은 subscriber에게 릴레이 복원 — 서버 자체 SR 생성은 비활성)
+            // RR만 제외 (서버가 자체 생성)
+            let mut relay_slices: Vec<&[u8]> = Vec::new();
+            for sr_ref in &parsed.sr_blocks {
+                relay_slices.push(&plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length]);
+            }
+            for blk in &parsed.relay_blocks {
+                relay_slices.push(&plaintext[blk.offset..blk.offset + blk.length]);
+            }
+            if !relay_slices.is_empty() {
+                let compound = assemble_compound(&relay_slices);
+                self.relay_publish_rtcp(&compound, &sender, &room, is_detail);
+            }
+            // MBCP만 있고 SR/PLI 없으면 릴레이 스킵
             return;
         }
 
@@ -139,6 +154,24 @@ impl UdpTransport {
         let rtp_hdr = parse_rtp_header(&plaintext);
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
         let is_summary = seq_num > 0 && seq_num % config::DBG_SUMMARY_INTERVAL == 0;
+
+        // RTCP Terminator: 수신 통계 갱신 (서버가 peer로서 RR 생성용)
+        // RTX(PT=97)는 재전송 패킷이므로 수신 통계에서 제외 — jitter 폭등 방지
+        if rtp_hdr.pt != config::RTX_PAYLOAD_TYPE {
+            let arrival_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let clock_rate = if rtp_hdr.pt == 111 {
+                config::CLOCK_RATE_AUDIO
+            } else {
+                config::CLOCK_RATE_VIDEO
+            };
+            let mut stats_map = sender.recv_stats.lock().unwrap();
+            let stats = stats_map.entry(rtp_hdr.ssrc)
+                .or_insert_with(|| RecvStats::new(rtp_hdr.ssrc, clock_rate));
+            stats.update(rtp_hdr.seq, rtp_hdr.timestamp, arrival_ms);
+        }
 
         // 비디오 RTP 캐시 (NACK → RTX 재전송용, audio는 skip)
         // PT 96 = VP8 (server_codec_policy)
@@ -592,12 +625,21 @@ impl UdpTransport {
             self.handle_nack_block(nack_block, subscriber, room, is_detail);
         }
 
-        // (2) 릴레이 대상 RTCP (RR, PLI, REMB) → publisher별로 모아서 전송
+        // (2) RR 소비 (서버가 종단 — publisher에게 릴레이하지 않음)
+        if !parsed.rr_blocks.is_empty() {
+            self.metrics.rr_consumed.fetch_add(parsed.rr_blocks.len() as u64, Ordering::Relaxed);
+            if is_detail {
+                debug!("[RTCP:TERM] consumed {} RR block(s) from subscriber user={}",
+                    parsed.rr_blocks.len(), subscriber.user_id);
+            }
+        }
+
+        // (3) PLI/REMB 릴레이 → publisher별로 모아서 전송 (SR/RR 제외)
         if !parsed.relay_blocks.is_empty() {
             self.relay_subscribe_rtcp_blocks(&plaintext, &parsed, subscriber, room, is_detail).await;
         }
 
-        // (3) MBCP APP 블록 — subscribe PC에서도 MBCP를 보낼 수 있음 (드문 경우)
+        // (4) MBCP APP 블록 — subscribe PC에서도 MBCP를 보낼 수 있음 (드문 경우)
         if !parsed.mbcp_blocks.is_empty() {
             self.handle_mbcp_from_publish(&parsed.mbcp_blocks, subscriber, room, is_detail).await;
         }

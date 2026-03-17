@@ -18,6 +18,7 @@
 //!   (metrics → src/metrics/ 모듈로 분리, v0.4.0)
 
 mod rtcp;
+pub(crate) mod rtcp_terminator;
 mod ingress;
 mod egress;
 pub(crate) mod twcc;
@@ -201,6 +202,12 @@ impl UdpTransport {
         );
         bwe_timer.tick().await;
 
+        // RTCP Terminator: 서버 자체 RR/SR 생성 타이머 (1초)
+        let mut rtcp_report_timer = tokio::time::interval(
+            tokio::time::Duration::from_millis(config::RTCP_REPORT_INTERVAL_MS),
+        );
+        rtcp_report_timer.tick().await;
+
         loop {
             tokio::select! {
                 result = self.socket.recv_from(&mut buf) => {
@@ -234,6 +241,9 @@ impl UdpTransport {
                         BweMode::Remb => self.send_remb_to_publishers().await,
                     }
                 }
+                _ = rtcp_report_timer.tick(), if is_primary => {
+                    self.send_rtcp_reports().await;
+                }
             }
         }
     }
@@ -248,6 +258,17 @@ impl UdpTransport {
         }
 
         let json = self.metrics.flush();
+
+        // RTCP Terminator 진단: rr_diag 콘솔 출력
+        if let Some(diag) = json.get("rr_diag").and_then(|v| v.as_array()) {
+            if !diag.is_empty() {
+                info!("[RTCP:TERM:DIAG] rr_diag ({} blocks):", diag.len());
+                for entry in diag {
+                    info!("  {}", entry);
+                }
+            }
+        }
+
         let _ = self.admin_tx.send(json.to_string());
     }
 

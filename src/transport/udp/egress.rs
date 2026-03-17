@@ -17,6 +17,7 @@ use crate::room::participant::{EgressPacket, TrackKind};
 use super::UdpTransport;
 use crate::metrics::GlobalMetrics;
 use super::rtcp::{build_pli, build_remb};
+use super::rtcp_terminator;
 use super::twcc::build_twcc_feedback;
 
 // ============================================================================
@@ -150,13 +151,16 @@ pub(crate) async fn run_egress_task(
 
         let t0 = Instant::now();
         let result = match pkt {
-            EgressPacket::Rtp(plaintext) => {
+            EgressPacket::Rtp(ref plaintext) => {
+                // RTCP Terminator: subscriber에게 보내는 RTP 통계 갱신 (SR 생성용 — 현재 비활성)
+                // TODO: SR 자체 생성은 NTP/RTP timestamp 보정 설계 후 재활성화
+                // RTX(PT=97)는 제외
                 let mut ctx = participant.subscribe.outbound_srtp.lock().unwrap();
-                ctx.encrypt_rtp(&plaintext)
+                ctx.encrypt_rtp(plaintext)
             }
-            EgressPacket::Rtcp(plaintext) => {
+            EgressPacket::Rtcp(ref plaintext) => {
                 let mut ctx = participant.subscribe.outbound_srtp.lock().unwrap();
-                ctx.encrypt_rtcp(&plaintext)
+                ctx.encrypt_rtcp(plaintext)
             }
         };
         metrics.egress_encrypt.record(t0.elapsed().as_micros() as u64);
@@ -167,6 +171,90 @@ pub(crate) async fn run_egress_task(
     }
 
     info!("[EGRESS] ended user={}", participant.user_id);
+}
+
+// ============================================================================
+// RTCP Terminator: 서버 자체 RR/SR 생성 + 전송 (1초 주기)
+// ============================================================================
+
+impl UdpTransport {
+    /// 모든 room의 모든 publisher에게 서버 자체 RR 전송
+    /// SFU는 publisher의 RTP를 수신하는 peer이므로, 수신 통계 기반 RR을 직접 생성한다.
+    /// subscriber의 RR은 publisher에게 릴레이하지 않는다 (ingress에서 소비).
+    pub(crate) async fn send_rtcp_reports(&self) {
+        // 서버 자체 SSRC (RR sender SSRC — 임의 고정값)
+        const SERVER_SSRC: u32 = 0x00000001;
+
+        for room_entry in self.room_hub.rooms.iter() {
+            let room = room_entry.value();
+
+            for entry in room.participants.iter() {
+                let publisher = entry.value();
+                if !publisher.is_publish_ready() { continue; }
+
+                let pub_addr = match publisher.publish.get_address() {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                // publisher의 recv_stats에서 RR Report Block 생성
+                let rr_blocks: Vec<rtcp_terminator::RrReportBlock> = {
+                    let mut stats_map = publisher.recv_stats.lock().unwrap();
+                    stats_map.values_mut()
+                        .map(|stats| stats.build_rr_block())
+                        .collect()
+                };
+
+                if rr_blocks.is_empty() { continue; }
+
+                // RTCP Terminator 진단: RR 블록 데이터를 메트릭 스냅샷으로 전송
+                {
+                    let mut diag = self.metrics.rr_diag_snapshot.lock().unwrap();
+                    for block in &rr_blocks {
+                        diag.push(serde_json::json!({
+                            "user": publisher.user_id,
+                            "ssrc": format!("0x{:08X}", block.ssrc),
+                            "frac_lost": block.fraction_lost,
+                            "cum_lost": block.cumulative_lost,
+                            "ext_seq": block.extended_highest_seq,
+                            "jitter": block.jitter,
+                            "lsr": format!("0x{:08X}", block.last_sr),
+                            "dlsr": block.delay_since_last_sr,
+                        }));
+                    }
+                }
+
+                let rr_plain = rtcp_terminator::build_receiver_report(SERVER_SSRC, &rr_blocks);
+
+                // SRTCP 암호화 (publisher의 publish session outbound context)
+                let encrypted = {
+                    let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
+                    match ctx.encrypt_rtcp(&rr_plain) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                };
+
+                if let Err(e) = self.socket.send_to(&encrypted, pub_addr).await {
+                    warn!("[RTCP:TERM] RR send FAILED user={} addr={}: {e}",
+                        publisher.user_id, pub_addr);
+                } else {
+                    self.metrics.rr_generated.fetch_add(
+                        rr_blocks.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    debug!("[RTCP:TERM] RR sent user={} blocks={} addr={}",
+                        publisher.user_id, rr_blocks.len(), pub_addr);
+                }
+
+                // --- SR 생성: 비활성 ---
+                // 서버 자체 클록으로 SR을 만들면 NTP/RTP timestamp이
+                // 원본 미디어 소스와 안 맞아서 jb_delay 폭등.
+                // publisher SR을 subscriber에게 릴레이하는 방식으로 복원 (ingress에서 처리).
+                // TODO: publisher SR 기반 NTP/RTP translation 설계 후 재활성화
+            }
+        }
+    }
 }
 
 /// Subscribe SRTP ready 시 해당 room의 모든 publisher에게 PLI 전송

@@ -108,6 +108,12 @@ pub(crate) struct GlobalMetrics {
     pub(crate) pli_sent:        AtomicU64,
     pub(crate) sr_relayed:      AtomicU64,
     pub(crate) rr_relayed:      AtomicU64,
+    /// RTCP Terminator: 서버가 소비한 subscriber RR 수 (publisher에게 릴레이하지 않음)
+    pub(crate) rr_consumed:     AtomicU64,
+    /// RTCP Terminator: 서버가 생성한 RR 수 (publisher에게 전송)
+    pub(crate) rr_generated:    AtomicU64,
+    /// RTCP Terminator: 서버가 생성한 SR 수 (subscriber에게 전송)
+    pub(crate) sr_generated:    AtomicU64,
     pub(crate) twcc_sent:       AtomicU64,
     pub(crate) twcc_recorded:   AtomicU64,
     pub(crate) remb_sent:       AtomicU64,
@@ -166,6 +172,9 @@ pub(crate) struct GlobalMetrics {
     /// 비디오 rewriter Skip 횟수 (화자 불일치)
     pub(crate) ptt_video_skip:          AtomicU64,
 
+    // ---- RTCP Terminator 진단 스냅샷 (1초마다 갱신, 3초 flush 시 전송) ----
+    pub(crate) rr_diag_snapshot: Mutex<Vec<serde_json::Value>>,
+
     // ---- Tokio RuntimeMetrics (flush 시점만, Mutex OK) ----
     tokio_snapshot: Mutex<TokioRuntimeSnapshot>,
 
@@ -192,6 +201,9 @@ impl GlobalMetrics {
             pli_sent:        AtomicU64::new(0),
             sr_relayed:      AtomicU64::new(0),
             rr_relayed:      AtomicU64::new(0),
+            rr_consumed:     AtomicU64::new(0),
+            rr_generated:    AtomicU64::new(0),
+            sr_generated:    AtomicU64::new(0),
             twcc_sent:       AtomicU64::new(0),
             twcc_recorded:   AtomicU64::new(0),
             remb_sent:       AtomicU64::new(0),
@@ -224,6 +236,7 @@ impl GlobalMetrics {
             ptt_audio_rewritten:    AtomicU64::new(0),
             ptt_video_rewritten:    AtomicU64::new(0),
             ptt_video_skip:         AtomicU64::new(0),
+            rr_diag_snapshot: Mutex::new(Vec::new()),
             tokio_snapshot:  Mutex::new(TokioRuntimeSnapshot::new()),
             env_meta:        EnvironmentMeta::capture(worker_count, bwe_mode),
         }
@@ -279,6 +292,9 @@ impl GlobalMetrics {
         let twcc_sent      = self.twcc_sent.swap(0, Ordering::Relaxed);
         let twcc_recorded  = self.twcc_recorded.swap(0, Ordering::Relaxed);
         let remb_sent      = self.remb_sent.swap(0, Ordering::Relaxed);
+        let rr_consumed    = self.rr_consumed.swap(0, Ordering::Relaxed);
+        let rr_generated   = self.rr_generated.swap(0, Ordering::Relaxed);
+        let sr_generated   = self.sr_generated.swap(0, Ordering::Relaxed);
         let sub_rtcp_received  = self.sub_rtcp_received.swap(0, Ordering::Relaxed);
         let sub_rtcp_not_rtcp  = self.sub_rtcp_not_rtcp.swap(0, Ordering::Relaxed);
         let sub_rtcp_decrypted = self.sub_rtcp_decrypted.swap(0, Ordering::Relaxed);
@@ -310,6 +326,12 @@ impl GlobalMetrics {
         let ptt_video_rw          = self.ptt_video_rewritten.swap(0, Ordering::Relaxed);
         let ptt_video_skip        = self.ptt_video_skip.swap(0, Ordering::Relaxed);
 
+        // RTCP Terminator 진단 스냅샷 (swap 추출)
+        let rr_diag = {
+            let mut snap = self.rr_diag_snapshot.lock().unwrap();
+            std::mem::take(&mut *snap)
+        };
+
         // Tokio runtime (Mutex, 3초 1회)
         let tokio_json = self.tokio_snapshot.lock().unwrap().sample();
 
@@ -327,6 +349,9 @@ impl GlobalMetrics {
             "pli_sent":           pli_sent,
             "sr_relayed":         sr_relayed,
             "rr_relayed":         rr_relayed,
+            "rr_consumed":        rr_consumed,
+            "rr_generated":       rr_generated,
+            "sr_generated":       sr_generated,
             "twcc_sent":          twcc_sent,
             "twcc_recorded":      twcc_recorded,
             "remb_sent":          remb_sent,
@@ -389,6 +414,13 @@ impl GlobalMetrics {
         if let (Some(root_obj), Some(cnt_obj)) = (root.as_object_mut(), counters_json.as_object()) {
             for (k, v) in cnt_obj {
                 root_obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        // RTCP Terminator 진단 추가
+        if !rr_diag.is_empty() {
+            if let Some(root_obj) = root.as_object_mut() {
+                root_obj.insert("rr_diag".to_string(), serde_json::Value::Array(rr_diag));
             }
         }
 

@@ -16,9 +16,11 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::trace;
 
+use std::collections::HashMap;
 use crate::config;
 use crate::transport::srtp::SrtpContext;
 use crate::transport::udp::twcc::TwccRecorder;
+use crate::transport::udp::rtcp_terminator::{RecvStats, SendStats};
 
 // ============================================================================
 // EgressPacket — subscriber egress task에 전달할 plaintext 패킷
@@ -236,6 +238,14 @@ pub struct Participant {
     /// Publisher RTP의 twcc seq → 도착 시간 기록 (feedback 생성용)
     pub twcc_recorder: Mutex<TwccRecorder>,
 
+    // --- RTCP Terminator (서버 자체 RR/SR 생성) ---
+    /// Publisher SSRC별 수신 통계 (서버가 peer로서 RR 생성용)
+    /// key = media SSRC, value = RecvStats
+    pub recv_stats: Mutex<HashMap<u32, RecvStats>>,
+    /// Subscriber 방향 송신 통계 (서버가 peer로서 SR 생성용)
+    /// key = 송신 SSRC (conference: 원본, PTT: 가상), value = SendStats
+    pub send_stats: Mutex<HashMap<u32, SendStats>>,
+
     // --- Egress (Phase W-3: subscriber별 egress task) ---
     /// subscribe PC egress channel — plaintext를 egress task에 전달
     pub egress_tx: mpsc::Sender<EgressPacket>,
@@ -278,6 +288,8 @@ impl Participant {
             tracks:     Mutex::new(Vec::new()),
             rtp_cache:  Mutex::new(RtpCache::new()),
             twcc_recorder: Mutex::new(TwccRecorder::new()),
+            recv_stats: Mutex::new(HashMap::new()),
+            send_stats: Mutex::new(HashMap::new()),
             rtx_ssrc_counter: AtomicU32::new(0),
             rtx_seq:    AtomicU16::new(0),
             egress_tx,

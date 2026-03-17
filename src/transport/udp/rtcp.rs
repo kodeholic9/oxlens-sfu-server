@@ -118,10 +118,15 @@ pub(crate) fn parse_rtcp_nack(buf: &[u8]) -> Vec<NackItem> {
 pub(crate) struct CompoundRtcpParsed {
     /// NACK 블록 (PT=205): 서버에서 RTX 처리
     pub(crate) nack_blocks: Vec<Vec<u8>>,
-    /// 릴레이 대상 블록 (RR, PLI, REMB 등): publisher로 전달
+    /// 릴레이 대상 블록 (PLI, REMB): publisher로 전달
+    /// → RR/SR은 더 이상 릴레이하지 않음 (RTCP Terminator가 서버 자체 생성)
     pub(crate) relay_blocks: Vec<RtcpBlockRef>,
     /// MBCP APP 블록 (PT=204, name="MBCP"): Floor Control 처리
     pub(crate) mbcp_blocks: Vec<MbcpMessage>,
+    /// SR 블록 (PT=200): 서버가 소비 (RecvStats LSR/DLSR 갱신용)
+    pub(crate) sr_blocks: Vec<RtcpBlockRef>,
+    /// RR 블록 (PT=201): 서버가 소비 (로깅/모니터링, publisher에게 릴레이하지 않음)
+    pub(crate) rr_blocks: Vec<RtcpBlockRef>,
 }
 
 /// Compound 내 개별 RTCP 블록 참조 (offset + length + media_ssrc)
@@ -143,6 +148,8 @@ pub(crate) fn split_compound_rtcp(buf: &[u8]) -> CompoundRtcpParsed {
         nack_blocks: Vec::new(),
         relay_blocks: Vec::new(),
         mbcp_blocks: Vec::new(),
+        sr_blocks: Vec::new(),
+        rr_blocks: Vec::new(),
     };
 
     let mut offset = 0;
@@ -172,18 +179,31 @@ pub(crate) fn split_compound_rtcp(buf: &[u8]) -> CompoundRtcpParsed {
             if let Some(msg) = parse_mbcp_app(&buf[offset..offset + pkt_len]) {
                 result.mbcp_blocks.push(msg);
             }
-        } else if pt == config::RTCP_PT_RR
-            || (pt == config::RTCP_PT_PSFB && fmt == config::RTCP_FMT_PLI)
+        } else if pt == config::RTCP_PT_SR {
+            // SR (PT=200): 서버가 소비 (RecvStats LSR/DLSR 갱신용)
+            result.sr_blocks.push(RtcpBlockRef {
+                offset,
+                length: pkt_len,
+                media_ssrc,
+            });
+        } else if pt == config::RTCP_PT_RR {
+            // RR (PT=201): 서버가 소비 (publisher에게 릴레이하지 않음)
+            result.rr_blocks.push(RtcpBlockRef {
+                offset,
+                length: pkt_len,
+                media_ssrc,
+            });
+        } else if (pt == config::RTCP_PT_PSFB && fmt == config::RTCP_FMT_PLI)
             || (pt == config::RTCP_PT_PSFB && fmt == config::RTCP_FMT_REMB)
         {
-            // 릴레이 대상: RR, PLI, REMB
+            // PLI, REMB: publisher로 릴레이
             result.relay_blocks.push(RtcpBlockRef {
                 offset,
                 length: pkt_len,
                 media_ssrc,
             });
         }
-        // 그 외 (SR 등 subscribe에서 오는 것): 무시
+        // 그 외: 무시
 
         offset += pkt_len;
     }

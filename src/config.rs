@@ -178,6 +178,20 @@ pub const FLOOR_PING_TIMEOUT_MS: u64 = 5_000;
 /// 정상 세션: ~10-30 RTX/3s, LTE lossy: 수백~수천. 200이면 정상은 통과, 폭풍은 차단.
 pub const RTX_BUDGET_PER_3S: u64 = 200;
 
+// --- RTCP Terminator (Server-generated RR/SR) ---
+/// 서버 자체 RR/SR 생성 주기 (ms) — publisher에게 수신 품질 피드백
+pub const RTCP_REPORT_INTERVAL_MS: u64 = 1_000;
+/// Opus clock rate (48kHz)
+pub const CLOCK_RATE_AUDIO: u32 = 48_000;
+/// VP8 clock rate (90kHz)
+pub const CLOCK_RATE_VIDEO: u32 = 90_000;
+/// RecvStats seq validation: max dropout (reorder tolerance)
+pub const RTP_SEQ_MAX_DROPOUT: u16 = 3000;
+/// RecvStats seq validation: max misorder (late arrival tolerance)
+pub const RTP_SEQ_MAX_MISORDER: u16 = 100;
+/// RecvStats seq validation: min sequential for valid source
+pub const RTP_SEQ_MIN_SEQUENTIAL: u32 = 2;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;
