@@ -310,6 +310,21 @@ impl PttRewriter {
         RewriteResult::Ok
     }
 
+    /// SR의 RTP timestamp를 가상 공간으로 변환
+    /// publisher SR의 NTP↔RTP 관계를 subscriber 가상 스트림 기준으로 보정.
+    /// 화자가 없거나 첫 패킷 미도착 시 None 반환.
+    pub fn translate_rtp_ts(&self, original_rtp_ts: u32) -> Option<u32> {
+        let s = self.state.lock().unwrap();
+        if s.speaker.is_none() || s.awaiting_first_packet {
+            return None;
+        }
+        Some(
+            original_rtp_ts
+                .wrapping_sub(s.origin_base_ts)
+                .wrapping_add(s.virtual_base_ts)
+        )
+    }
+
     /// NACK 역매핑: 가상 seq → 원본 seq 역산
     pub fn reverse_seq(&self, virtual_seq: u16) -> u16 {
         let s = self.state.lock().unwrap();

@@ -70,12 +70,16 @@ pub enum FloorAction {
 /// signaling handler에서 호출하고, 반환된 FloorAction에 따라 메시지 전송.
 pub struct FloorController {
     state: Mutex<FloorState>,
+    /// 직전 발화자 (발화 종료 후 NACK 역매핑용)
+    /// Idle 전환 시 저장, 다음 Granted 시 초기화
+    prev_speaker: Mutex<Option<String>>,
 }
 
 impl FloorController {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(FloorState::Idle),
+            prev_speaker: Mutex::new(None),
         }
     }
 
@@ -92,6 +96,11 @@ impl FloorController {
         }
     }
 
+    /// 직전 발화자 (Idle 전환 후에도 유효, NACK 역매핑 fallback용)
+    pub fn last_speaker(&self) -> Option<String> {
+        self.prev_speaker.lock().unwrap().clone()
+    }
+
     /// Floor Request — 발화권 요청 (PTT 누름)
     pub fn request(&self, user_id: &str, now_ms: u64) -> FloorAction {
         let mut state = self.state.lock().unwrap();
@@ -103,6 +112,8 @@ impl FloorController {
                     burst_start: now_ms,
                     last_ping: now_ms,
                 };
+                // 새 화자 시작 → prev_speaker 초기화 (이제 현재 화자가 있으니까)
+                *self.prev_speaker.lock().unwrap() = None;
                 FloorAction::Granted {
                     speaker: user_id.to_string(),
                 }
@@ -130,6 +141,7 @@ impl FloorController {
         match &*state {
             FloorState::Taken { speaker, .. } if speaker == user_id => {
                 info!("[FLOOR] released user={}", user_id);
+                *self.prev_speaker.lock().unwrap() = Some(user_id.to_string());
                 *state = FloorState::Idle;
                 FloorAction::Released {
                     prev_speaker: user_id.to_string(),
@@ -173,6 +185,7 @@ impl FloorController {
                     let prev = speaker.clone();
                     warn!("[FLOOR] T2 expired user={} burst={}ms",
                         prev, now_ms.saturating_sub(*burst_start));
+                    *self.prev_speaker.lock().unwrap() = Some(prev.clone());
                     *state = FloorState::Idle;
                     return Some(FloorAction::Revoked {
                         prev_speaker: prev,
@@ -184,6 +197,7 @@ impl FloorController {
                     let prev = speaker.clone();
                     warn!("[FLOOR] ping timeout user={} last_ping={}ms ago",
                         prev, now_ms.saturating_sub(*last_ping));
+                    *self.prev_speaker.lock().unwrap() = Some(prev.clone());
                     *state = FloorState::Idle;
                     return Some(FloorAction::Revoked {
                         prev_speaker: prev,
@@ -202,6 +216,7 @@ impl FloorController {
         match &*state {
             FloorState::Taken { speaker, .. } if speaker == user_id => {
                 info!("[FLOOR] auto-release on leave user={}", user_id);
+                *self.prev_speaker.lock().unwrap() = Some(user_id.to_string());
                 *state = FloorState::Idle;
                 Some(FloorAction::Released {
                     prev_speaker: user_id.to_string(),

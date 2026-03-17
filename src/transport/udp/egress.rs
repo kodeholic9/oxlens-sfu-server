@@ -152,9 +152,40 @@ pub(crate) async fn run_egress_task(
         let t0 = Instant::now();
         let result = match pkt {
             EgressPacket::Rtp(ref plaintext) => {
-                // RTCP Terminator: subscriber에게 보내는 RTP 통계 갱신 (SR 생성용 — 현재 비활성)
-                // TODO: SR 자체 생성은 NTP/RTP timestamp 보정 설계 후 재활성화
-                // RTX(PT=97)는 제외
+                // RTCP Terminator: SendStats 갱신 (SR translation용)
+                // RTX(PT=97)는 재전송이므로 제외
+                if plaintext.len() >= 12 {
+                    let pt = plaintext[1] & 0x7F;
+                    if pt != crate::config::RTX_PAYLOAD_TYPE {
+                        let ssrc = u32::from_be_bytes(
+                            [plaintext[8], plaintext[9], plaintext[10], plaintext[11]]
+                        );
+                        let rtp_ts = u32::from_be_bytes(
+                            [plaintext[4], plaintext[5], plaintext[6], plaintext[7]]
+                        );
+                        // payload len: 헤더(12 + CSRC + ext) 제외
+                        let cc = (plaintext[0] & 0x0F) as usize;
+                        let has_ext = (plaintext[0] & 0x10) != 0;
+                        let mut hdr_len = 12 + cc * 4;
+                        if has_ext && plaintext.len() >= hdr_len + 4 {
+                            let ext_words = u16::from_be_bytes(
+                                [plaintext[hdr_len + 2], plaintext[hdr_len + 3]]
+                            ) as usize;
+                            hdr_len += 4 + ext_words * 4;
+                        }
+                        let payload_len = plaintext.len().saturating_sub(hdr_len);
+
+                        let clock_rate = if pt == 111 {
+                            crate::config::CLOCK_RATE_AUDIO
+                        } else {
+                            crate::config::CLOCK_RATE_VIDEO
+                        };
+                        let mut stats_map = participant.send_stats.lock().unwrap();
+                        let stats = stats_map.entry(ssrc)
+                            .or_insert_with(|| rtcp_terminator::SendStats::new(ssrc, clock_rate));
+                        stats.on_rtp_sent(rtp_ts, payload_len);
+                    }
+                }
                 let mut ctx = participant.subscribe.outbound_srtp.lock().unwrap();
                 ctx.encrypt_rtp(plaintext)
             }

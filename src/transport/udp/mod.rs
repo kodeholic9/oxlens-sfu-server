@@ -259,12 +259,12 @@ impl UdpTransport {
 
         let json = self.metrics.flush();
 
-        // RTCP Terminator 진단: rr_diag 콘솔 출력
+        // RTCP Terminator 진단: rr_diag 콘솔 출력 (안정화 완료 → debug 레벨)
         if let Some(diag) = json.get("rr_diag").and_then(|v| v.as_array()) {
             if !diag.is_empty() {
-                info!("[RTCP:TERM:DIAG] rr_diag ({} blocks):", diag.len());
+                debug!("[RTCP:TERM:DIAG] rr_diag ({} blocks):", diag.len());
                 for entry in diag {
-                    info!("  {}", entry);
+                    debug!("  {}", entry);
                 }
             }
         }

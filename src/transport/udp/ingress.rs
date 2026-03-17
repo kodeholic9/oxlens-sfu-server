@@ -108,18 +108,19 @@ impl UdpTransport {
                 }
             }
 
-            // SR + PLI/REMB 릴레이 (SR은 subscriber에게 릴레이 복원 — 서버 자체 SR 생성은 비활성)
-            // RR만 제외 (서버가 자체 생성)
-            let mut relay_slices: Vec<&[u8]> = Vec::new();
-            for sr_ref in &parsed.sr_blocks {
-                relay_slices.push(&plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length]);
-            }
-            for blk in &parsed.relay_blocks {
-                relay_slices.push(&plaintext[blk.offset..blk.offset + blk.length]);
-            }
-            if !relay_slices.is_empty() {
-                let compound = assemble_compound(&relay_slices);
-                self.relay_publish_rtcp(&compound, &sender, &room, is_detail);
+            // SR translation + PLI/REMB 릴레이
+            // SR: subscriber별로 SSRC/RTP ts/counts 변환 (PTT: 가상 SSRC, Conference: counts만)
+            // RR: 서버가 자체 생성 (릴레이 안 함)
+            let sr_data: Vec<Vec<u8>> = parsed.sr_blocks.iter()
+                .map(|sr_ref| plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length].to_vec())
+                .collect();
+            let relay_data: Vec<Vec<u8>> = parsed.relay_blocks.iter()
+                .map(|blk| plaintext[blk.offset..blk.offset + blk.length].to_vec())
+                .collect();
+            if !sr_data.is_empty() || !relay_data.is_empty() {
+                self.relay_publish_rtcp_translated(
+                    &sr_data, &relay_data, &sender, &room, is_detail,
+                );
             }
             // MBCP만 있고 SR/PLI 없으면 릴레이 스킵
             return;
@@ -284,6 +285,10 @@ impl UdpTransport {
             let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
             if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
+                if self.metrics.egress_drop.load(Ordering::Relaxed) == 0 {
+                    warn!("[EGRESS:DIAG] queue_full user={} (backpressure drop)",
+                        target.user_id);
+                }
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
@@ -676,7 +681,9 @@ impl UdpTransport {
             let effective_ssrc = if ptt_audio_vssrc == Some(block.media_ssrc)
                 || ptt_video_vssrc == Some(block.media_ssrc) {
                 let is_video = ptt_video_vssrc == Some(block.media_ssrc);
+                // current_speaker → last_speaker fallback (release 직후 PLI 대응)
                 room.floor.current_speaker()
+                    .or_else(|| room.floor.last_speaker())
                     .and_then(|uid| room.get_participant(&uid))
                     .and_then(|p| {
                         let tracks = p.tracks.lock().unwrap();
@@ -782,7 +789,10 @@ impl UdpTransport {
                 let original_seqs: Vec<u16> = lost_seqs.iter()
                     .map(|&vs| room.video_rewriter.reverse_seq(vs))
                     .collect();
-                let speaker_ssrc = room.floor.current_speaker()
+                // current_speaker → last_speaker fallback (release 직후 NACK 대응)
+                let speaker_uid = room.floor.current_speaker()
+                    .or_else(|| room.floor.last_speaker());
+                let speaker_ssrc = speaker_uid
                     .and_then(|uid| room.get_participant(&uid))
                     .and_then(|p| {
                         let tracks = p.tracks.lock().unwrap();
@@ -801,10 +811,16 @@ impl UdpTransport {
             let publisher = match publisher {
                 Some(p) => p,
                 None => {
-                    self.metrics.nack_publisher_not_found.fetch_add(1, Ordering::Relaxed);
-                    if is_detail {
-                        debug!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", lookup_ssrc);
+                    // 3초 윈도우 첫 건만 warn (메트릭 swap(0) 주기 = 3초)
+                    if self.metrics.nack_publisher_not_found.load(Ordering::Relaxed) == 0 {
+                        warn!("[NACK:DIAG] pub_not_found media_ssrc=0x{:08X} lookup=0x{:08X} \
+                            virtual_video={} user={}",
+                            nack.media_ssrc, lookup_ssrc,
+                            ptt_virtual_video_ssrc.map(|v| format!("0x{:08X}", v))
+                                .unwrap_or("none".into()),
+                            subscriber.user_id);
                     }
+                    self.metrics.nack_publisher_not_found.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -816,10 +832,11 @@ impl UdpTransport {
             let rtx_ssrc = match rtx_ssrc {
                 Some(s) => s,
                 None => {
-                    self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
-                    if is_detail {
-                        debug!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", lookup_ssrc);
+                    if self.metrics.nack_no_rtx_ssrc.load(Ordering::Relaxed) == 0 {
+                        warn!("[NACK:DIAG] no_rtx_ssrc lookup=0x{:08X} user={}",
+                            lookup_ssrc, subscriber.user_id);
                     }
+                    self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -835,10 +852,11 @@ impl UdpTransport {
             };
 
             let cache_miss = cache_seqs.len() - rtx_packets.len();
-            self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
 
             if cache_miss > 0 {
-                if self.metrics.rtx_cache_miss.load(Ordering::Relaxed) <= 10 {
+                let first_in_window = self.metrics.rtx_cache_miss.load(Ordering::Relaxed) == 0;
+                self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
+                if first_in_window {
                     let cache = publisher.rtp_cache.lock().unwrap();
                     let missed: Vec<String> = cache_seqs.iter()
                         .filter(|&&s| rtx_packets.iter().all(|(ls, _, _)| *ls != s))
@@ -853,9 +871,9 @@ impl UdpTransport {
                             format!("seq={}(idx={})={}", s, idx, slot_info)
                         })
                         .collect();
-                    debug!("[DBG:RTX] MISS {}/{} ssrc=0x{:08X} user={} cached_3s={} samples=[{}]",
+                    warn!("[NACK:DIAG] cache_miss {}/{} ssrc=0x{:08X} user={} samples=[{}]",
                         cache_miss, cache_seqs.len(), lookup_ssrc,
-                        publisher.user_id, self.metrics.rtp_cache_stored.load(Ordering::Relaxed), missed.join(", "));
+                        publisher.user_id, missed.join(", "));
                 }
             }
 
@@ -863,6 +881,10 @@ impl UdpTransport {
                 // RTX budget: subscriber별 3초당 상한 초과 시 드롭 (다른 참가자 egress 큐 보호)
                 let used = subscriber.rtx_budget_used.fetch_add(1, Ordering::Relaxed);
                 if used >= config::RTX_BUDGET_PER_3S {
+                    if self.metrics.rtx_budget_exceeded.load(Ordering::Relaxed) == 0 {
+                        warn!("[NACK:DIAG] rtx_budget_exceeded user={} used={} limit={}",
+                            subscriber.user_id, used, config::RTX_BUDGET_PER_3S);
+                    }
                     self.metrics.rtx_budget_exceeded.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -875,20 +897,26 @@ impl UdpTransport {
     }
 
     // ========================================================================
-    // Publish RTCP relay — SR을 모든 subscriber에게 fan-out (Phase C-2a)
+    // Publish RTCP relay — SR translation + fan-out (Phase C-2a v2)
     // ========================================================================
 
-    /// Publish PC에서 수신된 RTCP compound를 모든 subscriber에게 릴레이.
-    /// SR 외 다른 RTCP도 함께 있을 수 있으나, compound 통째로 릴레이한다.
-    /// (publish → subscribe 방향에는 NACK이 없으므로 분리 불필요)
-    fn relay_publish_rtcp(
+    /// Publisher SR을 subscriber별로 변환하여 릴레이.
+    ///
+    /// SR 변환 전략:
+    ///   - Conference: SSRC/NTP/RTP ts 원본, packet_count/octet_count만 egress 기준
+    ///   - PTT: SSRC → 가상 SSRC, RTP ts → 오프셋 변환, counts → egress 기준
+    ///   - NTP timestamp은 항상 원본 유지 (lip sync 기준점)
+    ///
+    /// relay_blocks (PLI/REMB)는 변환 없이 통과.
+    fn relay_publish_rtcp_translated(
         &self,
-        plaintext: &[u8],
+        sr_blocks: &[Vec<u8>],
+        relay_blocks: &[Vec<u8>],
         sender: &Arc<crate::room::participant::Participant>,
         room: &Arc<Room>,
-        _is_detail: bool,
+        is_detail: bool,
     ) {
-        // Phase E-1: PTT 모드에서는 floor holder의 SR만 릴레이
+        // PTT 모드: floor holder만 릴레이 대상
         if room.mode == RoomMode::Ptt {
             let allowed = match room.floor.current_speaker() {
                 Some(ref speaker) if speaker == &sender.user_id => true,
@@ -897,19 +925,124 @@ impl UdpTransport {
             if !allowed { return; }
         }
 
-        self.metrics.sr_relayed.fetch_add(1, Ordering::Relaxed);
-
-        // Phase W-3: egress 큐로 SR relay 전달 (DashMap iter 직접 순회, Vec 할당 없음)
-        let plaintext_owned = plaintext.to_vec();
+        // PTT 모드: SR 릴레이 중단
+        // 화자 교대 시 NTP(실시간)는 idle 구간만큼 점프하는데 RTP(미디어 시간)는 연속 스트림으로 거의 안 점프
+        // → NTP↔RTP 선형 관계 파괴 → Chrome jitter buffer가 버퍼를 계속 키움 → jb_delay 점진적 폭등
+        // PTT에서는 1인 발화이므로 lip sync 불필요, arrival time 기반으로 충분
+        let use_sr = room.mode != RoomMode::Ptt;
 
         for entry in room.participants.iter() {
             if entry.key() == &sender.user_id { continue; }
             let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
-            if target.egress_tx.try_send(EgressPacket::Rtcp(plaintext_owned.clone())).is_err() {
+
+            let mut compound_slices: Vec<Vec<u8>> = Vec::new();
+
+            // Conference: subscriber별 SR 변환, PTT: SR 제외
+            if use_sr {
+                for sr_block in sr_blocks {
+                    let tr = self.build_sr_translation(sr_block, sender, &target, room);
+                    match rtcp_terminator::translate_sr(sr_block, &tr) {
+                        Some(translated) => compound_slices.push(translated),
+                        None => compound_slices.push(sr_block.clone()),
+                    }
+                }
+            }
+
+            // 비-SR relay 블록 (PLI/REMB) 통과
+            for blk in relay_blocks {
+                compound_slices.push(blk.clone());
+            }
+
+            if compound_slices.is_empty() { continue; }
+
+            let refs: Vec<&[u8]> = compound_slices.iter().map(|v| v.as_slice()).collect();
+            let compound = assemble_compound(&refs);
+
+            self.metrics.sr_relayed.fetch_add(1, Ordering::Relaxed);
+
+            if target.egress_tx.try_send(EgressPacket::Rtcp(compound)).is_err() {
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.metrics.egress_rtcp_relayed.fetch_add(1, Ordering::Relaxed);
+            }
+
+            if is_detail {
+                debug!("[RTCP:TERM] SR translated for subscriber user={}", target.user_id);
+            }
+        }
+    }
+
+    /// Publisher SR → subscriber SR 변환 파라미터 생성
+    ///
+    /// PTT: SSRC → virtual, RTP ts → 오프셋 변환, counts → egress
+    /// Conference: counts만 egress 기준으로 교체
+    fn build_sr_translation(
+        &self,
+        sr_block: &[u8],
+        sender: &Arc<crate::room::participant::Participant>,
+        target: &Arc<crate::room::participant::Participant>,
+        room: &Arc<Room>,
+    ) -> rtcp_terminator::SrTranslation {
+        // SR에서 publisher SSRC와 RTP timestamp 추출
+        let pub_ssrc = if sr_block.len() >= 8 {
+            u32::from_be_bytes([sr_block[4], sr_block[5], sr_block[6], sr_block[7]])
+        } else {
+            0
+        };
+        let original_rtp_ts = if sr_block.len() >= 20 {
+            u32::from_be_bytes([sr_block[16], sr_block[17], sr_block[18], sr_block[19]])
+        } else {
+            0
+        };
+
+        if room.mode == RoomMode::Ptt {
+            // publisher SSRC → audio/video 판별
+            let is_audio = {
+                let tracks = sender.tracks.lock().unwrap();
+                tracks.iter().any(|t| t.ssrc == pub_ssrc && t.kind == TrackKind::Audio)
+            };
+
+            let (virtual_ssrc, translated_rtp_ts) = if is_audio {
+                (
+                    room.audio_rewriter.virtual_ssrc(),
+                    room.audio_rewriter.translate_rtp_ts(original_rtp_ts),
+                )
+            } else {
+                (
+                    room.video_rewriter.virtual_ssrc(),
+                    room.video_rewriter.translate_rtp_ts(original_rtp_ts),
+                )
+            };
+
+            // subscriber의 send_stats에서 가상 SSRC 기준 counts 조회
+            let (pkt, oct) = {
+                let stats_map = target.send_stats.lock().unwrap();
+                stats_map.get(&virtual_ssrc)
+                    .map(|s| (s.packets_sent, s.bytes_sent))
+                    .unwrap_or((0, 0))
+            };
+
+            rtcp_terminator::SrTranslation {
+                ssrc: Some(virtual_ssrc),
+                rtp_ts: translated_rtp_ts,
+                packet_count: pkt,
+                octet_count: oct,
+            }
+        } else {
+            // Conference: SSRC/RTP ts 원본, counts만 egress 기준
+            let (pkt, oct) = {
+                let stats_map = target.send_stats.lock().unwrap();
+                stats_map.get(&pub_ssrc)
+                    .map(|s| (s.packets_sent, s.bytes_sent))
+                    .unwrap_or((0, 0))
+            };
+
+            rtcp_terminator::SrTranslation {
+                ssrc: None,
+                rtp_ts: None,
+                packet_count: pkt,
+                octet_count: oct,
             }
         }
     }

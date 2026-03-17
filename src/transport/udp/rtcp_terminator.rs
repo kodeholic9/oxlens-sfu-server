@@ -315,6 +315,8 @@ impl SendStats {
 /// RTCP Sender Report 생성 (RFC 3550 Section 6.4.1)
 ///
 /// 서버가 subscriber에게 보내는 SR. 서버가 보낸 패킷 수/바이트/timestamp 포함.
+/// 현재 SR 자체 생성은 비활성 (translate_sr 사용), 테스트에서 참조.
+#[allow(dead_code)]
 pub fn build_sender_report(stats: &SendStats) -> Vec<u8> {
     // header(4) + sender_ssrc(4) + sender_info(20) = 28 bytes (no report blocks)
     let total_len = 28;
@@ -356,6 +358,7 @@ pub fn build_sender_report(stats: &SendStats) -> Vec<u8> {
 
 /// 현재 wallclock → NTP 64비트 timestamp
 /// NTP epoch = 1900-01-01, Unix epoch = 1970-01-01 (차이 70년 = 2208988800초)
+#[allow(dead_code)]
 fn wallclock_to_ntp() -> (u32, u32) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -363,6 +366,55 @@ fn wallclock_to_ntp() -> (u32, u32) {
     let ntp_secs = now.as_secs() + 2_208_988_800;
     let ntp_frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
     (ntp_secs as u32, ntp_frac as u32)
+}
+
+// ============================================================================
+// SR Translation (publisher SR → subscriber SR 변환)
+// ============================================================================
+
+/// SR 변환 파라미터. None인 필드는 원본 값 유지.
+pub struct SrTranslation {
+    /// SSRC 교체 (PTT: 가상 SSRC, Conference: None=원본)
+    pub ssrc: Option<u32>,
+    /// RTP timestamp 변환 (PTT: 가상 공간 ts, Conference: None=원본)
+    pub rtp_ts: Option<u32>,
+    /// 서버 egress 기준 packet count
+    pub packet_count: u32,
+    /// 서버 egress 기준 octet count
+    pub octet_count: u32,
+}
+
+/// Publisher SR을 subscriber 기준으로 변환.
+///
+/// - SSRC: PTT 모드에서 가상 SSRC로 교체
+/// - NTP timestamp: 원본 유지 (미디어 클럭 일관성)
+/// - RTP timestamp: PTT 모드에서 오프셋 변환
+/// - packet_count/octet_count: 서버 egress 기준으로 교체
+pub fn translate_sr(sr_block: &[u8], tr: &SrTranslation) -> Option<Vec<u8>> {
+    if sr_block.len() < 28 { return None; }
+    if sr_block[1] != config::RTCP_PT_SR { return None; }
+
+    let mut out = sr_block.to_vec();
+
+    // SSRC 교체
+    if let Some(ssrc) = tr.ssrc {
+        out[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    }
+
+    // NTP timestamp: 원본 유지 (bytes 8..16)
+
+    // RTP timestamp 변환
+    if let Some(rtp_ts) = tr.rtp_ts {
+        out[16..20].copy_from_slice(&rtp_ts.to_be_bytes());
+    }
+
+    // packet_count (egress 기준)
+    out[20..24].copy_from_slice(&tr.packet_count.to_be_bytes());
+
+    // octet_count (egress 기준)
+    out[24..28].copy_from_slice(&tr.octet_count.to_be_bytes());
+
+    Some(out)
 }
 
 // ============================================================================
@@ -465,6 +517,78 @@ mod tests {
         assert_eq!(sr.len(), 28);
         assert_eq!(sr[0] & 0xC0, 0x80); // V=2
         assert_eq!(sr[1], config::RTCP_PT_SR);
+    }
+
+    #[test]
+    fn test_translate_sr_ptt_mode() {
+        // publisher SR 원본 생성
+        let stats = SendStats {
+            ssrc: 0xAAAAAAAA,
+            packets_sent: 500,
+            bytes_sent: 80_000,
+            last_rtp_ts: 48000,
+            last_send_time: Some(Instant::now()),
+            clock_rate: 48000,
+        };
+        let sr = build_sender_report(&stats);
+
+        // PTT 모드: SSRC + RTP ts + counts 변환
+        let tr = SrTranslation {
+            ssrc: Some(0xBBBBBBBB),      // 가상 SSRC
+            rtp_ts: Some(96000),          // 변환된 RTP ts
+            packet_count: 300,            // egress 기준
+            octet_count: 48_000,
+        };
+        let translated = translate_sr(&sr, &tr).unwrap();
+
+        // SSRC 교체 확인
+        let ssrc = u32::from_be_bytes([translated[4], translated[5], translated[6], translated[7]]);
+        assert_eq!(ssrc, 0xBBBBBBBB);
+
+        // NTP timestamp 원본 유지 확인
+        assert_eq!(&translated[8..16], &sr[8..16]);
+
+        // RTP timestamp 변환 확인
+        let rtp_ts = u32::from_be_bytes([translated[16], translated[17], translated[18], translated[19]]);
+        assert_eq!(rtp_ts, 96000);
+
+        // packet/octet count 교체 확인
+        let pkt_count = u32::from_be_bytes([translated[20], translated[21], translated[22], translated[23]]);
+        let oct_count = u32::from_be_bytes([translated[24], translated[25], translated[26], translated[27]]);
+        assert_eq!(pkt_count, 300);
+        assert_eq!(oct_count, 48_000);
+    }
+
+    #[test]
+    fn test_translate_sr_conference_mode() {
+        // Conference: SSRC/RTP ts 원본 유지, counts만 교체
+        let stats = SendStats {
+            ssrc: 0xCCCCCCCC,
+            packets_sent: 1000,
+            bytes_sent: 160_000,
+            last_rtp_ts: 48000,
+            last_send_time: Some(Instant::now()),
+            clock_rate: 48000,
+        };
+        let sr = build_sender_report(&stats);
+
+        let tr = SrTranslation {
+            ssrc: None,     // 원본 유지
+            rtp_ts: None,   // 원본 유지
+            packet_count: 800,
+            octet_count: 128_000,
+        };
+        let translated = translate_sr(&sr, &tr).unwrap();
+
+        // SSRC 원본 유지
+        assert_eq!(&translated[4..8], &sr[4..8]);
+        // NTP 원본 유지
+        assert_eq!(&translated[8..16], &sr[8..16]);
+        // RTP ts 원본 유지
+        assert_eq!(&translated[16..20], &sr[16..20]);
+        // counts 교체
+        let pkt = u32::from_be_bytes([translated[20], translated[21], translated[22], translated[23]]);
+        assert_eq!(pkt, 800);
     }
 
     #[test]
