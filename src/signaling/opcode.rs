@@ -18,6 +18,7 @@ pub const MUTE_UPDATE: u16 = 17;      // 트랙 mute/unmute 상태 변경
 pub const CAMERA_READY: u16 = 18;     // 카메라 웜업 완료 (첫 프레임 → PLI 트리거)
 pub const MESSAGE: u16 = 20;
 pub const TELEMETRY: u16 = 30;          // 클라이언트 telemetry 보고
+pub const ROOM_SYNC: u16 = 50;           // 참여자+트랙+floor 전체 동기화 (폴링)
 
 // --- Floor Control (MCPTT/MBCP) ---
 pub const FLOOR_REQUEST: u16 = 40;      // 발화권 요청 (PTT 누름)

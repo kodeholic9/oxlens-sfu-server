@@ -190,6 +190,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::CAMERA_READY    => Some(handle_camera_ready(session, state, &packet).await),
         opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
         opcode::TELEMETRY      => { handle_telemetry(session, state, &packet); None }
+        opcode::ROOM_SYNC       => Some(handle_room_sync(session, state, &packet).await),
         // Floor Control (MCPTT/MBCP)
         opcode::FLOOR_REQUEST   => Some(handle_floor_request(session, state, &packet).await),
         opcode::FLOOR_RELEASE   => Some(handle_floor_release(session, state, &packet).await),
@@ -404,6 +405,83 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     }
 
     Packet::ok(opcode::ROOM_JOIN, packet.pid, response)
+}
+
+// ============================================================================
+// ROOM_SYNC — 참여자+트랙+floor 전체 동기화 (클라이언트 폴링)
+// ============================================================================
+
+async fn handle_room_sync(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let user_id = match &session.user_id {
+        Some(id) => id,
+        None => return Packet::err(opcode::ROOM_SYNC, packet.pid, 2003, "not identified"),
+    };
+    let room_id = match &session.current_room {
+        Some(id) => id,
+        None => return Packet::err(opcode::ROOM_SYNC, packet.pid, 2004, "not in room"),
+    };
+    let room = match state.rooms.get(room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::ROOM_SYNC, packet.pid, 2001, "room not found"),
+    };
+
+    // subscribe_tracks: room_join과 동일한 로직 (Conference: 실제 SSRC, PTT: 가상 SSRC)
+    let subscribe_tracks: Vec<serde_json::Value> = if room.mode == RoomMode::Ptt {
+        // PTT: 가상 SSRC 2개 (고정)
+        vec![
+            serde_json::json!({
+                "kind": "audio",
+                "ssrc": room.audio_rewriter.virtual_ssrc(),
+                "track_id": "ptt-audio",
+                "virtual": true,
+            }),
+            serde_json::json!({
+                "kind": "video",
+                "ssrc": room.video_rewriter.virtual_ssrc(),
+                "track_id": "ptt-video",
+                "virtual": true,
+            }),
+        ]
+    } else {
+        // Conference: 다른 참여자들의 실제 트랙
+        room.other_participants(user_id)
+            .iter()
+            .flat_map(|p| {
+                p.get_tracks().into_iter().map(|t| {
+                    let mut j = serde_json::json!({
+                        "user_id": p.user_id,
+                        "kind": t.kind.to_string(),
+                        "ssrc": t.ssrc,
+                        "track_id": t.track_id,
+                    });
+                    if let Some(rs) = t.rtx_ssrc {
+                        j["rtx_ssrc"] = serde_json::json!(rs);
+                    }
+                    j
+                })
+            })
+            .collect()
+    };
+
+    let participants: Vec<String> = room.member_ids();
+
+    // floor 상태 (PTT에서만 의미 있지만, 항상 포함)
+    let floor = match room.floor.current_speaker() {
+        Some(s) => serde_json::json!({ "speaker": s }),
+        None => serde_json::json!({ "speaker": null }),
+    };
+
+    debug!("ROOM_SYNC user={} room={} participants={} tracks={}",
+        user_id, room_id, participants.len(), subscribe_tracks.len());
+
+    Packet::ok(opcode::ROOM_SYNC, packet.pid, serde_json::json!({
+        "room_id": room_id,
+        "mode": room.mode.to_string(),
+        "participants": participants,
+        "subscribe_tracks": subscribe_tracks,
+        "floor": floor,
+        "total": participants.len(),
+    }))
 }
 
 // ============================================================================
