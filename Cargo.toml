@@ -1,6 +1,6 @@
 [package]
 name = "oxlens-sfu-server"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 description = "High-performance SFU server — 2PC / SDP-free architecture"
 authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
