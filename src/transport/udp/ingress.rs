@@ -21,7 +21,7 @@ use crate::room::room::Room;
 
 use super::UdpTransport;
 use super::rtcp::{
-    parse_rtp_header, current_ts, split_compound_rtcp, parse_rtcp_nack,
+    parse_rtp_header, RtpHeader, current_ts, split_compound_rtcp, parse_rtcp_nack,
     expand_nack, build_rtx_packet, assemble_compound, build_mbcp_app, MbcpMessage,
 };
 use super::rtcp_terminator::{self, RecvStats};
@@ -64,65 +64,7 @@ impl UdpTransport {
             .unwrap_or(false);
 
         if is_rtcp {
-            let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
-
-            // Decrypt SRTCP (publish session inbound)
-            let plaintext = {
-                let lock_t = Instant::now();
-                let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
-                self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
-                let dec_t = Instant::now();
-                match ctx.decrypt_rtcp(buf) {
-                    Ok(p) => {
-                        self.metrics.decrypt.record(dec_t.elapsed().as_micros() as u64);
-                        p
-                    }
-                    Err(e) => {
-                        self.metrics.decrypt_fail.fetch_add(1, Ordering::Relaxed);
-                        if is_detail {
-                            debug!("[DBG:RTCP:PUB] decrypt FAILED user={}: {e}", sender.user_id);
-                        }
-                        return;
-                    }
-                }
-            };
-
-            // Phase M-1: Compound RTCP 파싱 — MBCP APP 블록 체크
-            let parsed = split_compound_rtcp(&plaintext);
-            if !parsed.mbcp_blocks.is_empty() {
-                self.handle_mbcp_from_publish(&parsed.mbcp_blocks, &sender, &room, is_detail).await;
-            }
-
-            // RTCP Terminator: Publisher SR 소비 (RecvStats LSR/DLSR 갱신)
-            for sr_ref in &parsed.sr_blocks {
-                let sr_data = &plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length];
-                if let Some((ssrc, ntp_hi, ntp_lo)) = rtcp_terminator::parse_sr_ntp(sr_data) {
-                    let mut stats_map = sender.recv_stats.lock().unwrap();
-                    if let Some(stats) = stats_map.get_mut(&ssrc) {
-                        stats.on_sr_received(ntp_hi, ntp_lo);
-                    }
-                    if is_detail {
-                        debug!("[RTCP:TERM] consumed SR from user={} ssrc=0x{:08X}",
-                            sender.user_id, ssrc);
-                    }
-                }
-            }
-
-            // SR translation + PLI/REMB 릴레이
-            // SR: subscriber별로 SSRC/RTP ts/counts 변환 (PTT: 가상 SSRC, Conference: counts만)
-            // RR: 서버가 자체 생성 (릴레이 안 함)
-            let sr_data: Vec<Vec<u8>> = parsed.sr_blocks.iter()
-                .map(|sr_ref| plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length].to_vec())
-                .collect();
-            let relay_data: Vec<Vec<u8>> = parsed.relay_blocks.iter()
-                .map(|blk| plaintext[blk.offset..blk.offset + blk.length].to_vec())
-                .collect();
-            if !sr_data.is_empty() || !relay_data.is_empty() {
-                self.relay_publish_rtcp_translated(
-                    &sr_data, &relay_data, &sender, &room, is_detail,
-                );
-            }
-            // MBCP만 있고 SR/PLI 없으면 릴레이 스킵
+            self.process_publish_rtcp(buf, &sender, &room, seq_num).await;
             return;
         }
 
@@ -157,6 +99,146 @@ impl UdpTransport {
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
         let is_summary = seq_num > 0 && seq_num % config::DBG_SUMMARY_INTERVAL == 0;
 
+        // Per-packet stats: jitter, recv_stats, cache, TWCC
+        self.collect_rtp_stats(&plaintext, &rtp_hdr, &sender, is_detail);
+
+        if is_detail {
+            debug!("[DBG:RTP] #{} user={} ssrc=0x{:08X} pt={} seq={} ts={} marker={} payload_len={}",
+                seq_num, sender.user_id,
+                rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq, rtp_hdr.timestamp,
+                rtp_hdr.marker, plaintext.len().saturating_sub(rtp_hdr.header_len));
+        } else if is_summary {
+            trace!("[DBG:RTP] summary #{} user={} last_ssrc=0x{:08X} last_pt={} last_seq={}",
+                seq_num, sender.user_id,
+                rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
+        }
+
+        // PTT gating + SSRC rewriting → fanout payload
+        let fanout_payload = match self.prepare_fanout_payload(&plaintext, &rtp_hdr, &sender, &room, is_detail) {
+            Some(p) => p,
+            None => return, // gated or pending keyframe
+        };
+
+        // Phase W-3: egress 큐로 전달
+        if is_detail {
+            let target_info: Vec<String> = room.participants.iter()
+                .filter(|e| e.key() != &sender.user_id && e.value().is_subscribe_ready())
+                .map(|e| format!("{}@{}", e.value().user_id, e.value().subscribe.get_address()
+                    .map(|a| a.to_string()).unwrap_or("none".into())))
+                .collect();
+            debug!("[DBG:RELAY] #{} from={} targets=[{}]",
+                seq_num, sender.user_id, target_info.join(", "));
+        }
+
+        // Simulcast video fan-out: 레이어 선택 + SimulcastRewriter
+        if room.simulcast_enabled && rtp_hdr.pt == 96 {
+            self.fanout_simulcast_video(&fanout_payload, &rtp_hdr, &sender, &room).await;
+        } else {
+            // Normal fan-out (audio, non-simulcast video, PTT)
+            for entry in room.participants.iter() {
+                if entry.key() == &sender.user_id { continue; }
+                let target = entry.value();
+                if !target.is_subscribe_ready() { continue; }
+                if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
+                    if self.metrics.egress_drop.load(Ordering::Relaxed) == 0 {
+                        warn!("[EGRESS:DIAG] queue_full user={} (backpressure drop)",
+                            target.user_id);
+                    }
+                    self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+                    target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                    target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Publish RTCP processing (extracted from handle_srtp)
+    // ========================================================================
+
+    /// Publish RTCP: decrypt → MBCP → SR consume → SR translation + relay
+    async fn process_publish_rtcp(
+        &self,
+        buf: &[u8],
+        sender: &Arc<crate::room::participant::Participant>,
+        room: &Arc<Room>,
+        seq_num: u64,
+    ) {
+        let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
+
+        // Decrypt SRTCP (publish session inbound)
+        let plaintext = {
+            let lock_t = Instant::now();
+            let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
+            self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
+            let dec_t = Instant::now();
+            match ctx.decrypt_rtcp(buf) {
+                Ok(p) => {
+                    self.metrics.decrypt.record(dec_t.elapsed().as_micros() as u64);
+                    p
+                }
+                Err(e) => {
+                    self.metrics.decrypt_fail.fetch_add(1, Ordering::Relaxed);
+                    if is_detail {
+                        debug!("[DBG:RTCP:PUB] decrypt FAILED user={}: {e}", sender.user_id);
+                    }
+                    return;
+                }
+            }
+        };
+
+        // Phase M-1: Compound RTCP 파싱 — MBCP APP 블록 체크
+        let parsed = split_compound_rtcp(&plaintext);
+        if !parsed.mbcp_blocks.is_empty() {
+            self.handle_mbcp_from_publish(&parsed.mbcp_blocks, &sender, &room, is_detail).await;
+        }
+
+        // RTCP Terminator: Publisher SR 소비 (RecvStats LSR/DLSR 갱신)
+        for sr_ref in &parsed.sr_blocks {
+            let sr_data = &plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length];
+            if let Some((ssrc, ntp_hi, ntp_lo)) = rtcp_terminator::parse_sr_ntp(sr_data) {
+                let mut stats_map = sender.recv_stats.lock().unwrap();
+                if let Some(stats) = stats_map.get_mut(&ssrc) {
+                    stats.on_sr_received(ntp_hi, ntp_lo);
+                }
+                if is_detail {
+                    debug!("[RTCP:TERM] consumed SR from user={} ssrc=0x{:08X}",
+                        sender.user_id, ssrc);
+                }
+            }
+        }
+
+        // SR translation + PLI/REMB 릴레이
+        // SR: subscriber별로 SSRC/RTP ts/counts 변환 (PTT: 가상 SSRC, Conference: counts만)
+        // RR: 서버가 자체 생성 (릴레이 안 함)
+        let sr_data: Vec<Vec<u8>> = parsed.sr_blocks.iter()
+            .map(|sr_ref| plaintext[sr_ref.offset..sr_ref.offset + sr_ref.length].to_vec())
+            .collect();
+        let relay_data: Vec<Vec<u8>> = parsed.relay_blocks.iter()
+            .map(|blk| plaintext[blk.offset..blk.offset + blk.length].to_vec())
+            .collect();
+        if !sr_data.is_empty() || !relay_data.is_empty() {
+            self.relay_publish_rtcp_translated(
+                &sr_data, &relay_data, &sender, &room, is_detail,
+            );
+        }
+        // MBCP만 있고 SR/PLI 없으면 릴레이 스킵
+    }
+
+    // ========================================================================
+    // Per-packet RTP stats collection (extracted from handle_srtp)
+    // ========================================================================
+
+    /// Audio jitter 감지, RTCP recv_stats 갱신, RTP cache, TWCC 기록
+    fn collect_rtp_stats(
+        &self,
+        plaintext: &[u8],
+        rtp_hdr: &RtpHeader,
+        sender: &Arc<crate::room::participant::Participant>,
+        _is_detail: bool,
+    ) {
         // Audio inter-arrival jitter 감지 (40ms 초과 시 warn 로그)
         if rtp_hdr.pt == 111 {
             let now_us = std::time::SystemTime::now()
@@ -196,7 +278,7 @@ impl UdpTransport {
         if rtp_hdr.pt == 96 {
             match sender.rtp_cache.lock() {
                 Ok(mut cache) => {
-                    cache.store(rtp_hdr.seq, &plaintext);
+                    cache.store(rtp_hdr.seq, plaintext);
                     self.metrics.rtp_cache_stored.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
@@ -211,24 +293,28 @@ impl UdpTransport {
             let cid = sender.twcc_extmap_id.load(Ordering::Relaxed);
             if cid != 0 { cid } else { config::TWCC_EXTMAP_ID }
         };
-        if let Some(twcc_seq) = twcc::parse_twcc_seq(&plaintext, twcc_id) {
+        if let Some(twcc_seq) = twcc::parse_twcc_seq(plaintext, twcc_id) {
             if let Ok(mut rec) = sender.twcc_recorder.lock() {
                 rec.record(twcc_seq, Instant::now());
                 self.metrics.twcc_recorded.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
 
-        if is_detail {
-            debug!("[DBG:RTP] #{} user={} ssrc=0x{:08X} pt={} seq={} ts={} marker={} payload_len={}",
-                seq_num, sender.user_id,
-                rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq, rtp_hdr.timestamp,
-                rtp_hdr.marker, plaintext.len().saturating_sub(rtp_hdr.header_len));
-        } else if is_summary {
-            trace!("[DBG:RTP] summary #{} user={} last_ssrc=0x{:08X} last_pt={} last_seq={}",
-                seq_num, sender.user_id,
-                rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
-        }
+    // ========================================================================
+    // PTT gating + SSRC rewriting (extracted from handle_srtp)
+    // ========================================================================
 
+    /// PTT 모드: floor gating + SSRC rewrite. Conference: passthrough.
+    /// Returns None if gated or pending keyframe (caller should return).
+    fn prepare_fanout_payload(
+        &self,
+        plaintext: &[u8],
+        rtp_hdr: &RtpHeader,
+        sender: &Arc<crate::room::participant::Participant>,
+        room: &Arc<Room>,
+        is_detail: bool,
+    ) -> Option<Vec<u8>> {
         // Phase E-1: PTT 모드 미디어 게이팅 — floor holder만 통과
         if room.mode == RoomMode::Ptt {
             let allowed = match room.floor.current_speaker() {
@@ -241,20 +327,20 @@ impl UdpTransport {
                 if is_detail {
                     trace!("[DBG:PTT] RTP dropped user={} (not floor holder)", sender.user_id);
                 }
-                return;
+                return None;
             }
         }
 
         // Phase E-2/E-4: PTT 모드 SSRC 리라이팅 (오디오 + 비디오)
-        let fanout_payload = if room.mode == RoomMode::Ptt {
+        if room.mode == RoomMode::Ptt {
             use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe};
-            let mut rewritten = plaintext.clone();
+            let mut rewritten = plaintext.to_vec();
             let result = if rtp_hdr.pt == 111 {
                 // Audio (Opus) — 키프레임 대기 없음
                 room.audio_rewriter.rewrite(&mut rewritten, &sender.user_id, false)
             } else if rtp_hdr.pt == 96 {
                 // Video (VP8) — 키프레임 감지 후 리라이팅
-                let keyframe = is_vp8_keyframe(&plaintext);
+                let keyframe = is_vp8_keyframe(plaintext);
                 if keyframe {
                     self.metrics.ptt_keyframe_arrived.fetch_add(1, Ordering::Relaxed);
                 }
@@ -272,7 +358,7 @@ impl UdpTransport {
                     } else if rtp_hdr.pt == 96 {
                         self.metrics.ptt_video_rewritten.fetch_add(1, Ordering::Relaxed);
                     }
-                    rewritten
+                    Some(rewritten)
                 }
                 RewriteResult::PendingKeyframe => {
                     self.metrics.ptt_video_pending_drop.fetch_add(1, Ordering::Relaxed);
@@ -281,135 +367,116 @@ impl UdpTransport {
                         trace!("[DBG:PTT] video dropped (pending keyframe) user={} seq={}",
                             sender.user_id, rtp_hdr.seq);
                     }
-                    return; // 키프레임 대기 중 — P-frame 드롭
+                    None // 키프레임 대기 중 — P-frame 드롭
                 }
                 RewriteResult::Skip => {
                     if rtp_hdr.pt == 96 {
                         self.metrics.ptt_video_skip.fetch_add(1, Ordering::Relaxed);
                     }
-                    plaintext.clone()
+                    Some(plaintext.to_vec())
                 }
             }
         } else {
-            plaintext.clone()
+            Some(plaintext.to_vec())
+        }
+    }
+
+    // ========================================================================
+    // Simulcast video fan-out (extracted from handle_srtp)
+    // ========================================================================
+
+    /// Simulcast video: subscriber별 레이어 선택 + SimulcastRewriter + PLI 교착 방지
+    async fn fanout_simulcast_video(
+        &self,
+        fanout_payload: &[u8],
+        rtp_hdr: &RtpHeader,
+        sender: &Arc<crate::room::participant::Participant>,
+        room: &Arc<Room>,
+    ) {
+        let sender_rid = {
+            let tracks = sender.tracks.lock().unwrap();
+            tracks.iter()
+                .find(|t| t.ssrc == rtp_hdr.ssrc)
+                .and_then(|t| t.rid.clone())
+        };
+        let sender_rid = match sender_rid {
+            Some(r) => r,
+            None => return, // simulcast track이 아님
         };
 
-        // Phase W-3: egress 큐로 전달
-        if is_detail {
-            let target_info: Vec<String> = room.participants.iter()
-                .filter(|e| e.key() != &sender.user_id && e.value().is_subscribe_ready())
-                .map(|e| format!("{}@{}", e.value().user_id, e.value().subscribe.get_address()
-                    .map(|a| a.to_string()).unwrap_or("none".into())))
-                .collect();
-            debug!("[DBG:RELAY] #{} from={} targets=[{}]",
-                seq_num, sender.user_id, target_info.join(", "));
-        }
+        let is_keyframe = crate::room::ptt_rewriter::is_vp8_keyframe(fanout_payload);
+        let vssrc = sender.ensure_simulcast_video_ssrc();
+        let mut pli_sent = false;
 
-        // Simulcast video fan-out: 레이어 선택 + SimulcastRewriter
-        if room.simulcast_enabled && rtp_hdr.pt == 96 {
-            let sender_rid = {
-                let tracks = sender.tracks.lock().unwrap();
-                tracks.iter()
-                    .find(|t| t.ssrc == rtp_hdr.ssrc)
-                    .and_then(|t| t.rid.clone())
+        for entry in room.participants.iter() {
+            if entry.key() == &sender.user_id { continue; }
+            let target = entry.value();
+            if !target.is_subscribe_ready() { continue; }
+
+            let (forwarded_buf, need_pli) = {
+                let mut layers = target.subscribe_layers.lock().unwrap();
+                let mut created = false;
+                let sub = layers.entry(sender.user_id.clone())
+                    .or_insert_with(|| {
+                        created = true;
+                        SubscribeLayerEntry {
+                            rid: "h".to_string(),
+                            rewriter: SimulcastRewriter::new(vssrc),
+                        }
+                    });
+
+                if sub.rid == "pause" || sender_rid != sub.rid {
+                    (None, created)
+                } else {
+                    let mut video_buf = fanout_payload.to_vec();
+                    let ok = sub.rewriter.rewrite(&mut video_buf, is_keyframe);
+                    (if ok { Some(video_buf) } else { None }, created)
+                }
             };
-            let sender_rid = match sender_rid {
-                Some(r) => r,
-                None => return, // simulcast track이 아님
-            };
 
-            let is_keyframe = crate::room::ptt_rewriter::is_vp8_keyframe(&fanout_payload);
-            let vssrc = sender.ensure_simulcast_video_ssrc();
-            let mut pli_sent = false;
-
-            for entry in room.participants.iter() {
-                if entry.key() == &sender.user_id { continue; }
-                let target = entry.value();
-                if !target.is_subscribe_ready() { continue; }
-
-                let (forwarded_buf, need_pli) = {
-                    let mut layers = target.subscribe_layers.lock().unwrap();
-                    let mut created = false;
-                    let sub = layers.entry(sender.user_id.clone())
-                        .or_insert_with(|| {
-                            created = true;
-                            SubscribeLayerEntry {
-                                rid: "h".to_string(),
-                                rewriter: SimulcastRewriter::new(vssrc),
-                            }
-                        });
-
-                    if sub.rid == "pause" || sender_rid != sub.rid {
-                        (None, created)
-                    } else {
-                        let mut video_buf = fanout_payload.clone();
-                        let ok = sub.rewriter.rewrite(&mut video_buf, is_keyframe);
-                        (if ok { Some(video_buf) } else { None }, created)
-                    }
+            // PLI 교착 방지 대책 #1: SubscribeLayer 즉석 생성 시 PLI burst
+            if need_pli && !pli_sent {
+                pli_sent = true;
+                let h_ssrc = {
+                    let tracks = sender.tracks.lock().unwrap();
+                    tracks.iter()
+                        .find(|t| t.kind == TrackKind::Video && t.rid.as_deref() == Some("h"))
+                        .map(|t| t.ssrc)
                 };
-
-                // PLI 교착 방지 대책 #1: SubscribeLayer 즉석 생성 시 PLI burst
-                if need_pli && !pli_sent {
-                    pli_sent = true;
-                    let h_ssrc = {
-                        let tracks = sender.tracks.lock().unwrap();
-                        tracks.iter()
-                            .find(|t| t.kind == TrackKind::Video && t.rid.as_deref() == Some("h"))
-                            .map(|t| t.ssrc)
-                    };
-                    if let (Some(ssrc), Some(pub_addr)) = (h_ssrc, sender.publish.get_address()) {
-                        if sender.is_publish_ready() {
-                            sender.cancel_pli_burst();
-                            let p = Arc::clone(&sender);
-                            let socket = self.socket.clone();
-                            let uid = sender.user_id.clone();
-                            let handle = tokio::spawn(async move {
-                                let delays = [0u64, 200, 500, 1500];
-                                for (i, &delay_ms) in delays.iter().enumerate() {
-                                    if delay_ms > 0 {
-                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    }
-                                    let pli_plain = super::rtcp::build_pli(ssrc);
-                                    let encrypted = {
-                                        let mut ctx = p.publish.outbound_srtp.lock().unwrap();
-                                        ctx.encrypt_rtcp(&pli_plain).ok()
-                                    };
-                                    if let Some(enc) = encrypted {
-                                        if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                                            warn!("[SIM:PLI] auto burst FAILED user={} #{}: {e}", uid, i);
-                                            break;
-                                        } else {
-                                            info!("[SIM:PLI] auto burst user={} ssrc=0x{:08X} #{}", uid, ssrc, i);
-                                        }
+                if let (Some(ssrc), Some(pub_addr)) = (h_ssrc, sender.publish.get_address()) {
+                    if sender.is_publish_ready() {
+                        sender.cancel_pli_burst();
+                        let p = Arc::clone(sender);
+                        let socket = self.socket.clone();
+                        let uid = sender.user_id.clone();
+                        let handle = tokio::spawn(async move {
+                            let delays = [0u64, 200, 500, 1500];
+                            for (i, &delay_ms) in delays.iter().enumerate() {
+                                if delay_ms > 0 {
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                }
+                                let pli_plain = super::rtcp::build_pli(ssrc);
+                                let encrypted = {
+                                    let mut ctx = p.publish.outbound_srtp.lock().unwrap();
+                                    ctx.encrypt_rtcp(&pli_plain).ok()
+                                };
+                                if let Some(enc) = encrypted {
+                                    if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                                        warn!("[SIM:PLI] auto burst FAILED user={} #{}: {e}", uid, i);
+                                        break;
+                                    } else {
+                                        info!("[SIM:PLI] auto burst user={} ssrc=0x{:08X} #{}", uid, ssrc, i);
                                     }
                                 }
-                            });
-                            *sender.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
-                        }
-                    }
-                }
-
-                if let Some(buf) = forwarded_buf {
-                    if target.egress_tx.try_send(EgressPacket::Rtp(buf)).is_err() {
-                        self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
-                        target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
-                        target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
+                        *sender.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
                     }
                 }
             }
-        } else {
-            // Normal fan-out (audio, non-simulcast video, PTT)
-            for entry in room.participants.iter() {
-                if entry.key() == &sender.user_id { continue; }
-                let target = entry.value();
-                if !target.is_subscribe_ready() { continue; }
-                if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
-                    if self.metrics.egress_drop.load(Ordering::Relaxed) == 0 {
-                        warn!("[EGRESS:DIAG] queue_full user={} (backpressure drop)",
-                            target.user_id);
-                    }
+
+            if let Some(buf) = forwarded_buf {
+                if target.egress_tx.try_send(EgressPacket::Rtp(buf)).is_err() {
                     self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
                     target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
                 } else {

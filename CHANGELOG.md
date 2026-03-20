@@ -7,6 +7,29 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.1] - 2026-03-20
+
+### Refactored (리팩토링 1차: handler 분할 + ingress 함수 분해)
+
+#### signaling/handler.rs → signaling/handler/ 디렉토리 분할
+- `handler.rs` 1,753줄 단일 파일 → 7개 파일로 분할 (최대 548줄)
+- `mod.rs` (211줄) — Session, WS entry point, dispatch
+- `room_ops.rs` (548줄) — IDENTIFY, ROOM_LIST/CREATE/JOIN/LEAVE/SYNC, MESSAGE, cleanup
+- `track_ops.rs` (547줄) — PUBLISH_TRACKS, TRACKS_ACK, MUTE_UPDATE, CAMERA_READY, SUBSCRIBE_LAYER
+- `floor_ops.rs` (249줄) — FLOOR_REQUEST/RELEASE/PING, apply_floor_action
+- `helpers.rs` (138줄) — broadcast_to_others/room, codec/extmap policy, simulcast SSRC, utilities
+- `admin.rs` (128줄) — admin WS handler, build_rooms_snapshot
+- `telemetry.rs` (32줄) — client telemetry passthrough
+
+#### transport/udp/ingress.rs — handle_srtp 함수 분해
+- `handle_srtp` 400줄 → 124줄 (3.2배 축소)
+- `process_publish_rtcp()` (67줄) 추출 — SRTCP decrypt + MBCP + SR consume + relay
+- `collect_rtp_stats()` (68줄) 추출 — audio jitter, recv_stats, RTP cache, TWCC
+- `prepare_fanout_payload()` (73줄) 추출 — PTT gating + SSRC rewrite
+- `fanout_simulcast_video()` (100줄) 추출 — simulcast 레이어 라우팅 + PLI burst
+
+### 동작 변경 없음 — 순수 구조 리팩토링
+
 ## [0.6.0] - 2026-03-20
 
 ### Added (Simulcast Phase 3: 가상 SSRC + SimulcastRewriter + 레이어 전환)
