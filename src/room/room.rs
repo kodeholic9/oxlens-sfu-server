@@ -21,6 +21,7 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, trace};
 
 use crate::config;
@@ -59,6 +60,11 @@ pub struct Room {
     /// Media index: addr → (Participant, PcType)
     /// STUN latch 시 등록, publish/subscribe 각각 별도 addr
     by_addr: DashMap<SocketAddr, (Arc<Participant>, PcType)>,
+
+    /// 활성 세션 시작 시각 (ms). 0 = 비활성 (아무도 없음).
+    /// 첫 join 시 compare_exchange(0, now) — 경합 안전.
+    /// flush tick에서 participants.len()==0이면 swap(0)으로 리셋.
+    pub active_since: AtomicU64,
 }
 
 impl Room {
@@ -79,6 +85,7 @@ impl Room {
             participants: DashMap::new(),
             by_ufrag:     DashMap::new(),
             by_addr:      DashMap::new(),
+            active_since: AtomicU64::new(0),
         }
     }
 
@@ -102,6 +109,14 @@ impl Room {
         );
 
         self.participants.insert(p.user_id.clone(), p);
+
+        // 활성 세션 감지: 첫 참가자 입장 시 0→now (경합 안전)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = self.active_since.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+
         Ok(())
     }
 

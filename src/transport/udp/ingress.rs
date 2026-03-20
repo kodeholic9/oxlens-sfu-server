@@ -140,12 +140,13 @@ impl UdpTransport {
                 let target = entry.value();
                 if !target.is_subscribe_ready() { continue; }
                 if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
-                    if self.metrics.egress_drop.load(Ordering::Relaxed) == 0 {
-                        warn!("[EGRESS:DIAG] queue_full user={} (backpressure drop)",
-                            target.user_id);
-                    }
                     self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
                     target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["egress_queue_full", &room.id]),
+                        format!("egress_queue_full user={}", target.user_id),
+                        Some(&room.id),
+                    );
                 } else {
                     self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
                     target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
@@ -249,8 +250,11 @@ impl UdpTransport {
             if prev_us > 0 {
                 let gap_ms = (now_us.saturating_sub(prev_us)) / 1000;
                 if gap_ms > 40 {
-                    warn!("[AUDIO:GAP] user={} gap={}ms (expected ~20ms) ssrc=0x{:08X} seq={}",
-                        sender.user_id, gap_ms, rtp_hdr.ssrc, rtp_hdr.seq);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["audio_gap", &sender.room_id, &sender.user_id]),
+                        format!("audio_gap user={} gap={}ms", sender.user_id, gap_ms),
+                        Some(&sender.room_id),
+                    );
                 }
             }
         }
@@ -986,16 +990,12 @@ impl UdpTransport {
             let publisher = match publisher {
                 Some(p) => p,
                 None => {
-                    // 3초 윈도우 첫 건만 warn (메트릭 swap(0) 주기 = 3초)
-                    if self.metrics.nack_publisher_not_found.load(Ordering::Relaxed) == 0 {
-                        warn!("[NACK:DIAG] pub_not_found media_ssrc=0x{:08X} lookup=0x{:08X} \
-                            virtual_video={} user={}",
-                            nack.media_ssrc, lookup_ssrc,
-                            ptt_virtual_video_ssrc.map(|v| format!("0x{:08X}", v))
-                                .unwrap_or("none".into()),
-                            subscriber.user_id);
-                    }
                     self.metrics.nack_publisher_not_found.fetch_add(1, Ordering::Relaxed);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["nack_pub_not_found", &room.id]),
+                        format!("nack_pub_not_found ssrc=0x{:08X} user={}", lookup_ssrc, subscriber.user_id),
+                        Some(&room.id),
+                    );
                     continue;
                 }
             };
@@ -1007,11 +1007,12 @@ impl UdpTransport {
             let rtx_ssrc = match rtx_ssrc {
                 Some(s) => s,
                 None => {
-                    if self.metrics.nack_no_rtx_ssrc.load(Ordering::Relaxed) == 0 {
-                        warn!("[NACK:DIAG] no_rtx_ssrc lookup=0x{:08X} user={}",
-                            lookup_ssrc, subscriber.user_id);
-                    }
                     self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["nack_no_rtx_ssrc", &room.id]),
+                        format!("nack_no_rtx_ssrc ssrc=0x{:08X} user={}", lookup_ssrc, subscriber.user_id),
+                        Some(&room.id),
+                    );
                     continue;
                 }
             };
@@ -1029,38 +1030,25 @@ impl UdpTransport {
             let cache_miss = cache_seqs.len() - rtx_packets.len();
 
             if cache_miss > 0 {
-                let first_in_window = self.metrics.rtx_cache_miss.load(Ordering::Relaxed) == 0;
                 self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
-                if first_in_window {
-                    let cache = publisher.rtp_cache.lock().unwrap();
-                    let missed: Vec<String> = cache_seqs.iter()
-                        .filter(|&&s| rtx_packets.iter().all(|(ls, _, _)| *ls != s))
-                        .take(3)
-                        .map(|&s| {
-                            let idx = (s as usize) % crate::config::RTP_CACHE_SIZE;
-                            let slot_info = match cache.slot_seq(s) {
-                                None => "EMPTY".to_string(),
-                                Some(cached) if cached == s => "MATCH(bug?)".to_string(),
-                                Some(cached) => format!("OTHER({})", cached),
-                            };
-                            format!("seq={}(idx={})={}", s, idx, slot_info)
-                        })
-                        .collect();
-                    warn!("[NACK:DIAG] cache_miss {}/{} ssrc=0x{:08X} user={} samples=[{}]",
-                        cache_miss, cache_seqs.len(), lookup_ssrc,
-                        publisher.user_id, missed.join(", "));
-                }
+                crate::agg_logger::inc_with(
+                    crate::agg_logger::agg_key(&["rtx_cache_miss", &room.id]),
+                    format!("rtx_cache_miss {}/{} ssrc=0x{:08X} user={}",
+                        cache_miss, cache_seqs.len(), lookup_ssrc, publisher.user_id),
+                    Some(&room.id),
+                );
             }
 
             for (_lost_seq, _rtx_seq, rtx_pkt) in rtx_packets {
                 // RTX budget: subscriber별 3초당 상한 초과 시 드롭 (다른 참가자 egress 큐 보호)
                 let used = subscriber.rtx_budget_used.fetch_add(1, Ordering::Relaxed);
                 if used >= config::RTX_BUDGET_PER_3S {
-                    if self.metrics.rtx_budget_exceeded.load(Ordering::Relaxed) == 0 {
-                        warn!("[NACK:DIAG] rtx_budget_exceeded user={} used={} limit={}",
-                            subscriber.user_id, used, config::RTX_BUDGET_PER_3S);
-                    }
                     self.metrics.rtx_budget_exceeded.fetch_add(1, Ordering::Relaxed);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["rtx_budget_exceeded", &room.id]),
+                        format!("rtx_budget_exceeded user={} used={}", subscriber.user_id, used),
+                        Some(&room.id),
+                    );
                     continue;
                 }
                 self.metrics.rtx_sent.fetch_add(1, Ordering::Relaxed);

@@ -4,15 +4,11 @@
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
 
 use crate::config::BweMode;
 use crate::metrics::GlobalMetrics;
 use crate::room::room::RoomHub;
 use crate::transport::dtls::ServerCert;
-
-/// Admin broadcast channel capacity
-const ADMIN_CHANNEL_SIZE: usize = 256;
 
 /// Shared application state (passed to all handlers via Axum's State extractor)
 #[derive(Clone)]
@@ -22,8 +18,6 @@ pub struct AppState {
     pub udp_socket: Arc<UdpSocket>,
     /// Global metrics (PTT 카운터 등 handler에서도 접근)
     pub(crate) metrics: Arc<GlobalMetrics>,
-    /// Admin telemetry broadcast (sender side, receivers subscribe via .subscribe())
-    pub admin_tx:   broadcast::Sender<String>,
     /// ICE candidate에 노출할 공인 IP (.env PUBLIC_IP 또는 자동 감지)
     pub public_ip:  String,
     /// WebSocket 시그널링 포트
@@ -47,13 +41,11 @@ impl AppState {
         remb_bitrate: u64,
         metrics: Arc<GlobalMetrics>,
     ) -> Self {
-        let (admin_tx, _) = broadcast::channel(ADMIN_CHANNEL_SIZE);
         Self {
             rooms:      Arc::new(RoomHub::new()),
             cert:       Arc::new(cert),
             udp_socket,
             metrics,
-            admin_tx,
             public_ip,
             ws_port,
             udp_port,

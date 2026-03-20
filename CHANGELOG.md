@@ -101,6 +101,65 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - TWCC extmap ID 동적 참조 — client-offer 모드에서 Chrome 할당 ID 사용 (0이면 서버 기본값 fallback)
   기존: 하드코딩 ID=6 → Chrome 할당 ID=3 불일치 → TWCC 추출 실패 → BWE 30kbps 추락
 
+## [0.5.8] - 2026-03-20
+
+### Added (AggLogger + Room Active Session)
+
+#### agg_logger.rs (신규)
+
+- `AggLogger` — OnceLock 싱글톤, DashMap<u64, AggEntry> 해시키 기반 집계
+- `agg_key()` — 호출자가 키 재료로 해시 생성
+- `inc()` / `inc_with()` / `register()` — 핫패스 atomic 카운터
+- `clear_room()` — room_id 기반 엔트리 일괄 제거
+- `flush()` → TelemetryBus emit(AggLog) 자동 호출
+- TelemetryEvent::AggLog variant 활성화
+
+#### room.rs
+
+- `Room.active_since: AtomicU64` 추가 (0=비활성)
+- `add_participant()`: `compare_exchange(0, now)` — 첫 join 시 활성 세션 시작
+
+#### ingress.rs
+
+- 6개 핫패스 반복 warn → `agg_logger::inc_with()` 교체
+  - egress_queue_full, audio_gap, nack_pub_not_found, nack_no_rtx_ssrc, rtx_cache_miss, rtx_budget_exceeded
+- 기존 수동 rate-limit (`if metrics.load()==0 { warn!() }`) 제거
+- GlobalMetrics 카운터는 그대로 유지
+
+#### transport/udp/mod.rs
+
+- `flush_metrics()`: 빈 방 감지 → `active_since` 리셋 + `clear_room()`
+- pipeline JSON에 `_active_since` 포함
+- `agg_logger::flush()` 호출 추가
+
+#### admin (oxlens-home)
+
+- `app.js`: `_active_since` 캡처 + 메타 필드 스킵
+- `snapshot.js`: `room_active` 표시
+
+## [0.5.7] - 2026-03-20
+
+### Refactored (TelemetryBus: 수집/전송 책임 분리)
+
+#### telemetry_bus.rs (신규)
+
+- `TelemetryBus` — OnceLock 전역 싱글톤 + mpsc→broadcast 버스 태스크
+- `TelemetryEvent` enum: ClientTelemetry, ServerMetrics, RoomSnapshot (확장 용이)
+- `emit()` — 어디서든 호출 가능, 의존성 zero. try_send로 핫패스 안 막힘
+- `subscribe()` — 어드민 WS 구독용
+
+#### state.rs
+
+- `admin_tx: broadcast::Sender<String>` 필드 제거
+
+#### 리와이어링 (동작 변경 없음)
+
+- `telemetry.rs`: `state.admin_tx.send()` → `telemetry_bus::emit(ClientTelemetry)`
+- `admin.rs`: `state.admin_tx.subscribe()` → `telemetry_bus::subscribe()`
+- `helpers.rs`: `state.admin_tx.send()` → `telemetry_bus::emit(RoomSnapshot)`
+- `transport/udp/mod.rs`: `self.admin_tx` 필드/인자 전부 제거, `emit(ServerMetrics)` 사용
+- `lib.rs`: `telemetry_bus::init()` 초기화 추가, UdpTransport 생성에서 admin_tx 제거
+
 ## [0.5.6] - 2026-03-20
 
 ### Added (Pipeline Stats: per-participant 파이프라인 카운터 — AI 진단 기반)

@@ -25,7 +25,13 @@ pub async fn admin_ws_handler(
 
 async fn handle_admin_connection(mut socket: WebSocket, state: AppState) {
     info!("admin WS connected");
-    let mut rx = state.admin_tx.subscribe();
+    let mut rx = match crate::telemetry_bus::subscribe() {
+        Some(rx) => rx,
+        None => {
+            warn!("admin WS: TelemetryBus not initialized");
+            return;
+        }
+    };
 
     // 접속 즉시 room 상태 스냅샷 전송
     let snapshot = build_rooms_snapshot(&state);

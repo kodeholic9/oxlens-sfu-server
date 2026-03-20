@@ -131,12 +131,12 @@ pub(super) fn current_ts() -> u64 {
         .as_millis() as u64
 }
 
-/// Room 변경 시 admin broadcast 채널로 스냅샷 push
+/// Room 변경 시 TelemetryBus로 스냅샷 push
 pub(super) fn push_admin_snapshot(state: &AppState) {
     let snapshot = super::admin::build_rooms_snapshot(state);
-    if let Ok(json) = serde_json::to_string(&snapshot) {
-        let _ = state.admin_tx.send(json);
-    }
+    crate::telemetry_bus::emit(
+        crate::telemetry_bus::TelemetryEvent::RoomSnapshot(snapshot)
+    );
 }
 
 // ============================================================================

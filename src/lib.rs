@@ -12,6 +12,8 @@ pub mod room;
 pub mod state;
 pub mod tasks;
 pub mod startup;
+pub mod telemetry_bus;
+pub mod agg_logger;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -130,6 +132,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Phase GM: 전역 메트릭 (모든 worker + egress task + handler 공유)
     let metrics = Arc::new(GlobalMetrics::new(worker_count, &bwe_mode));
 
+    // TelemetryBus 초기화 (AppState 생성 전 — 수집/전송 책임 분리)
+    telemetry_bus::init();
+    agg_logger::init();
+
     // Build shared state (primary_socket을 AppState에 공유 — PLI/REMB 전송용)
     let state = AppState::new(cert, Arc::clone(&primary_socket), public_ip, ws_port, udp_port, bwe_mode, remb_bitrate, Arc::clone(&metrics));
 
@@ -144,7 +150,6 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         primary_socket,
         Arc::clone(&state.rooms),
         Arc::clone(&state.cert),
-        state.admin_tx.clone(),
         0,
         bwe_mode,
         remb_bitrate,
@@ -162,7 +167,6 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 socket,
                 Arc::clone(&state.rooms),
                 Arc::clone(&state.cert),
-                state.admin_tx.clone(),
                 i as u8,
                 bwe_mode,
                 remb_bitrate,

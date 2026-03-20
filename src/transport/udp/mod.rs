@@ -34,7 +34,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
 // 로그 레벨 정책:
 //   info!  = 운영 필수 (연결/해제, 에러, 상태 전환)
@@ -109,7 +108,6 @@ pub struct UdpTransport {
     pub(crate) pkt_count:      u64,
     pub(crate) dbg_rtp_count:  AtomicU64,
     pub(crate) metrics:        Arc<GlobalMetrics>,
-    pub(crate) admin_tx:       broadcast::Sender<String>,
     // Phase W-2: multi-worker
     pub(crate) worker_id: u8,
     // BWE mode (TWCC or REMB)
@@ -122,7 +120,6 @@ impl UdpTransport {
     pub async fn bind(
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
-        admin_tx: broadcast::Sender<String>,
     ) -> std::io::Result<Self> {
         let addr = SocketAddr::from(([0, 0, 0, 0], config::UDP_PORT));
         let socket = UdpSocket::bind(addr).await?;
@@ -137,7 +134,6 @@ impl UdpTransport {
             pkt_count: 0,
             dbg_rtp_count: AtomicU64::new(0),
             metrics,
-            admin_tx,
             worker_id: 0,
             bwe_mode: BweMode::Twcc,
             remb_bitrate: config::REMB_BITRATE_BPS,
@@ -150,10 +146,9 @@ impl UdpTransport {
         socket:   Arc<UdpSocket>,
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
-        admin_tx: broadcast::Sender<String>,
         metrics:  Arc<GlobalMetrics>,
     ) -> Self {
-        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0, BweMode::Twcc, config::REMB_BITRATE_BPS, metrics)
+        Self::from_socket_with_id(socket, room_hub, cert, 0, BweMode::Twcc, config::REMB_BITRATE_BPS, metrics)
     }
 
     /// Phase W-2: worker_id 지정 생성자
@@ -161,7 +156,6 @@ impl UdpTransport {
         socket:   Arc<UdpSocket>,
         room_hub: Arc<RoomHub>,
         cert:     Arc<ServerCert>,
-        admin_tx: broadcast::Sender<String>,
         worker_id: u8,
         bwe_mode: BweMode,
         remb_bitrate: u64,
@@ -175,7 +169,6 @@ impl UdpTransport {
             pkt_count: 0,
             dbg_rtp_count: AtomicU64::new(0),
             metrics,
-            admin_tx,
             worker_id,
             bwe_mode,
             remb_bitrate,
@@ -276,20 +269,31 @@ impl UdpTransport {
         let mut pipeline_map = serde_json::Map::new();
         for room_entry in self.room_hub.rooms.iter() {
             let room = room_entry.value();
+
+            // 활성 세션 종료 감지: 빈 방 + active_since != 0 → 리셋
+            if room.participants.is_empty() {
+                let prev = room.active_since.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if prev != 0 {
+                    crate::agg_logger::clear_room(&room.id);
+                    debug!("[METRICS] room {} active session ended (was since {})", room.id, prev);
+                }
+                continue;
+            }
+
+            let active_since = room.active_since.load(std::sync::atomic::Ordering::Relaxed);
             let mut participants_map = serde_json::Map::new();
+            // 방 활성 세션 시작 시각
+            participants_map.insert("_active_since".to_string(), serde_json::json!(active_since));
             for entry in room.participants.iter() {
                 let p = entry.value();
                 let snap = p.pipeline.snapshot();
                 let mut p_json = snap.to_json();
-                // since: joined_at (counter 누적 기준점)
                 if let Some(obj) = p_json.as_object_mut() {
                     obj.insert("since".to_string(), serde_json::json!(p.joined_at));
                 }
                 participants_map.insert(p.user_id.clone(), p_json);
             }
-            if !participants_map.is_empty() {
-                pipeline_map.insert(room.id.clone(), serde_json::Value::Object(participants_map));
-            }
+            pipeline_map.insert(room.id.clone(), serde_json::Value::Object(participants_map));
         }
         if !pipeline_map.is_empty() {
             if let Some(root) = json.as_object_mut() {
@@ -297,7 +301,12 @@ impl UdpTransport {
             }
         }
 
-        let _ = self.admin_tx.send(json.to_string());
+        crate::telemetry_bus::emit(
+            crate::telemetry_bus::TelemetryEvent::ServerMetrics(json)
+        );
+
+        // AggLogger flush (같은 3초 tick에서 처리)
+        crate::agg_logger::flush();
     }
 
     // ========================================================================

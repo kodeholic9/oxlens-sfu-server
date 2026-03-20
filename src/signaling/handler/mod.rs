@@ -196,7 +196,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::MUTE_UPDATE     => Some(track_ops::handle_mute_update(session, state, &packet).await),
         opcode::CAMERA_READY    => Some(track_ops::handle_camera_ready(session, state, &packet).await),
         opcode::MESSAGE         => Some(room_ops::handle_message(session, state, &packet).await),
-        opcode::TELEMETRY      => { telemetry::handle_telemetry(session, state, &packet); None }
+        opcode::TELEMETRY      => { telemetry::handle_telemetry(session, &packet); None }
         opcode::ROOM_SYNC       => Some(room_ops::handle_room_sync(session, state, &packet).await),
         // Floor Control (MCPTT/MBCP)
         opcode::FLOOR_REQUEST   => Some(floor_ops::handle_floor_request(session, state, &packet).await),
