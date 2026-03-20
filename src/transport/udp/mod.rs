@@ -257,7 +257,7 @@ impl UdpTransport {
             }
         }
 
-        let json = self.metrics.flush();
+        let mut json = self.metrics.flush();
 
         // RTCP Terminator 진단: rr_diag 콘솔 출력 (안정화 완료 → debug 레벨)
         if let Some(diag) = json.get("rr_diag").and_then(|v| v.as_array()) {
@@ -266,6 +266,32 @@ impl UdpTransport {
                 for entry in diag {
                     debug!("  {}", entry);
                 }
+            }
+        }
+
+        // Per-participant pipeline stats (counter 타입, 누적값 스냅샷)
+        // delta 계산은 어드민 JS에서 "현재값 - 이전값"으로 처리
+        let mut pipeline_map = serde_json::Map::new();
+        for room_entry in self.room_hub.rooms.iter() {
+            let room = room_entry.value();
+            let mut participants_map = serde_json::Map::new();
+            for entry in room.participants.iter() {
+                let p = entry.value();
+                let snap = p.pipeline.snapshot();
+                let mut p_json = snap.to_json();
+                // since: joined_at (counter 누적 기준점)
+                if let Some(obj) = p_json.as_object_mut() {
+                    obj.insert("since".to_string(), serde_json::json!(p.joined_at));
+                }
+                participants_map.insert(p.user_id.clone(), p_json);
+            }
+            if !participants_map.is_empty() {
+                pipeline_map.insert(room.id.clone(), serde_json::Value::Object(participants_map));
+            }
+        }
+        if !pipeline_map.is_empty() {
+            if let Some(root) = json.as_object_mut() {
+                root.insert("pipeline".to_string(), serde_json::Value::Object(pipeline_map));
             }
         }
 

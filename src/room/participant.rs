@@ -23,6 +23,90 @@ use crate::transport::udp::twcc::TwccRecorder;
 use crate::transport::udp::rtcp_terminator::{RecvStats, SendStats};
 
 // ============================================================================
+// PipelineStats — per-participant 파이프라인 카운터 (AI 진단용)
+// ============================================================================
+
+/// 참가자별 미디어 파이프라인 통과량 카운터.
+/// 전부 AtomicU64 — 핫패스에서 fetch_add(1, Relaxed) ~1ns.
+/// flush 시 load(Relaxed)로 누적값 읽기 (swap 안 함, counter 타입).
+/// delta 계산은 어드민 JS에서 "현재값 - 이전값"으로 처리.
+pub struct PipelineStats {
+    // --- Publisher 관점 (내가 보낸 것) ---
+    /// ingress 수신 성공 (decrypt 후, RTX 포함)
+    pub pub_rtp_in:        AtomicU64,
+    /// PTT gate에서 차단된 RTP
+    pub pub_rtp_gated:     AtomicU64,
+    /// rewriter 통과 (PTT 모드에서 리라이팅 성공)
+    pub pub_rtp_rewritten: AtomicU64,
+    /// 키프레임 대기 중 드롭 (PTT 비디오)
+    pub pub_video_pending: AtomicU64,
+
+    // --- Subscriber 관점 (내가 받은 것) ---
+    /// egress 큐 전달 성공
+    pub sub_rtp_relayed:   AtomicU64,
+    /// egress 큐 full로 드롭
+    pub sub_rtp_dropped:   AtomicU64,
+    /// 이 subscriber에게 보낸 SR 수
+    pub sub_sr_relayed:    AtomicU64,
+}
+
+impl PipelineStats {
+    pub fn new() -> Self {
+        Self {
+            pub_rtp_in:        AtomicU64::new(0),
+            pub_rtp_gated:     AtomicU64::new(0),
+            pub_rtp_rewritten: AtomicU64::new(0),
+            pub_video_pending: AtomicU64::new(0),
+            sub_rtp_relayed:   AtomicU64::new(0),
+            sub_rtp_dropped:   AtomicU64::new(0),
+            sub_sr_relayed:    AtomicU64::new(0),
+        }
+    }
+
+    /// 누적값 스냅샷 (counter 타입 — swap 안 함)
+    pub fn snapshot(&self) -> PipelineSnapshot {
+        PipelineSnapshot {
+            pub_rtp_in:        self.pub_rtp_in.load(Ordering::Relaxed),
+            pub_rtp_gated:     self.pub_rtp_gated.load(Ordering::Relaxed),
+            pub_rtp_rewritten: self.pub_rtp_rewritten.load(Ordering::Relaxed),
+            pub_video_pending: self.pub_video_pending.load(Ordering::Relaxed),
+            sub_rtp_relayed:   self.sub_rtp_relayed.load(Ordering::Relaxed),
+            sub_rtp_dropped:   self.sub_rtp_dropped.load(Ordering::Relaxed),
+            sub_sr_relayed:    self.sub_sr_relayed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for PipelineStats {
+    fn default() -> Self { Self::new() }
+}
+
+/// PipelineStats의 순간 스냅샷 (plain values, JSON 직렬화용)
+pub struct PipelineSnapshot {
+    pub pub_rtp_in:        u64,
+    pub pub_rtp_gated:     u64,
+    pub pub_rtp_rewritten: u64,
+    pub pub_video_pending: u64,
+    pub sub_rtp_relayed:   u64,
+    pub sub_rtp_dropped:   u64,
+    pub sub_sr_relayed:    u64,
+}
+
+impl PipelineSnapshot {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pub_rtp_in":        self.pub_rtp_in,
+            "pub_rtp_gated":     self.pub_rtp_gated,
+            "pub_rtp_rewritten": self.pub_rtp_rewritten,
+            "pub_video_pending": self.pub_video_pending,
+            "sub_rtp_relayed":   self.sub_rtp_relayed,
+            "sub_rtp_dropped":   self.sub_rtp_dropped,
+            "sub_sr_relayed":    self.sub_sr_relayed,
+        })
+    }
+}
+
+// ============================================================================
 // EgressPacket — subscriber egress task에 전달할 plaintext 패킷
 // ============================================================================
 
@@ -259,6 +343,10 @@ pub struct Participant {
     // --- PLI burst cancel (Phase M-1) ---
     /// 진행 중인 PLI burst task의 AbortHandle (참가자 퇴장 시 cancel)
     pub pli_burst_handle: Mutex<Option<tokio::task::AbortHandle>>,
+
+    // --- Pipeline Stats (per-participant AI 진단용) ---
+    /// 파이프라인 구간별 통과량 카운터 (counter 타입, 누적)
+    pub pipeline: PipelineStats,
 }
 
 impl Participant {
@@ -296,6 +384,7 @@ impl Participant {
             egress_rx:  Mutex::new(Some(egress_rx)),
             rtx_budget_used: AtomicU64::new(0),
             pli_burst_handle: Mutex::new(None),
+            pipeline: PipelineStats::new(),
         }
     }
 

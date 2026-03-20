@@ -7,6 +7,34 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.6] - 2026-03-20
+
+### Added (Pipeline Stats: per-participant 파이프라인 카운터 — AI 진단 기반)
+
+#### participant.rs
+
+- `PipelineStats` 구조체 추가 — publisher/subscriber 관점 파이프라인 통과량 카운터 (7종)
+  - pub: `pub_rtp_in`, `pub_rtp_gated`, `pub_rtp_rewritten`, `pub_video_pending`
+  - sub: `sub_rtp_relayed`, `sub_rtp_dropped`, `sub_sr_relayed`
+- `PipelineSnapshot` + `to_json()` — flush 시 누적값 스냅샷 (counter 타입, swap 안 함)
+- `Participant.pipeline: PipelineStats` 필드 추가
+
+#### ingress.rs
+
+- 핫패스 6개 지점에 participant별 `fetch_add(1, Relaxed)` 계측 추가
+  - ingress 수신, PTT gate, PTT rewrite, PTT pending drop, egress relay, egress drop, SR relay
+
+#### transport/udp/mod.rs
+
+- `flush_metrics()`: room별→participant별 pipeline snapshot 수집 → `"pipeline"` 필드로 admin JSON에 포함
+- 각 participant에 `since` (joined_at) 첨부 — counter 누적 기준점
+
+#### admin (oxlens-home)
+
+- `state.js`: `pipelineRing` (Map) — per-participant delta 계산용 링버퍼
+- `app.js`: `processPipeline()` — counter 누적값에서 delta 계산 + 20슬롯 링버퍼 push
+- `snapshot.js`: `--- PIPELINE STATS ---` 섹션 추가 — total(+delta) + trend 출력
+
 ## [0.5.5] - 2026-03-13
 
 ### Added (Phase TV-2: 델타 기반 손실 분석 + 스냅샷 타임스탬프 + 세션 추적)

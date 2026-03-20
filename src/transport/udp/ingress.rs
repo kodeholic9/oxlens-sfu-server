@@ -150,6 +150,7 @@ impl UdpTransport {
 
         // Relay counter: publisher → 서버 RTP 수신 성공
         self.metrics.ingress_rtp_received.fetch_add(1, Ordering::Relaxed);
+        sender.pipeline.pub_rtp_in.fetch_add(1, Ordering::Relaxed);
 
         // [DBG:RTP] Parse RTP header for logging
         let rtp_hdr = parse_rtp_header(&plaintext);
@@ -215,6 +216,7 @@ impl UdpTransport {
             };
             if !allowed {
                 self.metrics.ptt_rtp_gated.fetch_add(1, Ordering::Relaxed);
+                sender.pipeline.pub_rtp_gated.fetch_add(1, Ordering::Relaxed);
                 if is_detail {
                     trace!("[DBG:PTT] RTP dropped user={} (not floor holder)", sender.user_id);
                 }
@@ -243,6 +245,7 @@ impl UdpTransport {
             match result {
                 RewriteResult::Ok => {
                     self.metrics.ptt_rtp_rewritten.fetch_add(1, Ordering::Relaxed);
+                    sender.pipeline.pub_rtp_rewritten.fetch_add(1, Ordering::Relaxed);
                     if rtp_hdr.pt == 111 {
                         self.metrics.ptt_audio_rewritten.fetch_add(1, Ordering::Relaxed);
                     } else if rtp_hdr.pt == 96 {
@@ -252,6 +255,7 @@ impl UdpTransport {
                 }
                 RewriteResult::PendingKeyframe => {
                     self.metrics.ptt_video_pending_drop.fetch_add(1, Ordering::Relaxed);
+                    sender.pipeline.pub_video_pending.fetch_add(1, Ordering::Relaxed);
                     if is_detail {
                         trace!("[DBG:PTT] video dropped (pending keyframe) user={} seq={}",
                             sender.user_id, rtp_hdr.seq);
@@ -290,8 +294,10 @@ impl UdpTransport {
                         target.user_id);
                 }
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+                target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -965,6 +971,7 @@ impl UdpTransport {
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.metrics.egress_rtcp_relayed.fetch_add(1, Ordering::Relaxed);
+                target.pipeline.sub_sr_relayed.fetch_add(1, Ordering::Relaxed);
             }
 
             if is_detail {
