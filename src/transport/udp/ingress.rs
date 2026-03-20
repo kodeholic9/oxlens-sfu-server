@@ -434,11 +434,16 @@ impl UdpTransport {
                 } else {
                     let mut video_buf = fanout_payload.to_vec();
                     let ok = sub.rewriter.rewrite(&mut video_buf, is_keyframe);
-                    (if ok { Some(video_buf) } else { None }, created)
+                    // PLI 자가 치유: rewrite 실패(키프레임 대기) + 재시도 시간 경과
+                    let retry_pli = !ok && sub.rewriter.needs_pli_retry();
+                    if created || retry_pli {
+                        sub.rewriter.mark_pli_sent();
+                    }
+                    (if ok { Some(video_buf) } else { None }, created || retry_pli)
                 }
             };
 
-            // PLI 교착 방지 대책 #1: SubscribeLayer 즉석 생성 시 PLI burst
+            // PLI: 즉석 생성 또는 자가 치유 재시도 → publisher에게 PLI burst (fan-out 회당 1회)
             if need_pli && !pli_sent {
                 pli_sent = true;
                 let h_ssrc = {
@@ -1028,12 +1033,19 @@ impl UdpTransport {
             let rtx_ssrc = match rtx_ssrc {
                 Some(s) => s,
                 None => {
-                    self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
-                    crate::agg_logger::inc_with(
-                        crate::agg_logger::agg_key(&["nack_no_rtx_ssrc", &room.id]),
-                        format!("nack_no_rtx_ssrc ssrc=0x{:08X} user={}", lookup_ssrc, subscriber.user_id),
-                        Some(&room.id),
-                    );
+                    // audio SSRC에 대한 NACK은 정상 (audio에 RTX 없음) — 노이즈 억제
+                    let is_audio = publisher.get_tracks().iter()
+                        .find(|t| t.ssrc == lookup_ssrc)
+                        .map(|t| t.kind == TrackKind::Audio)
+                        .unwrap_or(false);
+                    if !is_audio {
+                        self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
+                        crate::agg_logger::inc_with(
+                            crate::agg_logger::agg_key(&["nack_no_rtx_ssrc", &room.id]),
+                            format!("nack_no_rtx_ssrc ssrc=0x{:08X} user={}", lookup_ssrc, subscriber.user_id),
+                            Some(&room.id),
+                        );
+                    }
                     continue;
                 }
             };
