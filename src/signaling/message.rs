@@ -58,6 +58,9 @@ pub struct RoomCreateRequest {
     pub capacity: Option<usize>,
     #[serde(default)]
     pub mode: Option<RoomModeField>,
+    /// Simulcast 활성화 여부 (Conference 모드에서만 의미)
+    #[serde(default)]
+    pub simulcast: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,12 +78,18 @@ pub struct RoomLeaveRequest {
 #[derive(Debug, Deserialize)]
 pub struct PublishTracksRequest {
     pub tracks: Vec<PublishTrackItem>,
+    /// Chrome offerer가 할당한 TWCC extmap ID (simulcast 모드에서 클라이언트가 전달)
+    #[serde(default)]
+    pub twcc_extmap_id: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PublishTrackItem {
     pub kind: String,  // "audio" | "video"
     pub ssrc: u32,
+    /// Simulcast RTP stream ID ("h" | "l", None for non-simulcast)
+    #[serde(default)]
+    pub rid: Option<String>,
 }
 
 /// 트랙 mute/unmute 상태 변경 요청
@@ -169,4 +178,16 @@ pub struct TrackInfo {
     pub track_id: String,
     pub kind: String,
     pub ssrc: u32,
+}
+
+/// Simulcast 레이어 선택 요청 (Phase 3)
+#[derive(Debug, Deserialize)]
+pub struct SubscribeLayerRequest {
+    pub targets: Vec<SubscribeLayerTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubscribeLayerTarget {
+    pub user_id: String,  // publisher user_id
+    pub rid: String,      // "h", "l", "pause"
 }

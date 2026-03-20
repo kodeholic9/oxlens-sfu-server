@@ -293,10 +293,11 @@ fn detect_local_ip() -> String {
 
 /// 서버 기동 시 기본 방 생성 (테스트/개발용)
 fn create_default_rooms(state: &AppState) {
-    let defaults: [(&str, usize, config::RoomMode); 3] = [
-        ("무전 대화방", 10, config::RoomMode::Ptt),
-        ("회의실-2", 10, config::RoomMode::Conference),
-        ("대회의실", 20, config::RoomMode::Conference),
+    // (name, capacity, mode, simulcast)
+    let defaults: [(&str, usize, config::RoomMode, bool); 3] = [
+        ("무전 대화방", 10, config::RoomMode::Ptt, false),
+        ("회의실-2", 10, config::RoomMode::Conference, false),
+        ("대회의실", 20, config::RoomMode::Conference, true),
     ];
 
     let now = std::time::SystemTime::now()
@@ -304,9 +305,9 @@ fn create_default_rooms(state: &AppState) {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    for (name, capacity, mode) in defaults {
-        let room = state.rooms.create(name.to_string(), Some(capacity), mode, now);
-        info!("default room created: {} (id={}, cap={}, mode={})", name, room.id, capacity, room.mode);
+    for (name, capacity, mode, simulcast) in defaults {
+        let room = state.rooms.create(name.to_string(), Some(capacity), mode, now, simulcast);
+        info!("default room created: {} (id={}, cap={}, mode={}, simulcast={})", name, room.id, capacity, room.mode, room.simulcast_enabled);
     }
 }
 
@@ -430,27 +431,33 @@ async fn run_zombie_reaper(
             if let Ok(room) = rooms.get(&room_id) {
                 let tracks = zombie.get_tracks();
                 if !tracks.is_empty() {
-                    let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
-                        let mut j = serde_json::json!({
-                            "user_id": &zombie.user_id,
-                            "kind": t.kind.to_string(),
-                            "ssrc": t.ssrc,
-                            "track_id": &t.track_id,
-                        });
-                        if let Some(rs) = t.rtx_ssrc {
-                            j["rtx_ssrc"] = serde_json::json!(rs);
-                        }
-                        j
-                    }).collect();
-                    let tracks_event = Packet::new(
-                        opcode::TRACKS_UPDATE,
-                        0,
-                        serde_json::json!({
-                            "action": "remove",
-                            "tracks": remove_tracks,
-                        }),
-                    );
-                    broadcast_to_room_all(&room, &tracks_event);
+                    // Simulcast 방: rid="l" 트랙은 subscriber에게 안 보냈으니 remove에서도 제외
+                    let sim_enabled = room.simulcast_enabled;
+                    let remove_tracks: Vec<serde_json::Value> = tracks.iter()
+                        .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+                        .map(|t| {
+                            let mut j = serde_json::json!({
+                                "user_id": &zombie.user_id,
+                                "kind": t.kind.to_string(),
+                                "ssrc": t.ssrc,
+                                "track_id": &t.track_id,
+                            });
+                            if let Some(rs) = t.rtx_ssrc {
+                                j["rtx_ssrc"] = serde_json::json!(rs);
+                            }
+                            j
+                        }).collect();
+                    if !remove_tracks.is_empty() {
+                        let tracks_event = Packet::new(
+                            opcode::TRACKS_UPDATE,
+                            0,
+                            serde_json::json!({
+                                "action": "remove",
+                                "tracks": remove_tracks,
+                            }),
+                        );
+                        broadcast_to_room_all(&room, &tracks_event);
+                    }
                 }
 
                 let leave_event = Packet::new(

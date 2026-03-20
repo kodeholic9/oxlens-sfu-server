@@ -15,7 +15,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config;
 use crate::config::RoomMode;
-use crate::room::participant::{PcType, EgressPacket, TrackKind};
+use crate::room::participant::{PcType, EgressPacket, TrackKind, SimulcastRewriter, SubscribeLayerEntry};
 use crate::room::floor::FloorAction;
 use crate::room::room::Room;
 
@@ -190,7 +190,12 @@ impl UdpTransport {
         }
 
         // TWCC: transport-wide seq# 추출 + 도착 시간 기록
-        if let Some(twcc_seq) = twcc::parse_twcc_seq(&plaintext, config::TWCC_EXTMAP_ID) {
+        // client-offer 모드: Chrome이 할당한 extmap ID 사용 (0이면 서버 기본값 fallback)
+        let twcc_id = {
+            let cid = sender.twcc_extmap_id.load(Ordering::Relaxed);
+            if cid != 0 { cid } else { config::TWCC_EXTMAP_ID }
+        };
+        if let Some(twcc_seq) = twcc::parse_twcc_seq(&plaintext, twcc_id) {
             if let Ok(mut rec) = sender.twcc_recorder.lock() {
                 rec.record(twcc_seq, Instant::now());
                 self.metrics.twcc_recorded.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +278,7 @@ impl UdpTransport {
             plaintext.clone()
         };
 
-        // Phase W-3: egress 큐로 전달 (DashMap iter 직접 순회, Vec 할당 없음)
+        // Phase W-3: egress 큐로 전달
         if is_detail {
             let target_info: Vec<String> = room.participants.iter()
                 .filter(|e| e.key() != &sender.user_id && e.value().is_subscribe_ready())
@@ -284,20 +289,117 @@ impl UdpTransport {
                 seq_num, sender.user_id, target_info.join(", "));
         }
 
-        for entry in room.participants.iter() {
-            if entry.key() == &sender.user_id { continue; }
-            let target = entry.value();
-            if !target.is_subscribe_ready() { continue; }
-            if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
-                if self.metrics.egress_drop.load(Ordering::Relaxed) == 0 {
-                    warn!("[EGRESS:DIAG] queue_full user={} (backpressure drop)",
-                        target.user_id);
+        // Simulcast video fan-out: 레이어 선택 + SimulcastRewriter
+        if room.simulcast_enabled && rtp_hdr.pt == 96 {
+            let sender_rid = {
+                let tracks = sender.tracks.lock().unwrap();
+                tracks.iter()
+                    .find(|t| t.ssrc == rtp_hdr.ssrc)
+                    .and_then(|t| t.rid.clone())
+            };
+            let sender_rid = match sender_rid {
+                Some(r) => r,
+                None => return, // simulcast track이 아님
+            };
+
+            let is_keyframe = crate::room::ptt_rewriter::is_vp8_keyframe(&fanout_payload);
+            let vssrc = sender.ensure_simulcast_video_ssrc();
+            let mut pli_sent = false;
+
+            for entry in room.participants.iter() {
+                if entry.key() == &sender.user_id { continue; }
+                let target = entry.value();
+                if !target.is_subscribe_ready() { continue; }
+
+                let (forwarded_buf, need_pli) = {
+                    let mut layers = target.subscribe_layers.lock().unwrap();
+                    let mut created = false;
+                    let sub = layers.entry(sender.user_id.clone())
+                        .or_insert_with(|| {
+                            created = true;
+                            SubscribeLayerEntry {
+                                rid: "h".to_string(),
+                                rewriter: SimulcastRewriter::new(vssrc),
+                            }
+                        });
+
+                    if sub.rid == "pause" || sender_rid != sub.rid {
+                        (None, created)
+                    } else {
+                        let mut video_buf = fanout_payload.clone();
+                        let ok = sub.rewriter.rewrite(&mut video_buf, is_keyframe);
+                        (if ok { Some(video_buf) } else { None }, created)
+                    }
+                };
+
+                // PLI 교착 방지 대책 #1: SubscribeLayer 즉석 생성 시 PLI burst
+                if need_pli && !pli_sent {
+                    pli_sent = true;
+                    let h_ssrc = {
+                        let tracks = sender.tracks.lock().unwrap();
+                        tracks.iter()
+                            .find(|t| t.kind == TrackKind::Video && t.rid.as_deref() == Some("h"))
+                            .map(|t| t.ssrc)
+                    };
+                    if let (Some(ssrc), Some(pub_addr)) = (h_ssrc, sender.publish.get_address()) {
+                        if sender.is_publish_ready() {
+                            sender.cancel_pli_burst();
+                            let p = Arc::clone(&sender);
+                            let socket = self.socket.clone();
+                            let uid = sender.user_id.clone();
+                            let handle = tokio::spawn(async move {
+                                let delays = [0u64, 200, 500, 1500];
+                                for (i, &delay_ms) in delays.iter().enumerate() {
+                                    if delay_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    }
+                                    let pli_plain = super::rtcp::build_pli(ssrc);
+                                    let encrypted = {
+                                        let mut ctx = p.publish.outbound_srtp.lock().unwrap();
+                                        ctx.encrypt_rtcp(&pli_plain).ok()
+                                    };
+                                    if let Some(enc) = encrypted {
+                                        if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                                            warn!("[SIM:PLI] auto burst FAILED user={} #{}: {e}", uid, i);
+                                            break;
+                                        } else {
+                                            info!("[SIM:PLI] auto burst user={} ssrc=0x{:08X} #{}", uid, ssrc, i);
+                                        }
+                                    }
+                                }
+                            });
+                            *sender.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+                        }
+                    }
                 }
-                self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
-                target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
-                target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+
+                if let Some(buf) = forwarded_buf {
+                    if target.egress_tx.try_send(EgressPacket::Rtp(buf)).is_err() {
+                        self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+                        target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                        target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        } else {
+            // Normal fan-out (audio, non-simulcast video, PTT)
+            for entry in room.participants.iter() {
+                if entry.key() == &sender.user_id { continue; }
+                let target = entry.value();
+                if !target.is_subscribe_ready() { continue; }
+                if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
+                    if self.metrics.egress_drop.load(Ordering::Relaxed) == 0 {
+                        warn!("[EGRESS:DIAG] queue_full user={} (backpressure drop)",
+                            target.user_id);
+                    }
+                    self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+                    target.pipeline.sub_rtp_dropped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.metrics.egress_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                    target.pipeline.sub_rtp_relayed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -684,7 +786,23 @@ impl UdpTransport {
         let mut publisher_rtcp: HashMap<u32, Vec<&[u8]>> = HashMap::new();
         for block in &parsed.relay_blocks {
             if block.media_ssrc == 0 { continue; }
-            let effective_ssrc = if ptt_audio_vssrc == Some(block.media_ssrc)
+            // Simulcast: 가상 video SSRC → 현재 레이어 실제 SSRC 역매핑
+            let effective_ssrc = if room.simulcast_enabled {
+                if let Some(pub_p) = room.find_publisher_by_vssrc(block.media_ssrc) {
+                    let real_ssrc = {
+                        let layers = _subscriber.subscribe_layers.lock().unwrap();
+                        layers.get(&pub_p.user_id).and_then(|entry| {
+                            let tracks = pub_p.tracks.lock().unwrap();
+                            tracks.iter()
+                                .find(|t| t.kind == TrackKind::Video && t.rid.as_deref() == Some(&entry.rid))
+                                .map(|t| t.ssrc)
+                        })
+                    };
+                    real_ssrc.unwrap_or(block.media_ssrc)
+                } else {
+                    block.media_ssrc
+                }
+            } else if ptt_audio_vssrc == Some(block.media_ssrc)
                 || ptt_video_vssrc == Some(block.media_ssrc) {
                 let is_video = ptt_video_vssrc == Some(block.media_ssrc);
                 // current_speaker → last_speaker fallback (release 직후 PLI 대응)
@@ -790,7 +908,32 @@ impl UdpTransport {
                     subscriber.user_id, nack.media_ssrc, nack.pid, nack.blp, lost_seqs);
             }
 
-            let (lookup_ssrc, cache_seqs) = if ptt_virtual_video_ssrc == Some(nack.media_ssrc) {
+            let (lookup_ssrc, cache_seqs) = if room.simulcast_enabled {
+                // Simulcast: 가상 SSRC/seq → 실제 SSRC/seq 역매핑
+                if let Some(pub_p) = room.find_publisher_by_vssrc(nack.media_ssrc) {
+                    let (real_ssrc, real_seqs) = {
+                        let layers = subscriber.subscribe_layers.lock().unwrap();
+                        if let Some(entry) = layers.get(&pub_p.user_id) {
+                            let seqs: Vec<u16> = lost_seqs.iter()
+                                .map(|&vs| entry.rewriter.reverse_seq(vs))
+                                .collect();
+                            let ssrc = {
+                                let tracks = pub_p.tracks.lock().unwrap();
+                                tracks.iter()
+                                    .find(|t| t.kind == TrackKind::Video && t.rid.as_deref() == Some(&entry.rid))
+                                    .map(|t| t.ssrc)
+                                    .unwrap_or(nack.media_ssrc)
+                            };
+                            (ssrc, seqs)
+                        } else {
+                            (nack.media_ssrc, lost_seqs.clone())
+                        }
+                    };
+                    (real_ssrc, real_seqs)
+                } else {
+                    (nack.media_ssrc, lost_seqs.clone())
+                }
+            } else if ptt_virtual_video_ssrc == Some(nack.media_ssrc) {
                 self.metrics.ptt_nack_remapped.fetch_add(1, Ordering::Relaxed);
                 let original_seqs: Vec<u16> = lost_seqs.iter()
                     .map(|&vs| room.video_rewriter.reverse_seq(vs))
@@ -1037,7 +1180,29 @@ impl UdpTransport {
                 octet_count: oct,
             }
         } else {
-            // Conference: SSRC/RTP ts 원본, counts만 egress 기준
+            // Simulcast video: real SSRC → virtual SSRC 변환 + send_stats 조회
+            if room.simulcast_enabled {
+                let is_video = {
+                    let tracks = sender.tracks.lock().unwrap();
+                    tracks.iter().any(|t| t.ssrc == pub_ssrc && t.kind == TrackKind::Video)
+                };
+                if is_video {
+                    let vssrc = sender.ensure_simulcast_video_ssrc();
+                    let (pkt, oct) = {
+                        let stats_map = target.send_stats.lock().unwrap();
+                        stats_map.get(&vssrc)
+                            .map(|s| (s.packets_sent, s.bytes_sent))
+                            .unwrap_or((0, 0))
+                    };
+                    return rtcp_terminator::SrTranslation {
+                        ssrc: Some(vssrc),
+                        rtp_ts: None,
+                        packet_count: pkt,
+                        octet_count: oct,
+                    };
+                }
+            }
+            // Non-simulcast 또는 audio: 기존 동작
             let (pkt, oct) = {
                 let stats_map = target.send_stats.lock().unwrap();
                 stats_map.get(&pub_ssrc)

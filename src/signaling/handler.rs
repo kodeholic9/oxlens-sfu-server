@@ -25,7 +25,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config;
 use crate::config::RoomMode;
-use crate::room::participant::{EgressPacket, Participant, TrackKind};
+use crate::room::participant::{EgressPacket, Participant, TrackKind, SimulcastRewriter, SubscribeLayerEntry};
 use crate::room::floor::FloorAction;
 use crate::signaling::message::*;
 use crate::signaling::opcode;
@@ -195,6 +195,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::FLOOR_REQUEST   => Some(handle_floor_request(session, state, &packet).await),
         opcode::FLOOR_RELEASE   => Some(handle_floor_release(session, state, &packet).await),
         opcode::FLOOR_PING      => Some(handle_floor_ping(session, state, &packet)),
+        opcode::SUBSCRIBE_LAYER => Some(handle_subscribe_layer(session, state, &packet).await),
         _ => {
             warn!("unknown opcode: {}", packet.op);
             Some(Packet::err(packet.op, packet.pid, 3001, "invalid opcode"))
@@ -262,14 +263,16 @@ fn handle_room_create(state: &AppState, packet: &Packet) -> Packet {
 
     let now = current_ts();
     let mode = req.mode.unwrap_or(RoomModeField::Conference).to_config();
-    let room = state.rooms.create(req.name.clone(), req.capacity, mode, now);
-    info!("ROOM_CREATE id={} name={} mode={}", room.id, room.name, room.mode);
+    let simulcast = req.simulcast.unwrap_or(false);
+    let room = state.rooms.create(req.name.clone(), req.capacity, mode, now, simulcast);
+    info!("ROOM_CREATE id={} name={} mode={} simulcast={}", room.id, room.name, room.mode, room.simulcast_enabled);
 
     Packet::ok(opcode::ROOM_CREATE, packet.pid, serde_json::json!({
         "room_id": room.id,
         "name": room.name,
         "capacity": room.capacity,
         "mode": room.mode.to_string(),
+        "simulcast": room.simulcast_enabled,
     }))
 }
 
@@ -321,24 +324,29 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
         user_id, req.room_id, pub_ice.ufrag, sub_ice.ufrag);
 
     // Collect existing participants' tracks for the new joiner (rtx_ssrc 포함)
+    // Simulcast 방: rid="l" 트랙은 subscriber에게 노출하지 않음 (video m-line 1개만 보이도록)
+    let sim_enabled = room.simulcast_enabled;
     let others = room.other_participants(&user_id);
-    let existing_tracks: Vec<serde_json::Value> = others
+    let mut existing_tracks: Vec<serde_json::Value> = others
         .iter()
         .flat_map(|p| {
-            p.get_tracks().into_iter().map(|t| {
-                let mut j = serde_json::json!({
-                    "user_id": p.user_id,
-                    "kind": t.kind.to_string(),
-                    "ssrc": t.ssrc,
-                    "track_id": t.track_id,
-                });
-                if let Some(rs) = t.rtx_ssrc {
-                    j["rtx_ssrc"] = serde_json::json!(rs);
-                }
-                j
-            })
+            p.get_tracks().into_iter()
+                .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+                .map(|t| {
+                    let mut j = serde_json::json!({
+                        "user_id": p.user_id,
+                        "kind": t.kind.to_string(),
+                        "ssrc": t.ssrc,
+                        "track_id": t.track_id,
+                    });
+                    if let Some(rs) = t.rtx_ssrc {
+                        j["rtx_ssrc"] = serde_json::json!(rs);
+                    }
+                    j
+                })
         })
         .collect();
+    simulcast_replace_video_ssrc(&mut existing_tracks, &room);
 
     // P1: existing_tracks 상세 로그 — subscribe 누락 추적용
     let per_user: Vec<String> = others
@@ -385,10 +393,13 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
                 "setup": "passive",
             },
             "codecs": server_codec_policy(),
-            "extmap": server_extmap_policy(state.bwe_mode),
+            "extmap": server_extmap_policy(state.bwe_mode, sim_enabled),
             "max_bitrate_bps": config::resolve_remb_bitrate(),
         },
         "tracks": existing_tracks,
+        "simulcast": {
+            "enabled": sim_enabled,
+        },
     });
 
     // Phase E-5: PTT 모드 — 가상 SSRC + 현재 floor 상태
@@ -443,24 +454,29 @@ async fn handle_room_sync(session: &Session, state: &AppState, packet: &Packet) 
             }),
         ]
     } else {
-        // Conference: 다른 참여자들의 실제 트랙
-        room.other_participants(user_id)
+        // Conference: 다른 참여자들의 실제 트랙 (simulcast 방은 rid="l" 제외, video는 가상 SSRC)
+        let sim_enabled = room.simulcast_enabled;
+        let mut tracks: Vec<serde_json::Value> = room.other_participants(user_id)
             .iter()
             .flat_map(|p| {
-                p.get_tracks().into_iter().map(|t| {
-                    let mut j = serde_json::json!({
-                        "user_id": p.user_id,
-                        "kind": t.kind.to_string(),
-                        "ssrc": t.ssrc,
-                        "track_id": t.track_id,
-                    });
-                    if let Some(rs) = t.rtx_ssrc {
-                        j["rtx_ssrc"] = serde_json::json!(rs);
-                    }
-                    j
-                })
+                p.get_tracks().into_iter()
+                    .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+                    .map(|t| {
+                        let mut j = serde_json::json!({
+                            "user_id": p.user_id,
+                            "kind": t.kind.to_string(),
+                            "ssrc": t.ssrc,
+                            "track_id": t.track_id,
+                        });
+                        if let Some(rs) = t.rtx_ssrc {
+                            j["rtx_ssrc"] = serde_json::json!(rs);
+                        }
+                        j
+                    })
             })
-            .collect()
+            .collect();
+        simulcast_replace_video_ssrc(&mut tracks, &room);
+        tracks
     };
 
     let participants: Vec<String> = room.member_ids();
@@ -482,6 +498,122 @@ async fn handle_room_sync(session: &Session, state: &AppState, packet: &Packet) 
         "floor": floor,
         "total": participants.len(),
     }))
+}
+
+// ============================================================================
+// SUBSCRIBE_LAYER — Simulcast 레이어 선택 (Phase 3)
+// ============================================================================
+
+async fn handle_subscribe_layer(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: SubscribeLayerRequest = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::SUBSCRIBE_LAYER, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room_id = match &session.current_room {
+        Some(r) => r,
+        None => return Packet::err(opcode::SUBSCRIBE_LAYER, packet.pid, 2004, "not in room"),
+    };
+    let room = match state.rooms.get(room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::SUBSCRIBE_LAYER, packet.pid, 2001, "room not found"),
+    };
+
+    if !room.simulcast_enabled {
+        return Packet::err(opcode::SUBSCRIBE_LAYER, packet.pid, 2030, "simulcast not enabled");
+    }
+
+    let subscriber = match room.get_participant(user_id) {
+        Some(p) => p,
+        None => return Packet::err(opcode::SUBSCRIBE_LAYER, packet.pid, 2004, "not in room"),
+    };
+
+    for target in &req.targets {
+        let publisher = match room.get_participant(&target.user_id) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let vssrc = publisher.ensure_simulcast_video_ssrc();
+
+        let need_pli = {
+            let mut layers = subscriber.subscribe_layers.lock().unwrap();
+            // NLL 안전: 불변 참조를 블록 내에서 소분
+            let (old_rid, old_initialized) = {
+                let old = layers.get(&target.user_id);
+                (old.map(|e| e.rid.clone()), old.map(|e| e.rewriter.initialized).unwrap_or(false))
+            };
+
+            let entry = layers.entry(target.user_id.clone())
+                .or_insert_with(|| SubscribeLayerEntry {
+                    rid: target.rid.clone(),
+                    rewriter: SimulcastRewriter::new(vssrc),
+                });
+
+            if old_rid.as_deref() == Some(&target.rid) {
+                // Same layer — PLI if not initialized (PLI 교착 방지 대책 #2)
+                !old_initialized && target.rid != "pause"
+            } else {
+                // Layer change
+                entry.rid = target.rid.clone();
+                if target.rid != "pause" {
+                    entry.rewriter.switch_layer();
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if need_pli {
+            // publisher의 target rid 레이어 video SSRC 찾아서 PLI burst
+            let video_ssrc = {
+                let tracks = publisher.tracks.lock().unwrap();
+                tracks.iter()
+                    .find(|t| t.kind == TrackKind::Video && t.rid.as_deref() == Some(&target.rid))
+                    .map(|t| t.ssrc)
+            };
+            if let (Some(ssrc), Some(pub_addr)) = (video_ssrc, publisher.publish.get_address()) {
+                if publisher.is_publish_ready() {
+                    publisher.cancel_pli_burst();
+                    let p = Arc::clone(&publisher);
+                    let socket = state.udp_socket.clone();
+                    let uid = target.user_id.clone();
+                    let rid = target.rid.clone();
+                    let handle = tokio::spawn(async move {
+                        let delays = [0u64, 200, 500, 1500];
+                        for (i, &delay_ms) in delays.iter().enumerate() {
+                            if delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+                            let pli_plain = crate::transport::udp::build_pli(ssrc);
+                            let encrypted = {
+                                let mut ctx = p.publish.outbound_srtp.lock().unwrap();
+                                ctx.encrypt_rtcp(&pli_plain).ok()
+                            };
+                            if let Some(enc) = encrypted {
+                                if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                                    warn!("[SIM:PLI] send FAILED user={} rid={} ssrc=0x{:08X} #{}: {e}",
+                                        uid, rid, ssrc, i);
+                                    break;
+                                } else {
+                                    info!("[SIM:PLI] sent user={} rid={} ssrc=0x{:08X} #{}",
+                                        uid, rid, ssrc, i);
+                                }
+                            }
+                        }
+                    });
+                    *publisher.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+                }
+            }
+        }
+
+        info!("SUBSCRIBE_LAYER subscriber={} publisher={} rid={} need_pli={}",
+            user_id, target.user_id, target.rid, need_pli);
+    }
+
+    Packet::ok(opcode::SUBSCRIBE_LAYER, packet.pid, serde_json::json!({}))
 }
 
 // ============================================================================
@@ -510,9 +642,17 @@ async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Pac
         None => return Packet::err(opcode::PUBLISH_TRACKS, packet.pid, 2004, "not in room"),
     };
 
+    // Store twcc_extmap_id if provided (client-offer simulcast mode)
+    if let Some(twcc_id) = req.twcc_extmap_id {
+        participant.twcc_extmap_id.store(twcc_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    let sim_enabled = room.simulcast_enabled;
+
     // Register tracks on participant
     let mut track_id_counter = participant.get_tracks().len();
     let mut new_tracks = Vec::new();
+    let mut simulcast_group_counter = 0u32;
     for t in &req.tracks {
         let kind = match t.kind.as_str() {
             "audio" => TrackKind::Audio,
@@ -521,7 +661,15 @@ async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Pac
         };
         let track_id = format!("{}_{}", user_id, track_id_counter);
         track_id_counter += 1;
-        participant.add_track(t.ssrc, kind.clone(), track_id.clone());
+
+        // Simulcast: rid가 있으면 add_track_ext, 없으면 기존 add_track (하위호환)
+        if let Some(ref rid) = t.rid {
+            let group = if rid == "h" { simulcast_group_counter } else { simulcast_group_counter };
+            if rid == "l" { simulcast_group_counter += 1; } // h 후 l 순서로 등록된다고 가정
+            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), Some(rid.clone()), Some(group));
+        } else {
+            participant.add_track(t.ssrc, kind.clone(), track_id.clone());
+        }
 
         // add_track 후 등록된 트랙에서 rtx_ssrc 가져오기
         let rtx_ssrc = participant.get_tracks().iter()
@@ -537,22 +685,37 @@ async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Pac
         if let Some(rs) = rtx_ssrc {
             track_json["rtx_ssrc"] = serde_json::json!(rs);
         }
+        if let Some(ref rid) = t.rid {
+            track_json["rid"] = serde_json::json!(rid);
+        }
         new_tracks.push(track_json);
     }
 
-    info!("PUBLISH_TRACKS user={} count={}", user_id, new_tracks.len());
+    info!("PUBLISH_TRACKS user={} count={} simulcast={}", user_id, new_tracks.len(), sim_enabled);
 
     // Broadcast tracks_update to other participants
+    // Simulcast 방: rid="l" 트랙은 subscriber에게 빠짐 (video m-line 1개만 보이도록)
     if !new_tracks.is_empty() {
-        let tracks_event = Packet::new(
-            opcode::TRACKS_UPDATE,
-            0,
-            serde_json::json!({
-                "action": "add",
-                "tracks": new_tracks,
-            }),
-        );
-        broadcast_to_others(&room, user_id, &tracks_event);
+        let mut broadcast_tracks: Vec<serde_json::Value> = if sim_enabled {
+            new_tracks.iter()
+                .filter(|j| j.get("rid").and_then(|v| v.as_str()) != Some("l"))
+                .cloned()
+                .collect()
+        } else {
+            new_tracks.clone()
+        };
+        simulcast_replace_video_ssrc(&mut broadcast_tracks, &room);
+        if !broadcast_tracks.is_empty() {
+            let tracks_event = Packet::new(
+                opcode::TRACKS_UPDATE,
+                0,
+                serde_json::json!({
+                    "action": "add",
+                    "tracks": broadcast_tracks,
+                }),
+            );
+            broadcast_to_others(&room, user_id, &tracks_event);
+        }
     }
 
     Packet::ok(opcode::PUBLISH_TRACKS, packet.pid, serde_json::json!({
@@ -590,9 +753,18 @@ async fn handle_tracks_ack(session: &Session, state: &AppState, packet: &Packet)
         set
     } else {
         // Conference: 다른 참가자들의 primary SSRC (RTX 제외)
+        // Simulcast: video는 가상 SSRC, rid="l" 제외
+        let sim = room.simulcast_enabled;
         room.other_participants(user_id)
             .iter()
-            .flat_map(|p| p.get_tracks().into_iter().map(|t| t.ssrc))
+            .flat_map(|p| {
+                let vssrc = if sim { p.ensure_simulcast_video_ssrc() } else { 0 };
+                p.get_tracks().into_iter()
+                    .filter(move |t| !(sim && t.rid.as_deref() == Some("l")))
+                    .map(move |t| {
+                        if sim && t.kind == TrackKind::Video { vssrc } else { t.ssrc }
+                    })
+            })
             .collect()
     };
 
@@ -630,11 +802,14 @@ async fn handle_tracks_ack(session: &Session, state: &AppState, packet: &Packet)
             }),
         ]
     } else {
-        // Conference: 다른 참가자들의 전체 트랙 목록
-        room.other_participants(user_id)
+        // Conference: 다른 참가자들의 전체 트랙 목록 (simulcast: rid="l" 제외, video→가상 SSRC)
+        let sim = room.simulcast_enabled;
+        let mut resync: Vec<serde_json::Value> = room.other_participants(user_id)
             .iter()
             .flat_map(|p| {
-                p.get_tracks().into_iter().map(|t| {
+                p.get_tracks().into_iter()
+                    .filter(|t| !(sim && t.rid.as_deref() == Some("l")))
+                    .map(|t| {
                     let mut j = serde_json::json!({
                         "user_id": p.user_id,
                         "kind": t.kind.to_string(),
@@ -647,7 +822,9 @@ async fn handle_tracks_ack(session: &Session, state: &AppState, packet: &Packet)
                     j
                 })
             })
-            .collect()
+            .collect();
+        simulcast_replace_video_ssrc(&mut resync, &room);
+        resync
     };
 
     // Send TRACKS_RESYNC to this client
@@ -900,28 +1077,36 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
             // Notify remaining: participant_left + tracks_update(remove)
             if let Ok(room) = state.rooms.get(&req.room_id) {
                 let tracks = p.get_tracks();
+                let vssrc_leave = p.simulcast_video_ssrc.load(std::sync::atomic::Ordering::Relaxed);
                 if !tracks.is_empty() {
-                    let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
-                        let mut j = serde_json::json!({
-                            "user_id": user_id,
-                            "kind": t.kind.to_string(),
-                            "ssrc": t.ssrc,
-                            "track_id": t.track_id,
-                        });
-                        if let Some(rs) = t.rtx_ssrc {
-                            j["rtx_ssrc"] = serde_json::json!(rs);
-                        }
-                        j
-                    }).collect();
-                    let tracks_event = Packet::new(
-                        opcode::TRACKS_UPDATE,
-                        0,
-                        serde_json::json!({
-                            "action": "remove",
-                            "tracks": remove_tracks,
-                        }),
-                    );
-                    broadcast_to_room(&room, &tracks_event);
+                    // Simulcast 방: rid="l" 트랙은 subscriber에게 안 보냈으니 remove에서도 제외
+                    let sim_enabled = room.simulcast_enabled;
+                    let mut remove_tracks: Vec<serde_json::Value> = tracks.iter()
+                        .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+                        .map(|t| {
+                            let mut j = serde_json::json!({
+                                "user_id": user_id,
+                                "kind": t.kind.to_string(),
+                                "ssrc": t.ssrc,
+                                "track_id": t.track_id,
+                            });
+                            if let Some(rs) = t.rtx_ssrc {
+                                j["rtx_ssrc"] = serde_json::json!(rs);
+                            }
+                            j
+                        }).collect();
+                    simulcast_replace_video_ssrc_direct(&mut remove_tracks, sim_enabled, vssrc_leave);
+                    if !remove_tracks.is_empty() {
+                        let tracks_event = Packet::new(
+                            opcode::TRACKS_UPDATE,
+                            0,
+                            serde_json::json!({
+                                "action": "remove",
+                                "tracks": remove_tracks,
+                            }),
+                        );
+                        broadcast_to_room(&room, &tracks_event);
+                    }
                 }
 
                 let event = Packet::new(
@@ -1237,41 +1422,47 @@ async fn cleanup(session: &Session, state: &AppState) {
         }
 
         // Get tracks before removing (for tracks_update broadcast)
-        let tracks = if let Ok(room) = state.rooms.get(room_id) {
+        let (tracks, sim_vssrc) = if let Ok(room) = state.rooms.get(room_id) {
             if let Some(p) = room.get_participant(user_id) {
-                p.get_tracks()
+                (p.get_tracks(), p.simulcast_video_ssrc.load(std::sync::atomic::Ordering::Relaxed))
             } else {
-                vec![]
+                (vec![], 0)
             }
         } else {
-            vec![]
+            (vec![], 0)
         };
 
         // Notify others before removing
         if let Ok(room) = state.rooms.get(room_id) {
-            // tracks_update(remove)
+            // tracks_update(remove) — simulcast 방은 rid="l" 제외
             if !tracks.is_empty() {
-                let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
-                    let mut j = serde_json::json!({
-                        "user_id": user_id,
-                        "kind": t.kind.to_string(),
-                        "ssrc": t.ssrc,
-                        "track_id": t.track_id,
-                    });
-                    if let Some(rs) = t.rtx_ssrc {
-                        j["rtx_ssrc"] = serde_json::json!(rs);
-                    }
-                    j
-                }).collect();
-                let tracks_event = Packet::new(
-                    opcode::TRACKS_UPDATE,
-                    0,
-                    serde_json::json!({
-                        "action": "remove",
-                        "tracks": remove_tracks,
-                    }),
-                );
-                broadcast_to_others(&room, user_id, &tracks_event);
+                let sim_enabled = room.simulcast_enabled;
+                let mut remove_tracks: Vec<serde_json::Value> = tracks.iter()
+                    .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+                    .map(|t| {
+                        let mut j = serde_json::json!({
+                            "user_id": user_id,
+                            "kind": t.kind.to_string(),
+                            "ssrc": t.ssrc,
+                            "track_id": t.track_id,
+                        });
+                        if let Some(rs) = t.rtx_ssrc {
+                            j["rtx_ssrc"] = serde_json::json!(rs);
+                        }
+                        j
+                    }).collect();
+                simulcast_replace_video_ssrc_direct(&mut remove_tracks, sim_enabled, sim_vssrc);
+                if !remove_tracks.is_empty() {
+                    let tracks_event = Packet::new(
+                        opcode::TRACKS_UPDATE,
+                        0,
+                        serde_json::json!({
+                            "action": "remove",
+                            "tracks": remove_tracks,
+                        }),
+                    );
+                    broadcast_to_others(&room, user_id, &tracks_event);
+                }
             }
 
             let event = Packet::new(
@@ -1323,7 +1514,7 @@ fn server_codec_policy() -> serde_json::Value {
     ])
 }
 
-fn server_extmap_policy(bwe_mode: config::BweMode) -> serde_json::Value {
+fn server_extmap_policy(bwe_mode: config::BweMode, simulcast_enabled: bool) -> serde_json::Value {
     // BWE 모드에 따라 transport-wide-cc extmap 포함 여부 결정
     // TWCC: extmap id=6 포함 → Chrome GCC delay gradient 기반 적응적 BWE
     // REMB: extmap id=6 제외 → Chrome REMB 모드, 서버 고정 REMB 힌트
@@ -1334,6 +1525,11 @@ fn server_extmap_policy(bwe_mode: config::BweMode) -> serde_json::Value {
     ];
     if bwe_mode == config::BweMode::Twcc {
         exts.push(serde_json::json!({ "id": 6, "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01" }));
+    }
+    // Simulcast: rtp-stream-id + repaired-rtp-stream-id (rid 식별용)
+    if simulcast_enabled {
+        exts.push(serde_json::json!({ "id": 10, "uri": "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id" }));
+        exts.push(serde_json::json!({ "id": 11, "uri": "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id" }));
     }
     serde_json::Value::Array(exts)
 }
@@ -1372,6 +1568,35 @@ fn rand_u16() -> u16 {
     let mut buf = [0u8; 2];
     getrandom::fill(&mut buf).expect("getrandom failed");
     u16::from_le_bytes(buf)
+}
+
+/// Simulcast 방에서 video 트랙의 SSRC를 가상 SSRC로 교체 + rid 제거
+/// subscriber에게 단일 video m-line만 보이도록 함
+fn simulcast_replace_video_ssrc(tracks: &mut [serde_json::Value], room: &crate::room::room::Room) {
+    if !room.simulcast_enabled { return; }
+    for t in tracks.iter_mut() {
+        if t.get("kind").and_then(|v| v.as_str()) != Some("video") { continue; }
+        let user_id = match t.get("user_id").and_then(|v| v.as_str()) {
+            Some(uid) => uid.to_string(),
+            None => continue,
+        };
+        if let Some(p) = room.get_participant(&user_id) {
+            let vssrc = p.ensure_simulcast_video_ssrc();
+            t["ssrc"] = serde_json::json!(vssrc);
+            trace!("[SIM] replaced video ssrc → virtual 0x{:08X} for user={}", vssrc, user_id);
+        }
+        if let Some(obj) = t.as_object_mut() { obj.remove("rid"); }
+    }
+}
+
+/// ROOM_LEAVE/cleanup용: 이미 제거된 participant의 가상 SSRC로 video 트랙 교체
+fn simulcast_replace_video_ssrc_direct(tracks: &mut [serde_json::Value], sim_enabled: bool, vssrc: u32) {
+    if !sim_enabled || vssrc == 0 { return; }
+    for t in tracks.iter_mut() {
+        if t.get("kind").and_then(|v| v.as_str()) != Some("video") { continue; }
+        t["ssrc"] = serde_json::json!(vssrc);
+        if let Some(obj) = t.as_object_mut() { obj.remove("rid"); }
+    }
 }
 
 fn current_ts() -> u64 {
@@ -1504,6 +1729,7 @@ fn build_rooms_snapshot(state: &AppState) -> serde_json::Value {
                 "name": &room.name,
                 "capacity": room.capacity,
                 "mode": room.mode.to_string(),
+                "simulcast": room.simulcast_enabled,
                 "created_at": room.created_at,
                 "participants": participants,
             });

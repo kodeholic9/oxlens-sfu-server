@@ -11,7 +11,7 @@
 //! latching 후에는 sockaddr → (user_id, PcType) 매핑으로 O(1) 식별.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::trace;
@@ -107,6 +107,103 @@ impl PipelineSnapshot {
 }
 
 // ============================================================================
+// SimulcastRewriter — subscriber별 가상 SSRC rewrite (Phase 3)
+// ============================================================================
+
+/// Simulcast 레이어 전환 시 SSRC/seq/ts를 가상 값으로 rewrite.
+/// subscriber는 항상 단일 virtual_ssrc만 보므로 Chrome SDP 매칭 보장.
+///
+/// 시맨틱:
+///   initialized=false + P-frame  → Drop (키프레임부터 시작)
+///   initialized=false + 키프레임 → offset=0, initialized=true → Pass
+///   pending_keyframe  + P-frame  → Drop
+///   pending_keyframe  + 키프레임 → offset 재계산 → Pass
+///   normal            → SSRC/seq/ts rewrite → Pass
+pub struct SimulcastRewriter {
+    pub virtual_ssrc: u32,
+    seq_offset: u16,
+    ts_offset: u32,
+    last_out_seq: u16,
+    last_out_ts: u32,
+    pub pending_keyframe: bool,
+    pub initialized: bool,
+}
+
+impl SimulcastRewriter {
+    pub fn new(virtual_ssrc: u32) -> Self {
+        Self {
+            virtual_ssrc,
+            seq_offset: 0,
+            ts_offset: 0,
+            last_out_seq: 0,
+            last_out_ts: 0,
+            pending_keyframe: false,
+            initialized: false,
+        }
+    }
+
+    /// 레이어 전환: 키프레임 도착까지 모든 패킷 드롭
+    pub fn switch_layer(&mut self) {
+        self.pending_keyframe = true;
+    }
+
+    /// RTP 패킷 rewrite. buf를 in-place 수정 (SSRC/seq/ts).
+    /// Returns true if packet should be forwarded, false if dropped.
+    pub fn rewrite(&mut self, buf: &mut [u8], is_keyframe: bool) -> bool {
+        if buf.len() < 12 { return false; }
+
+        let input_seq = u16::from_be_bytes([buf[2], buf[3]]);
+        let input_ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        if !self.initialized {
+            if !is_keyframe { return false; }
+            // 첫 키프레임: offset 0으로 시작
+            self.seq_offset = 0;
+            self.ts_offset = 0;
+            self.initialized = true;
+            self.pending_keyframe = false;
+        } else if self.pending_keyframe {
+            if !is_keyframe { return false; }
+            // 레이어 전환 키프레임: seq/ts 연속 보장을 위한 offset 재계산
+            let target_seq = self.last_out_seq.wrapping_add(1);
+            self.seq_offset = target_seq.wrapping_sub(input_seq);
+            let target_ts = self.last_out_ts.wrapping_add(1);
+            self.ts_offset = target_ts.wrapping_sub(input_ts);
+            self.pending_keyframe = false;
+        }
+
+        // Apply offsets
+        let out_seq = input_seq.wrapping_add(self.seq_offset);
+        let out_ts = input_ts.wrapping_add(self.ts_offset);
+
+        // Write virtual SSRC
+        buf[8..12].copy_from_slice(&self.virtual_ssrc.to_be_bytes());
+        // Write rewritten seq
+        buf[2..4].copy_from_slice(&out_seq.to_be_bytes());
+        // Write rewritten ts
+        buf[4..8].copy_from_slice(&out_ts.to_be_bytes());
+
+        self.last_out_seq = out_seq;
+        self.last_out_ts = out_ts;
+
+        true
+    }
+
+    /// 가상 seq → 실제 seq 역매핑 (NACK용, best-effort)
+    pub fn reverse_seq(&self, virtual_seq: u16) -> u16 {
+        virtual_seq.wrapping_sub(self.seq_offset)
+    }
+}
+
+/// Subscriber별 특정 publisher에 대한 레이어 구독 상태
+pub struct SubscribeLayerEntry {
+    /// 구독 중인 레이어: "h", "l", "pause"
+    pub rid: String,
+    /// 가상 SSRC rewriter
+    pub rewriter: SimulcastRewriter,
+}
+
+// ============================================================================
 // EgressPacket — subscriber egress task에 전달할 plaintext 패킷
 // ============================================================================
 
@@ -169,6 +266,10 @@ pub struct Track {
     pub rtx_ssrc: Option<u32>,
     /// mute 상태 (true = 송신 중단)
     pub muted: bool,
+    /// Simulcast RTP stream ID ("h" | "l", None for non-simulcast)
+    pub rid: Option<String>,
+    /// Simulcast 그룹 ID (같은 소스의 h/l 레이어는 동일 group)
+    pub simulcast_group: Option<u32>,
 }
 
 // ============================================================================
@@ -344,6 +445,14 @@ pub struct Participant {
     /// 진행 중인 PLI burst task의 AbortHandle (참가자 퇴장 시 cancel)
     pub pli_burst_handle: Mutex<Option<tokio::task::AbortHandle>>,
 
+    // --- Simulcast ---
+    /// Chrome offerer가 할당한 TWCC extmap ID (client-offer 모드에서 전달받음)
+    pub twcc_extmap_id: AtomicU8,
+    /// Publisher별 고정 가상 video SSRC (simulcast 전용, 0=미할당)
+    pub simulcast_video_ssrc: AtomicU32,
+    /// Subscriber별 레이어 구독 상태 (key = publisher user_id)
+    pub subscribe_layers: Mutex<HashMap<String, SubscribeLayerEntry>>,
+
     // --- Pipeline Stats (per-participant AI 진단용) ---
     /// 파이프라인 구간별 통과량 카운터 (counter 타입, 누적)
     pub pipeline: PipelineStats,
@@ -384,6 +493,9 @@ impl Participant {
             egress_rx:  Mutex::new(Some(egress_rx)),
             rtx_budget_used: AtomicU64::new(0),
             pli_burst_handle: Mutex::new(None),
+            twcc_extmap_id: AtomicU8::new(0),
+            simulcast_video_ssrc: AtomicU32::new(0),
+            subscribe_layers: Mutex::new(HashMap::new()),
             pipeline: PipelineStats::new(),
         }
     }
@@ -409,8 +521,23 @@ impl Participant {
             } else {
                 None
             };
-            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false });
+            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid: None, simulcast_group: None });
             trace!("track added ssrc={} rtx_ssrc={:?} user={}", ssrc, rtx_ssrc, self.user_id);
+        }
+    }
+
+    /// Simulcast rid/simulcast_group 포함 트랙 등록
+    pub fn add_track_ext(&self, ssrc: u32, kind: TrackKind, track_id: String, rid: Option<String>, simulcast_group: Option<u32>) {
+        let mut tracks = self.tracks.lock().unwrap();
+        if !tracks.iter().any(|t| t.ssrc == ssrc) {
+            let rtx_ssrc = if kind == TrackKind::Video {
+                Some(self.alloc_rtx_ssrc(ssrc))
+            } else {
+                None
+            };
+            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid, simulcast_group });
+            trace!("track added (ext) ssrc={} rtx_ssrc={:?} rid={:?} group={:?} user={}",
+                ssrc, rtx_ssrc, tracks.last().unwrap().rid, simulcast_group, self.user_id);
         }
     }
 
@@ -468,5 +595,28 @@ impl Participant {
         if let Some(handle) = self.pli_burst_handle.lock().unwrap().take() {
             handle.abort();
         }
+    }
+
+    /// Simulcast 가상 video SSRC lazy 할당 (CAS, 한번 할당되면 고정)
+    pub fn ensure_simulcast_video_ssrc(&self) -> u32 {
+        let existing = self.simulcast_video_ssrc.load(Ordering::Relaxed);
+        if existing != 0 { return existing; }
+        let new_ssrc = rand_u32_nonzero();
+        match self.simulcast_video_ssrc.compare_exchange(
+            0, new_ssrc, Ordering::SeqCst, Ordering::Relaxed
+        ) {
+            Ok(_) => new_ssrc,
+            Err(winner) => winner,
+        }
+    }
+}
+
+/// 0이 아닌 랜덤 u32 생성 (SSRC 할당용)
+fn rand_u32_nonzero() -> u32 {
+    loop {
+        let mut buf = [0u8; 4];
+        getrandom::fill(&mut buf).expect("getrandom failed");
+        let v = u32::from_le_bytes(buf);
+        if v != 0 { return v; }
     }
 }

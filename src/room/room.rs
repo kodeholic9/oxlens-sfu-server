@@ -40,6 +40,8 @@ pub struct Room {
     pub capacity: usize,
     pub mode:     RoomMode,
     pub created_at: u64,
+    /// Simulcast 활성화 여부 (Conference 모드에서만 의미, PTT에서는 항상 false)
+    pub simulcast_enabled: bool,
 
     /// Floor Control (PTT 모드에서만 활성)
     pub floor: FloorController,
@@ -60,7 +62,9 @@ pub struct Room {
 }
 
 impl Room {
-    pub fn new(id: String, name: String, capacity: Option<usize>, mode: RoomMode, created_at: u64) -> Self {
+    pub fn new(id: String, name: String, capacity: Option<usize>, mode: RoomMode, created_at: u64, simulcast_enabled: bool) -> Self {
+        // PTT 모드에서는 simulcast 강제 OFF
+        let sim = if mode == RoomMode::Ptt { false } else { simulcast_enabled };
         Self {
             id,
             name,
@@ -68,6 +72,7 @@ impl Room {
                 .min(config::ROOM_MAX_CAPACITY),
             mode,
             created_at,
+            simulcast_enabled: sim,
             floor: FloorController::new(),
             audio_rewriter: PttRewriter::new_audio(),
             video_rewriter: PttRewriter::new_video(),
@@ -196,6 +201,19 @@ impl Room {
             }
         })
     }
+
+    /// Simulcast 가상 video SSRC로 publisher 찾기 (PLI/NACK 역매핑용)
+    pub fn find_publisher_by_vssrc(&self, vssrc: u32) -> Option<Arc<Participant>> {
+        if vssrc == 0 { return None; }
+        self.participants.iter().find_map(|entry| {
+            let p = entry.value();
+            if p.simulcast_video_ssrc.load(std::sync::atomic::Ordering::Relaxed) == vssrc {
+                Some(Arc::clone(p))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 // ============================================================================
@@ -220,9 +238,9 @@ impl RoomHub {
         }
     }
 
-    pub fn create(&self, name: String, capacity: Option<usize>, mode: RoomMode, created_at: u64) -> Arc<Room> {
+    pub fn create(&self, name: String, capacity: Option<usize>, mode: RoomMode, created_at: u64, simulcast_enabled: bool) -> Arc<Room> {
         let id = uuid::Uuid::new_v4().to_string();
-        let room = Arc::new(Room::new(id.clone(), name, capacity, mode, created_at));
+        let room = Arc::new(Room::new(id.clone(), name, capacity, mode, created_at, simulcast_enabled));
         self.rooms.insert(id, room.clone());
         room
     }

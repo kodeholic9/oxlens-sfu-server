@@ -7,6 +7,40 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] - 2026-03-20
+
+### Added (Simulcast Phase 3: 가상 SSRC + SimulcastRewriter + 레이어 전환)
+
+#### participant.rs
+- `SimulcastRewriter` 구조체 — SSRC/seq/ts rewrite, 키프레임 대기, 레이어 전환 offset 재계산
+- `SubscribeLayerEntry` 구조체 — subscriber별 publisher 레이어 구독 상태
+- `simulcast_video_ssrc: AtomicU32` — publisher별 고정 가상 video SSRC (CAS lazy 할당)
+- `subscribe_layers: Mutex<HashMap>` — subscriber별 레이어 상태
+- `ensure_simulcast_video_ssrc()` — CAS 기반 lazy 할당
+
+#### room.rs
+- `find_publisher_by_vssrc()` — 가상 video SSRC로 publisher 찾기 (PLI/NACK 역매핑)
+
+#### message.rs
+- `SubscribeLayerRequest`, `SubscribeLayerTarget` 구조체
+
+#### handler.rs
+- `handle_subscribe_layer()` (op=51) — 레이어 선택 + PLI 교착 방지 대책 #2
+- `simulcast_replace_video_ssrc()` — TRACKS_UPDATE/ROOM_JOIN/ROOM_SYNC에서 가상 SSRC 교체
+- `simulcast_replace_video_ssrc_direct()` — ROOM_LEAVE/cleanup용
+- SSRC 참조 경로 10항목 전체 수정 (TRACKS_UPDATE, ROOM_JOIN, ROOM_SYNC, ROOM_LEAVE, TRACKS_ACK, TRACKS_RESYNC)
+
+#### ingress.rs
+- Simulcast video fan-out: SubscribeLayer 확인 + SimulcastRewriter.rewrite()
+- PLI 교착 방지 대책 #1: SubscribeLayer 즉석 생성 시 PLI burst [0,200,500,1500]ms
+- PLI relay: 가상 SSRC → 실제 SSRC 역매핑 (find_publisher_by_vssrc)
+- NACK: 가상 SSRC/seq → 실제 SSRC/seq 역매핑 (reverse_seq)
+- SR translation: simulcast video는 가상 SSRC로 send_stats 조회
+
+### Fixed
+- TWCC extmap ID 동적 참조 — client-offer 모드에서 Chrome 할당 ID 사용 (0이면 서버 기본값 fallback)
+  기존: 하드코딩 ID=6 → Chrome 할당 ID=3 불일치 → TWCC 추출 실패 → BWE 30kbps 추락
+
 ## [0.5.6] - 2026-03-20
 
 ### Added (Pipeline Stats: per-participant 파이프라인 카운터 — AI 진단 기반)

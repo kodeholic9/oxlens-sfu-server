@@ -192,6 +192,14 @@ pub const RTP_SEQ_MAX_MISORDER: u16 = 100;
 /// RecvStats seq validation: min sequential for valid source
 pub const RTP_SEQ_MIN_SEQUENTIAL: u32 = 2;
 
+// --- Simulcast ---
+/// Simulcast high 레이어 최대 비트레이트 (bps)
+pub const SIMULCAST_HIGH_MAX_BITRATE: u32 = 1_650_000;
+/// Simulcast low 레이어 최대 비트레이트 (bps)
+pub const SIMULCAST_LOW_MAX_BITRATE: u32 = 250_000;
+/// Simulcast low 레이어 해상도 축소 비율 (scaleResolutionDownBy)
+pub const SIMULCAST_LOW_SCALE_DOWN: u32 = 4;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;
