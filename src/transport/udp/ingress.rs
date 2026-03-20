@@ -798,11 +798,10 @@ impl UdpTransport {
         room: &Arc<Room>,
         is_detail: bool,
     ) {
-        // RR/PLI relay count
+        // RR relay count (PLI는 publisher 매칭 성공 후에만 카운트 — 유령 PLI 방지)
         for block in &parsed.relay_blocks {
             let pt = plaintext.get(block.offset + 1).copied().unwrap_or(0);
             if pt == config::RTCP_PT_RR { self.metrics.rr_relayed.fetch_add(1, Ordering::Relaxed); }
-            if pt == config::RTCP_PT_PSFB { self.metrics.pli_sent.fetch_add(1, Ordering::Relaxed); }
         }
 
         // Phase E-4: PTT 모드에서 가상 SSRC → 원본 SSRC 변환
@@ -871,7 +870,11 @@ impl UdpTransport {
             let publisher = match publisher {
                 Some(p) => p,
                 None => {
-                    if is_detail {
+                    let dropped_pli = pli_per_ssrc.get(media_ssrc).copied().unwrap_or(0);
+                    if dropped_pli > 0 {
+                        warn!("[RTCP:PLI] dropped — publisher not found ssrc=0x{:08X} ×{} room={} sub={}",
+                            media_ssrc, dropped_pli, room.id, _subscriber.user_id);
+                    } else if is_detail {
                         debug!("[DBG:RTCP:SUB] publisher not found for ssrc=0x{:08X}", media_ssrc);
                     }
                     continue;
@@ -909,6 +912,7 @@ impl UdpTransport {
                 // PLI per-publisher 계측
                 let pli_count = pli_per_ssrc.get(media_ssrc).copied().unwrap_or(0);
                 if pli_count > 0 {
+                    self.metrics.pli_sent.fetch_add(pli_count, Ordering::Relaxed);
                     publisher.pipeline.pub_pli_received.fetch_add(pli_count, Ordering::Relaxed);
                     crate::agg_logger::inc_with(
                         crate::agg_logger::agg_key(&["pli_subscriber_relay", &room.id, &publisher.user_id]),
