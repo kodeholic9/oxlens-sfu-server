@@ -1,2 +1,5 @@
 /target
 .env
+*.log
+*.log.*
+logs/

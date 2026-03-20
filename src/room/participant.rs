@@ -445,6 +445,10 @@ pub struct Participant {
     /// 진행 중인 PLI burst task의 AbortHandle (참가자 퇴장 시 cancel)
     pub pli_burst_handle: Mutex<Option<tokio::task::AbortHandle>>,
 
+    // --- Audio diagnostics ---
+    /// 마지막 audio RTP 도착 시각 (µs, Instant 대신 u64로 저장 — AtomicU64 호환)
+    pub last_audio_arrival_us: AtomicU64,
+
     // --- Simulcast ---
     /// Chrome offerer가 할당한 TWCC extmap ID (client-offer 모드에서 전달받음)
     pub twcc_extmap_id: AtomicU8,
@@ -493,6 +497,7 @@ impl Participant {
             egress_rx:  Mutex::new(Some(egress_rx)),
             rtx_budget_used: AtomicU64::new(0),
             pli_burst_handle: Mutex::new(None),
+            last_audio_arrival_us: AtomicU64::new(0),
             twcc_extmap_id: AtomicU8::new(0),
             simulcast_video_ssrc: AtomicU32::new(0),
             subscribe_layers: Mutex::new(HashMap::new()),

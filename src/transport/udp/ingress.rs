@@ -157,6 +157,22 @@ impl UdpTransport {
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
         let is_summary = seq_num > 0 && seq_num % config::DBG_SUMMARY_INTERVAL == 0;
 
+        // Audio inter-arrival jitter 감지 (40ms 초과 시 warn 로그)
+        if rtp_hdr.pt == 111 {
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            let prev_us = sender.last_audio_arrival_us.swap(now_us, Ordering::Relaxed);
+            if prev_us > 0 {
+                let gap_ms = (now_us.saturating_sub(prev_us)) / 1000;
+                if gap_ms > 40 {
+                    warn!("[AUDIO:GAP] user={} gap={}ms (expected ~20ms) ssrc=0x{:08X} seq={}",
+                        sender.user_id, gap_ms, rtp_hdr.ssrc, rtp_hdr.seq);
+                }
+            }
+        }
+
         // RTCP Terminator: 수신 통계 갱신 (서버가 peer로서 RR 생성용)
         // RTX(PT=97)는 재전송 패킷이므로 수신 통계에서 제외 — jitter 폭등 방지
         if rtp_hdr.pt != config::RTX_PAYLOAD_TYPE {
