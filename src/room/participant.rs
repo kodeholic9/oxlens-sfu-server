@@ -145,6 +145,8 @@ pub struct SimulcastRewriter {
     last_out_ts: u32,
     pub pending_keyframe: bool,
     pub initialized: bool,
+    /// PLI 자가 치유: 마지막 PLI 전송 시각 (initialized될 때까지 2초 간격 재시도)
+    pub pli_sent_at: Option<std::time::Instant>,
 }
 
 impl SimulcastRewriter {
@@ -157,7 +159,22 @@ impl SimulcastRewriter {
             last_out_ts: 0,
             pending_keyframe: false,
             initialized: false,
+            pli_sent_at: None,
         }
+    }
+
+    /// PLI 재시도가 필요한지 판정 (initialized 전 + 2초 경과)
+    pub fn needs_pli_retry(&self) -> bool {
+        if self.initialized { return false; }
+        match self.pli_sent_at {
+            None => true,
+            Some(t) => t.elapsed() >= std::time::Duration::from_secs(2),
+        }
+    }
+
+    /// PLI 전송 기록
+    pub fn mark_pli_sent(&mut self) {
+        self.pli_sent_at = Some(std::time::Instant::now());
     }
 
     /// 레이어 전환: 키프레임 도착까지 모든 패킷 드롭

@@ -357,12 +357,14 @@ pub(super) async fn handle_subscribe_layer(session: &Session, state: &AppState, 
                     rid: target.rid.clone(),
                     rewriter: SimulcastRewriter::new(vssrc),
                 });
-            if old_rid.as_deref() == Some(&target.rid) {
+            let pli = if old_rid.as_deref() == Some(&target.rid) {
                 !old_initialized && target.rid != "pause"
             } else {
                 entry.rid = target.rid.clone();
                 if target.rid != "pause" { entry.rewriter.switch_layer(); true } else { false }
-            }
+            };
+            if pli { entry.rewriter.mark_pli_sent(); }
+            pli
         };
 
         if need_pli {

@@ -129,6 +129,9 @@ pub(super) async fn handle_room_join(session: &mut Session, state: &AppState, pa
     session.pub_ufrag = Some(pub_ice.ufrag.clone());
     session.sub_ufrag = Some(sub_ice.ufrag.clone());
 
+    // 재입장 방어: cleanup 실패/서버 크래시 등으로 stale entry가 남아있을 수 있음
+    purge_subscribe_layers(&room, &user_id);
+
     info!("ROOM_JOIN user={} room={} pub_ufrag={} sub_ufrag={}",
         user_id, req.room_id, pub_ice.ufrag, sub_ice.ufrag);
 
@@ -278,6 +281,9 @@ pub(super) async fn handle_room_leave(session: &mut Session, state: &AppState, p
             info!("ROOM_LEAVE user={} room={}", user_id, req.room_id);
 
             if let Ok(room) = state.rooms.get(&req.room_id) {
+                // simulcast: 퇴장한 유저의 subscribe_layers entry 정리 (재입장 시 stale rewriter 방지)
+                purge_subscribe_layers(&room, user_id);
+
                 let tracks = p.get_tracks();
                 let vssrc_leave = p.simulcast_video_ssrc.load(Ordering::Relaxed);
                 let remove_tracks = build_remove_tracks(&tracks, user_id, room.simulcast_enabled, vssrc_leave);
@@ -370,6 +376,9 @@ pub(super) async fn cleanup(session: &Session, state: &AppState) {
                     flush_ptt_silence(&room);
                 }
             }
+
+            // 3.5. simulcast: 퇴장한 유저의 subscribe_layers entry 정리
+            purge_subscribe_layers(&room, user_id);
 
             // 4. Remove tracks + leave event broadcast
             let remove_tracks = build_remove_tracks(&tracks, user_id, room.simulcast_enabled, sim_vssrc);

@@ -1,7 +1,7 @@
 // author: kodeholic (powered by Claude)
 //! Shared helpers for signaling handlers
 
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::config;
 use crate::room::participant::{EgressPacket, Track};
@@ -214,6 +214,22 @@ pub(crate) fn build_remove_tracks(
 /// audio_rewriter.clear_speaker() + video_rewriter.clear_speaker() + silence fan-out.
 ///
 /// handle_floor_release, handle_room_leave, cleanup 3곳에서 공용.
+/// 퇴장한 유저의 subscribe_layers entry를 다른 참가자에서 제거.
+/// 재입장 시 stale rewriter(이전 vSSRC + initialized=true)가 남아있으면
+/// PLI 미발송 + SSRC 불일치로 video fan-out 실패.
+pub(super) fn purge_subscribe_layers(room: &Room, leaving_user: &str) {
+    let mut purged = 0u32;
+    for entry in room.participants.iter() {
+        if entry.key() == leaving_user { continue; }
+        if entry.value().subscribe_layers.lock().unwrap().remove(leaving_user).is_some() {
+            purged += 1;
+        }
+    }
+    if purged > 0 {
+        debug!("purge_subscribe_layers user={} removed from {} subscribers", leaving_user, purged);
+    }
+}
+
 pub(super) fn flush_ptt_silence(room: &Room) {
     let silence = room.audio_rewriter.clear_speaker();
     room.video_rewriter.clear_speaker();
