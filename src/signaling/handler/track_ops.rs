@@ -1,15 +1,15 @@
 // author: kodeholic (powered by Claude)
 //! Track management handlers — publish, ack, mute, camera, simulcast layer
 
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
-use tokio::time::Duration;
 
 use crate::config::RoomMode;
 use crate::room::participant::{TrackKind, SimulcastRewriter, SubscribeLayerEntry};
 use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
+use crate::transport::udp::spawn_pli_burst;
 
 use super::Session;
 use super::helpers::*;
@@ -41,7 +41,7 @@ pub(super) async fn handle_publish_tracks(session: &Session, state: &AppState, p
     };
 
     if let Some(twcc_id) = req.twcc_extmap_id {
-        participant.twcc_extmap_id.store(twcc_id, std::sync::atomic::Ordering::Relaxed);
+        participant.twcc_extmap_id.store(twcc_id, Ordering::Relaxed);
     }
 
     let sim_enabled = room.simulcast_enabled;
@@ -59,7 +59,7 @@ pub(super) async fn handle_publish_tracks(session: &Session, state: &AppState, p
         track_id_counter += 1;
 
         if let Some(ref rid) = t.rid {
-            let group = if rid == "h" { simulcast_group_counter } else { simulcast_group_counter };
+            let group = simulcast_group_counter;
             if rid == "l" { simulcast_group_counter += 1; }
             participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), Some(rid.clone()), Some(group));
         } else {
@@ -165,7 +165,7 @@ pub(super) async fn handle_tracks_ack(session: &Session, state: &AppState, packe
         }));
     }
 
-    state.metrics.tracks_ack_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.tracks_ack_mismatch.fetch_add(1, Ordering::Relaxed);
     let missing: Vec<u32> = expected.difference(&client_set).copied().collect();
     let extra: Vec<u32> = client_set.difference(&expected).copied().collect();
     warn!("TRACKS_ACK mismatch user={} expected={} client={} missing={:?} extra={:?}",
@@ -177,28 +177,7 @@ pub(super) async fn handle_tracks_ack(session: &Session, state: &AppState, packe
             serde_json::json!({ "user_id": "__virtual__", "kind": "video", "ssrc": room.video_rewriter.virtual_ssrc(), "track_id": "virtual_video" }),
         ]
     } else {
-        let sim = room.simulcast_enabled;
-        let mut resync: Vec<serde_json::Value> = room.other_participants(user_id)
-            .iter()
-            .flat_map(|p| {
-                p.get_tracks().into_iter()
-                    .filter(|t| !(sim && t.rid.as_deref() == Some("l")))
-                    .map(|t| {
-                    let mut j = serde_json::json!({
-                        "user_id": p.user_id,
-                        "kind": t.kind.to_string(),
-                        "ssrc": t.ssrc,
-                        "track_id": t.track_id,
-                    });
-                    if let Some(rs) = t.rtx_ssrc {
-                        j["rtx_ssrc"] = serde_json::json!(rs);
-                    }
-                    j
-                })
-            })
-            .collect();
-        simulcast_replace_video_ssrc(&mut resync, &room);
-        resync
+        collect_subscribe_tracks(&room, user_id)
     };
 
     let resync = Packet::new(
@@ -209,7 +188,7 @@ pub(super) async fn handle_tracks_ack(session: &Session, state: &AppState, packe
     let json = serde_json::to_string(&resync).unwrap_or_default();
     let _ = session.ws_tx.send(json);
 
-    state.metrics.tracks_resync_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.tracks_resync_sent.fetch_add(1, Ordering::Relaxed);
     info!("TRACKS_RESYNC sent user={} tracks={}", user_id, resync_tracks.len());
 
     Packet::ok(opcode::TRACKS_ACK, packet.pid, serde_json::json!({
@@ -264,21 +243,18 @@ pub(super) async fn handle_mute_update(session: &Session, state: &AppState, pack
         info!("[MUTE] VIDEO_SUSPENDED broadcast user={}", user_id);
     }
 
-    if !req.muted && kind == TrackKind::Video {
-        if participant.is_publish_ready() {
-            if let Some(pub_addr) = participant.publish.get_address() {
-                let pli_plain = crate::transport::udp::build_pli(req.ssrc);
-                let encrypted = {
-                    let mut ctx = participant.publish.outbound_srtp.lock().unwrap();
-                    ctx.encrypt_rtcp(&pli_plain).ok()
-                };
-                if let Some(enc) = encrypted {
-                    let socket = &state.udp_socket;
-                    if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                        warn!("[MUTE] PLI send FAILED user={} ssrc={}: {e}", user_id, req.ssrc);
-                    } else {
-                        info!("[MUTE] PLI sent user={} ssrc=0x{:08X} (video unmute)", user_id, req.ssrc);
-                    }
+    if !req.muted && kind == TrackKind::Video && participant.is_publish_ready() {
+        if let Some(pub_addr) = participant.publish.get_address() {
+            let pli_plain = crate::transport::udp::build_pli(req.ssrc);
+            let encrypted = {
+                let mut ctx = participant.publish.outbound_srtp.lock().unwrap();
+                ctx.encrypt_rtcp(&pli_plain).ok()
+            };
+            if let Some(enc) = encrypted {
+                if let Err(e) = state.udp_socket.send_to(&enc, pub_addr).await {
+                    warn!("[MUTE] PLI send FAILED user={} ssrc={}: {e}", user_id, req.ssrc);
+                } else {
+                    info!("[MUTE] PLI sent user={} ssrc=0x{:08X} (video unmute)", user_id, req.ssrc);
                 }
             }
         }
@@ -325,30 +301,7 @@ pub(super) async fn handle_camera_ready(session: &Session, state: &AppState, pac
 
     if participant.is_publish_ready() {
         if let Some(pub_addr) = participant.publish.get_address() {
-            participant.cancel_pli_burst();
-            let p = Arc::clone(&participant);
-            let socket = state.udp_socket.clone();
-            let uid = user_id.to_string();
-            let handle = tokio::spawn(async move {
-                let delays = [0u64, 150];
-                for (i, &delay_ms) in delays.iter().enumerate() {
-                    if delay_ms > 0 { tokio::time::sleep(Duration::from_millis(delay_ms)).await; }
-                    let pli_plain = crate::transport::udp::build_pli(ssrc);
-                    let encrypted = {
-                        let mut ctx = p.publish.outbound_srtp.lock().unwrap();
-                        ctx.encrypt_rtcp(&pli_plain).ok()
-                    };
-                    if let Some(enc) = encrypted {
-                        if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                            warn!("[CAMERA_READY] PLI send FAILED user={} ssrc=0x{:08X} #{}: {e}", uid, ssrc, i);
-                            break;
-                        } else {
-                            info!("[CAMERA_READY] PLI sent user={} ssrc=0x{:08X} #{}", uid, ssrc, i);
-                        }
-                    }
-                }
-            });
-            *participant.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+            spawn_pli_burst(&participant, ssrc, pub_addr, state.udp_socket.clone(), &[0, 150], "CAMERA_READY");
         }
     }
 
@@ -421,31 +374,7 @@ pub(super) async fn handle_subscribe_layer(session: &Session, state: &AppState, 
             };
             if let (Some(ssrc), Some(pub_addr)) = (video_ssrc, publisher.publish.get_address()) {
                 if publisher.is_publish_ready() {
-                    publisher.cancel_pli_burst();
-                    let p = Arc::clone(&publisher);
-                    let socket = state.udp_socket.clone();
-                    let uid = target.user_id.clone();
-                    let rid = target.rid.clone();
-                    let handle = tokio::spawn(async move {
-                        let delays = [0u64, 200, 500, 1500];
-                        for (i, &delay_ms) in delays.iter().enumerate() {
-                            if delay_ms > 0 { tokio::time::sleep(Duration::from_millis(delay_ms)).await; }
-                            let pli_plain = crate::transport::udp::build_pli(ssrc);
-                            let encrypted = {
-                                let mut ctx = p.publish.outbound_srtp.lock().unwrap();
-                                ctx.encrypt_rtcp(&pli_plain).ok()
-                            };
-                            if let Some(enc) = encrypted {
-                                if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                                    warn!("[SIM:PLI] send FAILED user={} rid={} ssrc=0x{:08X} #{}: {e}", uid, rid, ssrc, i);
-                                    break;
-                                } else {
-                                    info!("[SIM:PLI] sent user={} rid={} ssrc=0x{:08X} #{}", uid, rid, ssrc, i);
-                                }
-                            }
-                        }
-                    });
-                    *publisher.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+                    spawn_pli_burst(&publisher, ssrc, pub_addr, state.udp_socket.clone(), &[0, 200, 500, 1500], "SIM:PLI");
                 }
             }
         }

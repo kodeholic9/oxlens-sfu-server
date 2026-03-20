@@ -7,6 +7,43 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.2] - 2026-03-20
+
+### Refactored (리팩토링 2차: 공통 헬퍼 추출 + lib.rs 분리)
+
+#### PLI burst 공통 헬퍼 — transport/udp/pli.rs (신규)
+- `spawn_pli_burst()` 함수 추출: 5곳 중복 PLI burst 코드 통합
+  - track_ops.rs: CAMERA_READY [0,150], SUBSCRIBE_LAYER [0,200,500,1500]
+  - floor_ops.rs: FLOOR_REQUEST [0,500,1500]
+  - ingress.rs: fanout_simulcast_video [0,200,500,1500], send_pli_burst [0,500,1500]
+- delays 배열 + log_prefix 파라미터화로 호출처별 차이 유지
+
+#### Subscribe tracks 수집 헬퍼 — handler/helpers.rs
+- `collect_subscribe_tracks()` 추출: 3곳 동일 로직 통합
+  - room_ops.rs: handle_room_join (existing_tracks)
+  - room_ops.rs: handle_room_sync (subscribe_tracks)
+  - track_ops.rs: handle_tracks_ack (resync_tracks)
+
+#### PTT silence flush 헬퍼 — handler/helpers.rs
+- `flush_ptt_silence()` 추출: 3곳 동일 로직 통합
+  - floor_ops.rs: handle_floor_release
+  - room_ops.rs: handle_room_leave, cleanup
+
+#### Remove tracks 빌드 헬퍼 — handler/helpers.rs
+- `build_remove_tracks()` 추출: 3곳 동일 로직 통합
+  - room_ops.rs: handle_room_leave, cleanup
+  - tasks.rs: run_zombie_reaper
+
+#### cleanup() 구조 개선 — handler/room_ops.rs
+- state.rooms.get() 4회 반복 → 1회로 통합 (Arc clone 재사용)
+- 단계별 주석으로 가독성 개선
+
+#### lib.rs 분리
+- `tasks.rs` (신규) — run_floor_timer + run_zombie_reaper 이동
+- `startup.rs` (신규) — load_env_file + env_or + detect_local_ip + create_default_rooms 이동
+- `broadcast_to_room_all` 제거 → handler/helpers::broadcast_to_room 통합
+- lib.rs: 491줄 → ~190줄
+
 ## [0.6.1] - 2026-03-20
 
 ### Refactored (리팩토링 1차: handler 분할 + ingress 함수 분해)

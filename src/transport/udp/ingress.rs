@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, info, trace, warn};
 
 use crate::config;
@@ -445,32 +445,7 @@ impl UdpTransport {
                 };
                 if let (Some(ssrc), Some(pub_addr)) = (h_ssrc, sender.publish.get_address()) {
                     if sender.is_publish_ready() {
-                        sender.cancel_pli_burst();
-                        let p = Arc::clone(sender);
-                        let socket = self.socket.clone();
-                        let uid = sender.user_id.clone();
-                        let handle = tokio::spawn(async move {
-                            let delays = [0u64, 200, 500, 1500];
-                            for (i, &delay_ms) in delays.iter().enumerate() {
-                                if delay_ms > 0 {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                }
-                                let pli_plain = super::rtcp::build_pli(ssrc);
-                                let encrypted = {
-                                    let mut ctx = p.publish.outbound_srtp.lock().unwrap();
-                                    ctx.encrypt_rtcp(&pli_plain).ok()
-                                };
-                                if let Some(enc) = encrypted {
-                                    if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                                        warn!("[SIM:PLI] auto burst FAILED user={} #{}: {e}", uid, i);
-                                        break;
-                                    } else {
-                                        info!("[SIM:PLI] auto burst user={} ssrc=0x{:08X} #{}", uid, ssrc, i);
-                                    }
-                                }
-                            }
-                        });
-                        *sender.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+                        super::pli::spawn_pli_burst(sender, ssrc, pub_addr, self.socket.clone(), &[0, 200, 500, 1500], "SIM:PLI");
                     }
                 }
             }
@@ -718,39 +693,7 @@ impl UdpTransport {
             _ => return,
         };
 
-        let p = Arc::clone(&participant);
-        let socket = self.socket.clone();
-        let speaker_id = speaker.to_string();
-
-        // 이전 PLI burst가 진행 중이면 cancel
-        participant.cancel_pli_burst();
-
-        let handle = tokio::spawn(async move {
-            let delays = [0u64, 500, 1500];
-            for (i, &delay_ms) in delays.iter().enumerate() {
-                if delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                let pli_plain = super::rtcp::build_pli(ssrc);
-                let encrypted = {
-                    let mut ctx = p.publish.outbound_srtp.lock().unwrap();
-                    ctx.encrypt_rtcp(&pli_plain).ok()
-                };
-                if let Some(enc) = encrypted {
-                    if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                        warn!("[MBCP] PLI send FAILED user={} ssrc=0x{:08X} #{}: {e}",
-                            speaker_id, ssrc, i);
-                        break;
-                    } else {
-                        info!("[MBCP] PLI sent user={} ssrc=0x{:08X} #{} (floor granted)",
-                            speaker_id, ssrc, i);
-                    }
-                }
-            }
-        });
-
-        // AbortHandle 저장 (참가자 퇴장 시 cancel 가능하도록)
-        *participant.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+        super::pli::spawn_pli_burst(&participant, ssrc, pub_addr, self.socket.clone(), &[0, 500, 1500], "MBCP");
     }
 
     // ========================================================================

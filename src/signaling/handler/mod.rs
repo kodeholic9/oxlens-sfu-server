@@ -17,7 +17,7 @@ mod room_ops;
 mod track_ops;
 mod floor_ops;
 mod admin;
-mod helpers;
+pub(crate) mod helpers;
 mod telemetry;
 
 // Re-export public entry points (lib.rs에서 사용)

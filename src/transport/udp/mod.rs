@@ -22,9 +22,11 @@ pub(crate) mod rtcp_terminator;
 mod ingress;
 mod egress;
 pub(crate) mod twcc;
+pub(crate) mod pli;
 
 // Re-exports for external use
 pub use rtcp::build_pli;
+pub use pli::spawn_pli_burst;
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;

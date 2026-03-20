@@ -10,22 +10,24 @@ pub mod transport;
 pub mod media;
 pub mod room;
 pub mod state;
+pub mod tasks;
+pub mod startup;
 
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use axum::Router;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::info;
 use tracing_subscriber::fmt::time::FormatTime;
 
-use crate::signaling::message::*;
-use crate::signaling::opcode;
 use crate::state::AppState;
 use crate::signaling::handler;
 use crate::transport::dtls::ServerCert;
 use crate::metrics::GlobalMetrics;
 use crate::transport::udp::UdpTransport;
+use crate::startup::{load_env_file, env_or, detect_local_ip, create_default_rooms};
+use crate::tasks::{run_floor_timer, run_zombie_reaper};
 
 // ============================================================================
 // Local time formatter for tracing
@@ -171,19 +173,19 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start zombie reaper
-    let reaper_cancel = cancel.clone();
-    let reaper_rooms = Arc::clone(&state.rooms);
-    tokio::spawn(async move {
-        run_zombie_reaper(reaper_rooms, reaper_cancel).await;
-    });
+    {
+        let rooms = Arc::clone(&state.rooms);
+        let cancel = cancel.clone();
+        tokio::spawn(async move { run_zombie_reaper(rooms, cancel).await; });
+    }
 
     // Start floor timer (PTT T2/T_FLOOR_TIMEOUT 감시)
-    let floor_cancel = cancel.clone();
-    let floor_rooms = Arc::clone(&state.rooms);
-    let floor_metrics = Arc::clone(&metrics);
-    tokio::spawn(async move {
-        run_floor_timer(floor_rooms, floor_metrics, floor_cancel).await;
-    });
+    {
+        let rooms = Arc::clone(&state.rooms);
+        let metrics = Arc::clone(&metrics);
+        let cancel = cancel.clone();
+        tokio::spawn(async move { run_floor_timer(rooms, metrics, cancel).await; });
+    }
 
     // Start WebSocket signaling
     let app = Router::new()
@@ -211,281 +213,4 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
-}
-
-// ============================================================================
-// .env 파일 탐색 + 헬퍼
-// ============================================================================
-
-/// .env 파일 탐색 및 로드
-///
-/// 우선순위:
-///   1. `--env /path/to/.env` CLI 인자 → 해당 경로 (없으면 에러 출력 후 무시)
-///   2. CWD/.env
-///   3. 실행파일 디렉토리/.env
-///   4. 모두 없으면 환경변수/기본값으로 동작
-fn load_env_file() {
-    let args: Vec<String> = std::env::args().collect();
-
-    // --env /path 인자 처리
-    if let Some(pos) = args.iter().position(|a| a == "--env") {
-        if let Some(path) = args.get(pos + 1) {
-            match dotenvy::from_path(std::path::Path::new(path)) {
-                Ok(_) => {
-                    eprintln!("[env] loaded: {}", path);
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[env] WARN: --env {} failed: {}", path, e);
-                    // fallback으로 계속
-                }
-            }
-        } else {
-            eprintln!("[env] WARN: --env requires a path argument");
-        }
-    }
-
-    // CWD/.env
-    if dotenvy::dotenv().is_ok() {
-        eprintln!("[env] loaded: .env (CWD)");
-        return;
-    }
-
-    // 실행파일 디렉토리/.env
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let env_path = dir.join(".env");
-            if env_path.is_file() {
-                match dotenvy::from_path(&env_path) {
-                    Ok(_) => {
-                        eprintln!("[env] loaded: {}", env_path.display());
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("[env] WARN: {} failed: {}", env_path.display(), e);
-                    }
-                }
-            }
-        }
-    }
-
-    eprintln!("[env] no .env file found, using environment variables / defaults");
-}
-
-/// 환경변수에서 값 로드, 실패 시 기본값 반환
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-/// 라우팅 테이블 기반 로컬 IP 감지 (PUBLIC_IP 미설정 시 fallback)
-fn detect_local_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
-/// 서버 기동 시 기본 방 생성 (테스트/개발용)
-fn create_default_rooms(state: &AppState) {
-    // (name, capacity, mode, simulcast)
-    let defaults: [(&str, usize, config::RoomMode, bool); 3] = [
-        ("무전 대화방", 10, config::RoomMode::Ptt, false),
-        ("회의실-2", 10, config::RoomMode::Conference, false),
-        ("대회의실", 20, config::RoomMode::Conference, true),
-    ];
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    for (name, capacity, mode, simulcast) in defaults {
-        let room = state.rooms.create(name.to_string(), Some(capacity), mode, now, simulcast);
-        info!("default room created: {} (id={}, cap={}, mode={}, simulcast={})", name, room.id, capacity, room.mode, room.simulcast_enabled);
-    }
-}
-
-/// Floor Control 타이머 태스크 (PTT T2/T_FLOOR_TIMEOUT 감시)
-/// 2초 주기로 PTT 모드 room의 floor 타이머를 체크하여
-/// max burst 초과 또는 ping 미수신 시 발화권을 강제 회수한다.
-async fn run_floor_timer(
-    rooms: Arc<crate::room::room::RoomHub>,
-    metrics: Arc<crate::metrics::GlobalMetrics>,
-    cancel: CancellationToken,
-) {
-    let mut timer = tokio::time::interval(
-        tokio::time::Duration::from_millis(config::FLOOR_PING_INTERVAL_MS),
-    );
-    timer.tick().await; // 첫 tick 즉시 소비
-
-    loop {
-        tokio::select! {
-            _ = timer.tick() => {}
-            _ = cancel.cancelled() => {
-                info!("floor timer stopped (shutdown)");
-                return;
-            }
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // PTT 모드 room만 순회
-        for entry in rooms.rooms.iter() {
-            let room = entry.value();
-            if room.mode != config::RoomMode::Ptt {
-                continue;
-            }
-
-            if let Some(action) = room.floor.check_timers(now) {
-                match &action {
-                    crate::room::floor::FloorAction::Revoked { prev_speaker, cause } => {
-                        metrics.ptt_floor_revoked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!("[FLOOR] timer revoke: user={} cause={} room={}",
-                            prev_speaker, cause, room.id);
-
-                        // PLI burst cancel + rewriter 정리
-                        if let Some(p) = room.get_participant(prev_speaker) {
-                            p.cancel_pli_burst();
-                        }
-                        room.audio_rewriter.clear_speaker();
-                        room.video_rewriter.clear_speaker();
-
-                        // 발화자에게 FLOOR_REVOKE
-                        if let Some(p) = room.get_participant(prev_speaker) {
-                            let revoke = Packet::new(
-                                opcode::FLOOR_REVOKE,
-                                0,
-                                serde_json::json!({
-                                    "room_id": &room.id,
-                                    "cause": cause,
-                                }),
-                            );
-                            let json = serde_json::to_string(&revoke).unwrap_or_default();
-                            let _ = p.ws_tx.send(json);
-                        }
-
-                        // 전체에 FLOOR_IDLE
-                        let idle = Packet::new(
-                            opcode::FLOOR_IDLE,
-                            0,
-                            serde_json::json!({
-                                "room_id": &room.id,
-                                "prev_speaker": prev_speaker,
-                            }),
-                        );
-                        broadcast_to_room_all(&room, &idle);
-                    }
-                    _ => {} // check_timers는 Revoked만 반환
-                }
-            }
-        }
-    }
-}
-
-/// 좀비 세션 주기적 정리 태스크
-/// last_seen + ZOMBIE_TIMEOUT_MS < now 인 participant를 room에서 제거하고
-/// 나머지 참가자들에게 leave/tracks_update 브로드캐스트
-async fn run_zombie_reaper(
-    rooms: Arc<crate::room::room::RoomHub>,
-    cancel: CancellationToken,
-) {
-    let mut timer = tokio::time::interval(
-        tokio::time::Duration::from_millis(config::REAPER_INTERVAL_MS),
-    );
-    timer.tick().await; // 첫 tick 즉시 소비
-
-    loop {
-        tokio::select! {
-            _ = timer.tick() => {}
-            _ = cancel.cancelled() => {
-                info!("zombie reaper stopped (shutdown)");
-                return;
-            }
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let reaped = rooms.reap_zombies(now, config::ZOMBIE_TIMEOUT_MS);
-
-        for (room_id, zombie) in &reaped {
-            // PLI burst cancel (좀비가 발화자였을 수 있음)
-            zombie.cancel_pli_burst();
-
-            warn!("zombie reaped: user={} room={} last_seen={}ms ago",
-                zombie.user_id, room_id,
-                now.saturating_sub(zombie.last_seen.load(std::sync::atomic::Ordering::Relaxed)));
-
-            // 남은 참가자에게 tracks_update(remove) + participant_left 브로드캐스트
-            if let Ok(room) = rooms.get(&room_id) {
-                let tracks = zombie.get_tracks();
-                if !tracks.is_empty() {
-                    // Simulcast 방: rid="l" 트랙은 subscriber에게 안 보냈으니 remove에서도 제외
-                    let sim_enabled = room.simulcast_enabled;
-                    let remove_tracks: Vec<serde_json::Value> = tracks.iter()
-                        .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
-                        .map(|t| {
-                            let mut j = serde_json::json!({
-                                "user_id": &zombie.user_id,
-                                "kind": t.kind.to_string(),
-                                "ssrc": t.ssrc,
-                                "track_id": &t.track_id,
-                            });
-                            if let Some(rs) = t.rtx_ssrc {
-                                j["rtx_ssrc"] = serde_json::json!(rs);
-                            }
-                            j
-                        }).collect();
-                    if !remove_tracks.is_empty() {
-                        let tracks_event = Packet::new(
-                            opcode::TRACKS_UPDATE,
-                            0,
-                            serde_json::json!({
-                                "action": "remove",
-                                "tracks": remove_tracks,
-                            }),
-                        );
-                        broadcast_to_room_all(&room, &tracks_event);
-                    }
-                }
-
-                let leave_event = Packet::new(
-                    opcode::ROOM_EVENT,
-                    0,
-                    serde_json::json!({
-                        "type": "participant_left",
-                        "room_id": room_id,
-                        "user_id": &zombie.user_id,
-                    }),
-                );
-                broadcast_to_room_all(&room, &leave_event);
-            }
-        }
-
-        if !reaped.is_empty() {
-            debug!("reaper cycle: {} zombies removed", reaped.len());
-        }
-    }
-}
-
-/// reaper용 브로드캐스트 (room 내 모든 참가자에게 전송)
-fn broadcast_to_room_all(room: &crate::room::room::Room, packet: &Packet) {
-    let json = match serde_json::to_string(packet) {
-        Ok(j) => j,
-        Err(_) => return,
-    };
-    for entry in room.participants.iter() {
-        let _ = entry.value().ws_tx.send(json.clone());
-    }
 }

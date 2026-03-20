@@ -2,11 +2,12 @@
 //! Room lifecycle handlers — identify, room CRUD, message, cleanup
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::config::RoomMode;
-use crate::room::participant::{EgressPacket, Participant};
+use crate::room::participant::Participant;
 use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
@@ -132,29 +133,9 @@ pub(super) async fn handle_room_join(session: &mut Session, state: &AppState, pa
         user_id, req.room_id, pub_ice.ufrag, sub_ice.ufrag);
 
     let sim_enabled = room.simulcast_enabled;
-    let others = room.other_participants(&user_id);
-    let mut existing_tracks: Vec<serde_json::Value> = others
-        .iter()
-        .flat_map(|p| {
-            p.get_tracks().into_iter()
-                .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
-                .map(|t| {
-                    let mut j = serde_json::json!({
-                        "user_id": p.user_id,
-                        "kind": t.kind.to_string(),
-                        "ssrc": t.ssrc,
-                        "track_id": t.track_id,
-                    });
-                    if let Some(rs) = t.rtx_ssrc {
-                        j["rtx_ssrc"] = serde_json::json!(rs);
-                    }
-                    j
-                })
-        })
-        .collect();
-    simulcast_replace_video_ssrc(&mut existing_tracks, &room);
+    let existing_tracks = collect_subscribe_tracks(&room, &user_id);
 
-    let per_user: Vec<String> = others
+    let per_user: Vec<String> = room.other_participants(&user_id)
         .iter()
         .map(|p| format!("{}({})", p.user_id, p.get_tracks().len()))
         .collect();
@@ -208,10 +189,7 @@ pub(super) async fn handle_room_join(session: &mut Session, state: &AppState, pa
             "audio": room.audio_rewriter.virtual_ssrc(),
             "video": room.video_rewriter.virtual_ssrc(),
         });
-        response["floor_speaker"] = match room.floor.current_speaker() {
-            Some(s) => serde_json::json!(s),
-            None => serde_json::json!(null),
-        };
+        response["floor_speaker"] = serde_json::json!(room.floor.current_speaker());
     }
 
     Packet::ok(opcode::ROOM_JOIN, packet.pid, response)
@@ -251,36 +229,12 @@ pub(super) async fn handle_room_sync(session: &Session, state: &AppState, packet
             }),
         ]
     } else {
-        let sim_enabled = room.simulcast_enabled;
-        let mut tracks: Vec<serde_json::Value> = room.other_participants(user_id)
-            .iter()
-            .flat_map(|p| {
-                p.get_tracks().into_iter()
-                    .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
-                    .map(|t| {
-                        let mut j = serde_json::json!({
-                            "user_id": p.user_id,
-                            "kind": t.kind.to_string(),
-                            "ssrc": t.ssrc,
-                            "track_id": t.track_id,
-                        });
-                        if let Some(rs) = t.rtx_ssrc {
-                            j["rtx_ssrc"] = serde_json::json!(rs);
-                        }
-                        j
-                    })
-            })
-            .collect();
-        simulcast_replace_video_ssrc(&mut tracks, &room);
-        tracks
+        collect_subscribe_tracks(&room, user_id)
     };
 
     let participants: Vec<String> = room.member_ids();
 
-    let floor = match room.floor.current_speaker() {
-        Some(s) => serde_json::json!({ "speaker": s }),
-        None => serde_json::json!({ "speaker": null }),
-    };
+    let floor = serde_json::json!({ "speaker": room.floor.current_speaker() });
 
     debug!("ROOM_SYNC user={} room={} participants={} tracks={}",
         user_id, room_id, participants.len(), subscribe_tracks.len());
@@ -314,19 +268,7 @@ pub(super) async fn handle_room_leave(session: &mut Session, state: &AppState, p
         if room.mode == RoomMode::Ptt {
             if let Some(action) = room.floor.on_participant_leave(user_id) {
                 super::floor_ops::apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
-                let silence = room.audio_rewriter.clear_speaker();
-                room.video_rewriter.clear_speaker();
-                if let Some(frames) = silence {
-                    for entry in room.participants.iter() {
-                        if entry.value().is_subscribe_ready() {
-                            for frame in &frames {
-                                let _ = entry.value().egress_tx.try_send(
-                                    EgressPacket::Rtp(frame.clone())
-                                );
-                            }
-                        }
-                    }
-                }
+                flush_ptt_silence(&room);
             }
         }
     }
@@ -337,35 +279,18 @@ pub(super) async fn handle_room_leave(session: &mut Session, state: &AppState, p
 
             if let Ok(room) = state.rooms.get(&req.room_id) {
                 let tracks = p.get_tracks();
-                let vssrc_leave = p.simulcast_video_ssrc.load(std::sync::atomic::Ordering::Relaxed);
-                if !tracks.is_empty() {
-                    let sim_enabled = room.simulcast_enabled;
-                    let mut remove_tracks: Vec<serde_json::Value> = tracks.iter()
-                        .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
-                        .map(|t| {
-                            let mut j = serde_json::json!({
-                                "user_id": user_id,
-                                "kind": t.kind.to_string(),
-                                "ssrc": t.ssrc,
-                                "track_id": t.track_id,
-                            });
-                            if let Some(rs) = t.rtx_ssrc {
-                                j["rtx_ssrc"] = serde_json::json!(rs);
-                            }
-                            j
-                        }).collect();
-                    simulcast_replace_video_ssrc_direct(&mut remove_tracks, sim_enabled, vssrc_leave);
-                    if !remove_tracks.is_empty() {
-                        let tracks_event = Packet::new(
-                            opcode::TRACKS_UPDATE,
-                            0,
-                            serde_json::json!({
-                                "action": "remove",
-                                "tracks": remove_tracks,
-                            }),
-                        );
-                        broadcast_to_room(&room, &tracks_event);
-                    }
+                let vssrc_leave = p.simulcast_video_ssrc.load(Ordering::Relaxed);
+                let remove_tracks = build_remove_tracks(&tracks, user_id, room.simulcast_enabled, vssrc_leave);
+                if !remove_tracks.is_empty() {
+                    let tracks_event = Packet::new(
+                        opcode::TRACKS_UPDATE,
+                        0,
+                        serde_json::json!({
+                            "action": "remove",
+                            "tracks": remove_tracks,
+                        }),
+                    );
+                    broadcast_to_room(&room, &tracks_event);
                 }
 
                 let event = Packet::new(
@@ -428,72 +353,36 @@ pub(super) async fn handle_message(session: &Session, state: &AppState, packet: 
 
 pub(super) async fn cleanup(session: &Session, state: &AppState) {
     if let (Some(room_id), Some(user_id)) = (&session.current_room, &session.user_id) {
+        // Room 1회 조회 — 이후 모든 작업에서 재사용 (Arc clone, DashMap 락 없음)
         if let Ok(room) = state.rooms.get(room_id) {
-            if let Some(p) = room.get_participant(user_id) {
+            // 1~3. participant 1회 조회 → PLI cancel + 트랙 수집
+            let (tracks, sim_vssrc) = if let Some(p) = room.get_participant(user_id) {
                 p.cancel_pli_burst();
-            }
-        }
+                (p.get_tracks(), p.simulcast_video_ssrc.load(Ordering::Relaxed))
+            } else {
+                (vec![], 0)
+            };
 
-        if let Ok(room) = state.rooms.get(room_id) {
+            // PTT floor auto-release
             if room.mode == RoomMode::Ptt {
                 if let Some(action) = room.floor.on_participant_leave(user_id) {
                     super::floor_ops::apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
-                    let silence = room.audio_rewriter.clear_speaker();
-                    room.video_rewriter.clear_speaker();
-                    if let Some(frames) = silence {
-                        for entry in room.participants.iter() {
-                            if entry.value().is_subscribe_ready() {
-                                for frame in &frames {
-                                    let _ = entry.value().egress_tx.try_send(
-                                        EgressPacket::Rtp(frame.clone())
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    flush_ptt_silence(&room);
                 }
             }
-        }
 
-        let (tracks, sim_vssrc) = if let Ok(room) = state.rooms.get(room_id) {
-            if let Some(p) = room.get_participant(user_id) {
-                (p.get_tracks(), p.simulcast_video_ssrc.load(std::sync::atomic::Ordering::Relaxed))
-            } else {
-                (vec![], 0)
-            }
-        } else {
-            (vec![], 0)
-        };
-
-        if let Ok(room) = state.rooms.get(room_id) {
-            if !tracks.is_empty() {
-                let sim_enabled = room.simulcast_enabled;
-                let mut remove_tracks: Vec<serde_json::Value> = tracks.iter()
-                    .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
-                    .map(|t| {
-                        let mut j = serde_json::json!({
-                            "user_id": user_id,
-                            "kind": t.kind.to_string(),
-                            "ssrc": t.ssrc,
-                            "track_id": t.track_id,
-                        });
-                        if let Some(rs) = t.rtx_ssrc {
-                            j["rtx_ssrc"] = serde_json::json!(rs);
-                        }
-                        j
-                    }).collect();
-                simulcast_replace_video_ssrc_direct(&mut remove_tracks, sim_enabled, sim_vssrc);
-                if !remove_tracks.is_empty() {
-                    let tracks_event = Packet::new(
-                        opcode::TRACKS_UPDATE,
-                        0,
-                        serde_json::json!({
-                            "action": "remove",
-                            "tracks": remove_tracks,
-                        }),
-                    );
-                    broadcast_to_others(&room, user_id, &tracks_event);
-                }
+            // 4. Remove tracks + leave event broadcast
+            let remove_tracks = build_remove_tracks(&tracks, user_id, room.simulcast_enabled, sim_vssrc);
+            if !remove_tracks.is_empty() {
+                let tracks_event = Packet::new(
+                    opcode::TRACKS_UPDATE,
+                    0,
+                    serde_json::json!({
+                        "action": "remove",
+                        "tracks": remove_tracks,
+                    }),
+                );
+                broadcast_to_others(&room, user_id, &tracks_event);
             }
 
             let event = Packet::new(
@@ -508,12 +397,12 @@ pub(super) async fn cleanup(session: &Session, state: &AppState) {
             broadcast_to_others(&room, user_id, &event);
         }
 
+        // 5. Room에서 participant 제거 (인덱스 정리 포함)
         if let Err(e) = state.rooms.remove_participant(room_id, user_id) {
             warn!("cleanup error: {e}");
         }
 
         push_admin_snapshot(state);
-
         debug!("cleanup done user={} room={}", user_id, room_id);
     }
 }

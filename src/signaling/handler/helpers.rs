@@ -4,6 +4,8 @@
 use tracing::trace;
 
 use crate::config;
+use crate::room::participant::{EgressPacket, Track};
+use crate::room::room::Room;
 use crate::signaling::message::Packet;
 use crate::state::AppState;
 
@@ -23,7 +25,7 @@ pub(super) fn broadcast_to_others(room: &crate::room::room::Room, exclude: &str,
     }
 }
 
-pub(super) fn broadcast_to_room(room: &crate::room::room::Room, packet: &Packet) {
+pub(crate) fn broadcast_to_room(room: &crate::room::room::Room, packet: &Packet) {
     let json = match serde_json::to_string(packet) {
         Ok(j) => j,
         Err(_) => return,
@@ -134,5 +136,96 @@ pub(super) fn push_admin_snapshot(state: &AppState) {
     let snapshot = super::admin::build_rooms_snapshot(state);
     if let Ok(json) = serde_json::to_string(&snapshot) {
         let _ = state.admin_tx.send(json);
+    }
+}
+
+// ============================================================================
+// Subscribe tracks 수집 (Conference/Simulcast 공통)
+// ============================================================================
+
+/// 다른 참여자들의 subscribe 트랙 목록을 수집.
+/// - Simulcast 방: rid="l" 트랙 제외, video SSRC를 가상 SSRC로 교체
+/// - Conference 방: 그대로 수집
+///
+/// handle_room_join, handle_room_sync, handle_tracks_ack 3곳에서 공용.
+pub(super) fn collect_subscribe_tracks(room: &Room, exclude_user: &str) -> Vec<serde_json::Value> {
+    let sim_enabled = room.simulcast_enabled;
+    let mut tracks: Vec<serde_json::Value> = room.other_participants(exclude_user)
+        .iter()
+        .flat_map(|p| {
+            p.get_tracks().into_iter()
+                .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+                .map(|t| {
+                    let mut j = serde_json::json!({
+                        "user_id": p.user_id,
+                        "kind": t.kind.to_string(),
+                        "ssrc": t.ssrc,
+                        "track_id": t.track_id,
+                    });
+                    if let Some(rs) = t.rtx_ssrc {
+                        j["rtx_ssrc"] = serde_json::json!(rs);
+                    }
+                    j
+                })
+        })
+        .collect();
+    simulcast_replace_video_ssrc(&mut tracks, room);
+    tracks
+}
+
+// ============================================================================
+// Remove tracks JSON 빌드 (퇴장/cleanup/reaper 공통)
+// ============================================================================
+
+/// 퇴장하는 참여자의 트랙 목록을 TRACKS_UPDATE(remove)용 JSON으로 변환.
+/// - Simulcast 방: rid="l" 트랙 제외, video SSRC를 가상 SSRC로 교체
+/// - Conference 방: 그대로 변환
+///
+/// handle_room_leave, cleanup, run_zombie_reaper 3곳에서 공용.
+pub(crate) fn build_remove_tracks(
+    tracks: &[Track],
+    user_id: &str,
+    sim_enabled: bool,
+    vssrc: u32,
+) -> Vec<serde_json::Value> {
+    let mut remove_tracks: Vec<serde_json::Value> = tracks.iter()
+        .filter(|t| !(sim_enabled && t.rid.as_deref() == Some("l")))
+        .map(|t| {
+            let mut j = serde_json::json!({
+                "user_id": user_id,
+                "kind": t.kind.to_string(),
+                "ssrc": t.ssrc,
+                "track_id": &t.track_id,
+            });
+            if let Some(rs) = t.rtx_ssrc {
+                j["rtx_ssrc"] = serde_json::json!(rs);
+            }
+            j
+        }).collect();
+    simulcast_replace_video_ssrc_direct(&mut remove_tracks, sim_enabled, vssrc);
+    remove_tracks
+}
+
+// ============================================================================
+// PTT silence flush (발화권 해제/퇴장 공통)
+// ============================================================================
+
+/// PTT 모드에서 발화 종료 시 silence 프레임 생성 + 브로드캐스트.
+/// audio_rewriter.clear_speaker() + video_rewriter.clear_speaker() + silence fan-out.
+///
+/// handle_floor_release, handle_room_leave, cleanup 3곳에서 공용.
+pub(super) fn flush_ptt_silence(room: &Room) {
+    let silence = room.audio_rewriter.clear_speaker();
+    room.video_rewriter.clear_speaker();
+    if let Some(frames) = silence {
+        for entry in room.participants.iter() {
+            if entry.value().is_subscribe_ready() {
+                for frame in &frames {
+                    let _ = entry.value().egress_tx.try_send(
+                        EgressPacket::Rtp(frame.clone())
+                    );
+                }
+            }
+        }
     }
 }

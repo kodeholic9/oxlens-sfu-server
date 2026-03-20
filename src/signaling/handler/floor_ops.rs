@@ -1,16 +1,15 @@
 // author: kodeholic (powered by Claude)
 //! Floor Control handlers — PTT request/release/ping + action dispatch
 
-use std::sync::Arc;
-use tracing::{info, warn};
-use tokio::time::Duration;
+use std::sync::atomic::Ordering;
 
 use crate::config::RoomMode;
-use crate::room::participant::{EgressPacket, TrackKind};
+use crate::room::participant::TrackKind;
 use crate::room::floor::FloorAction;
 use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
+use crate::transport::udp::spawn_pli_burst;
 
 use super::Session;
 use super::helpers::*;
@@ -40,41 +39,19 @@ pub(super) async fn handle_floor_request(session: &Session, state: &AppState, pa
     let response = apply_floor_action(opcode::FLOOR_REQUEST, packet.pid, &action, &room, user_id);
 
     if let FloorAction::Granted { speaker } = &action {
-        state.metrics.ptt_floor_granted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        state.metrics.ptt_speaker_switches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.metrics.ptt_floor_granted.fetch_add(1, Ordering::Relaxed);
+        state.metrics.ptt_speaker_switches.fetch_add(1, Ordering::Relaxed);
         room.audio_rewriter.switch_speaker(speaker);
         room.video_rewriter.switch_speaker(speaker);
         if let Some(participant) = room.get_participant(speaker) {
-            if participant.is_publish_ready() {
+            if !participant.is_publish_ready() { /* SRTP not ready yet */ }
+            else if let Some(pub_addr) = participant.publish.get_address() {
                 let video_ssrc = {
                     let tracks = participant.tracks.lock().unwrap();
                     tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.ssrc)
                 };
-                if let (Some(ssrc), Some(pub_addr)) = (video_ssrc, participant.publish.get_address()) {
-                    participant.cancel_pli_burst();
-                    let p = Arc::clone(&participant);
-                    let socket = state.udp_socket.clone();
-                    let speaker_id = speaker.to_string();
-                    let handle = tokio::spawn(async move {
-                        let delays = [0u64, 500, 1500];
-                        for (i, &delay_ms) in delays.iter().enumerate() {
-                            if delay_ms > 0 { tokio::time::sleep(Duration::from_millis(delay_ms)).await; }
-                            let pli_plain = crate::transport::udp::build_pli(ssrc);
-                            let encrypted = {
-                                let mut ctx = p.publish.outbound_srtp.lock().unwrap();
-                                ctx.encrypt_rtcp(&pli_plain).ok()
-                            };
-                            if let Some(enc) = encrypted {
-                                if let Err(e) = socket.send_to(&enc, pub_addr).await {
-                                    warn!("[FLOOR] PLI send FAILED user={} ssrc=0x{:08X} #{}: {e}", speaker_id, ssrc, i);
-                                    break;
-                                } else {
-                                    info!("[FLOOR] PLI sent user={} ssrc=0x{:08X} #{} (floor granted)", speaker_id, ssrc, i);
-                                }
-                            }
-                        }
-                    });
-                    *participant.pli_burst_handle.lock().unwrap() = Some(handle.abort_handle());
+                if let Some(ssrc) = video_ssrc {
+                    spawn_pli_burst(&participant, ssrc, pub_addr, state.udp_socket.clone(), &[0, 500, 1500], "FLOOR");
                 }
             }
         }
@@ -106,18 +83,8 @@ pub(super) async fn handle_floor_release(session: &Session, state: &AppState, pa
     let action = room.floor.release(user_id);
 
     if matches!(&action, FloorAction::Released { .. }) {
-        state.metrics.ptt_floor_released.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let silence = room.audio_rewriter.clear_speaker();
-        room.video_rewriter.clear_speaker();
-        if let Some(frames) = silence {
-            for entry in room.participants.iter() {
-                if entry.value().is_subscribe_ready() {
-                    for frame in &frames {
-                        let _ = entry.value().egress_tx.try_send(EgressPacket::Rtp(frame.clone()));
-                    }
-                }
-            }
-        }
+        state.metrics.ptt_floor_released.fetch_add(1, Ordering::Relaxed);
+        flush_ptt_silence(&room);
     }
 
     apply_floor_action(opcode::FLOOR_RELEASE, packet.pid, &action, &room, user_id)
