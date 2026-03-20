@@ -101,6 +101,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - TWCC extmap ID 동적 참조 — client-offer 모드에서 Chrome 할당 ID 사용 (0이면 서버 기본값 fallback)
   기존: 하드코딩 ID=6 → Chrome 할당 ID=3 불일치 → TWCC 추출 실패 → BWE 30kbps 추락
 
+## [0.5.9] - 2026-03-20
+
+### Added (분석 다각화: PLI/NACK/RTX per-participant 계측)
+
+#### participant.rs
+
+- PipelineStats 3종 추가: `pub_pli_received`, `sub_nack_sent`, `sub_rtx_received`
+
+#### ingress.rs
+
+- subscriber NACK 수신 → `sub_nack_sent` 계측
+- PLI subscriber relay → `pub_pli_received` + agg `pli_subscriber_relay`
+- RTX 전송 성공 → `sub_rtx_received` 계측
+
+#### egress.rs
+
+- subscribe_ready PLI → `pub_pli_received` + agg `pli_server_initiated`
+
+#### pli.rs
+
+- PLI burst (floor/simulcast/camera) → `pub_pli_received` + agg `pli_server_initiated`
+
+#### admin (oxlens-home)
+
+- `app.js`: PIPELINE_FIELDS에 3종 추가
+- `snapshot.js`: pub/sub 라인에 pli/nack/rtx, trend에 pub_pli/sub_nack 추가
+
 ## [0.5.8] - 2026-03-20
 
 ### Added (AggLogger + Room Active Session)

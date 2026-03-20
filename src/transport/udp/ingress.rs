@@ -764,6 +764,7 @@ impl UdpTransport {
 
         // (1) NACK 처리 (RTX 재전송 — 기존 로직)
         self.metrics.nack_received.fetch_add(parsed.nack_blocks.len() as u64, Ordering::Relaxed);
+        subscriber.pipeline.sub_nack_sent.fetch_add(parsed.nack_blocks.len() as u64, Ordering::Relaxed);
         for nack_block in &parsed.nack_blocks {
             self.handle_nack_block(nack_block, subscriber, room, is_detail);
         }
@@ -814,6 +815,7 @@ impl UdpTransport {
 
         // media_ssrc → publisher 매핑 + RTCP 블록 그룹핑
         let mut publisher_rtcp: HashMap<u32, Vec<&[u8]>> = HashMap::new();
+        let mut pli_per_ssrc: HashMap<u32, u64> = HashMap::new();
         for block in &parsed.relay_blocks {
             if block.media_ssrc == 0 { continue; }
             // Simulcast: 가상 video SSRC → 현재 레이어 실제 SSRC 역매핑
@@ -856,6 +858,11 @@ impl UdpTransport {
             publisher_rtcp.entry(effective_ssrc)
                 .or_default()
                 .push(&plaintext[block.offset..block.offset + block.length]);
+            // PLI (PSFB) 블록인 경우 publisher별 카운트
+            let pt = plaintext.get(block.offset + 1).copied().unwrap_or(0);
+            if pt == config::RTCP_PT_PSFB {
+                *pli_per_ssrc.entry(effective_ssrc).or_insert(0) += 1;
+            }
         }
 
         for (media_ssrc, blocks) in &publisher_rtcp {
@@ -899,6 +906,16 @@ impl UdpTransport {
                         media_ssrc, pub_addr);
                 }
             } else {
+                // PLI per-publisher 계측
+                let pli_count = pli_per_ssrc.get(media_ssrc).copied().unwrap_or(0);
+                if pli_count > 0 {
+                    publisher.pipeline.pub_pli_received.fetch_add(pli_count, Ordering::Relaxed);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["pli_subscriber_relay", &room.id, &publisher.user_id]),
+                        format!("pli_subscriber_relay pub={}", publisher.user_id),
+                        Some(&room.id),
+                    );
+                }
                 if is_detail {
                     debug!("[DBG:RTCP:SUB] relayed {} block(s) ssrc=0x{:08X} → user={} addr={}",
                         blocks.len(), media_ssrc, publisher.user_id, pub_addr);
@@ -1054,6 +1071,8 @@ impl UdpTransport {
                 self.metrics.rtx_sent.fetch_add(1, Ordering::Relaxed);
                 if subscriber.egress_tx.try_send(EgressPacket::Rtp(rtx_pkt)).is_err() {
                     self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    subscriber.pipeline.sub_rtx_received.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }

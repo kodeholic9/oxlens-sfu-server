@@ -334,6 +334,12 @@ pub(crate) async fn send_pli_to_publishers(
         if let Err(e) = socket.send_to(&encrypted, pub_addr).await {
             warn!("[DBG:PLI] send FAILED → user={} addr={}: {e}", publisher.user_id, pub_addr);
         } else {
+            publisher.pipeline.pub_pli_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::agg_logger::inc_with(
+                crate::agg_logger::agg_key(&["pli_server_initiated", &room.id, &publisher.user_id]),
+                format!("pli_server_subscribe_ready pub={}", publisher.user_id),
+                Some(&room.id),
+            );
             info!("[DBG:PLI] sent → user={} ssrc=0x{:08X} addr={}",
                 publisher.user_id, ssrc, pub_addr);
         }

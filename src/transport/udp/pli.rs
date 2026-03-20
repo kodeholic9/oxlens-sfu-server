@@ -61,6 +61,12 @@ pub fn spawn_pli_burst(
                         prefix, uid, ssrc, i);
                     break;
                 } else {
+                    p.pipeline.pub_pli_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::agg_logger::inc_with(
+                        crate::agg_logger::agg_key(&["pli_server_initiated", &p.room_id, &uid]),
+                        format!("pli_server_{} pub={}", prefix, uid),
+                        Some(&p.room_id),
+                    );
                     info!("[{}] PLI sent user={} ssrc=0x{:08X} #{}",
                         prefix, uid, ssrc, i);
                 }

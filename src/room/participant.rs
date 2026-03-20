@@ -40,6 +40,8 @@ pub struct PipelineStats {
     pub pub_rtp_rewritten: AtomicU64,
     /// 키프레임 대기 중 드롭 (PTT 비디오)
     pub pub_video_pending: AtomicU64,
+    /// 이 publisher에게 전달된 PLI 수 (모든 출처 합산)
+    pub pub_pli_received:  AtomicU64,
 
     // --- Subscriber 관점 (내가 받은 것) ---
     /// egress 큐 전달 성공
@@ -48,6 +50,10 @@ pub struct PipelineStats {
     pub sub_rtp_dropped:   AtomicU64,
     /// 이 subscriber에게 보낸 SR 수
     pub sub_sr_relayed:    AtomicU64,
+    /// 이 subscriber가 보낸 NACK 블록 수
+    pub sub_nack_sent:     AtomicU64,
+    /// 이 subscriber에게 전달된 RTX 수
+    pub sub_rtx_received:  AtomicU64,
 }
 
 impl PipelineStats {
@@ -57,9 +63,12 @@ impl PipelineStats {
             pub_rtp_gated:     AtomicU64::new(0),
             pub_rtp_rewritten: AtomicU64::new(0),
             pub_video_pending: AtomicU64::new(0),
+            pub_pli_received:  AtomicU64::new(0),
             sub_rtp_relayed:   AtomicU64::new(0),
             sub_rtp_dropped:   AtomicU64::new(0),
             sub_sr_relayed:    AtomicU64::new(0),
+            sub_nack_sent:     AtomicU64::new(0),
+            sub_rtx_received:  AtomicU64::new(0),
         }
     }
 
@@ -70,9 +79,12 @@ impl PipelineStats {
             pub_rtp_gated:     self.pub_rtp_gated.load(Ordering::Relaxed),
             pub_rtp_rewritten: self.pub_rtp_rewritten.load(Ordering::Relaxed),
             pub_video_pending: self.pub_video_pending.load(Ordering::Relaxed),
+            pub_pli_received:  self.pub_pli_received.load(Ordering::Relaxed),
             sub_rtp_relayed:   self.sub_rtp_relayed.load(Ordering::Relaxed),
             sub_rtp_dropped:   self.sub_rtp_dropped.load(Ordering::Relaxed),
             sub_sr_relayed:    self.sub_sr_relayed.load(Ordering::Relaxed),
+            sub_nack_sent:     self.sub_nack_sent.load(Ordering::Relaxed),
+            sub_rtx_received:  self.sub_rtx_received.load(Ordering::Relaxed),
         }
     }
 }
@@ -87,9 +99,12 @@ pub struct PipelineSnapshot {
     pub pub_rtp_gated:     u64,
     pub pub_rtp_rewritten: u64,
     pub pub_video_pending: u64,
+    pub pub_pli_received:  u64,
     pub sub_rtp_relayed:   u64,
     pub sub_rtp_dropped:   u64,
     pub sub_sr_relayed:    u64,
+    pub sub_nack_sent:     u64,
+    pub sub_rtx_received:  u64,
 }
 
 impl PipelineSnapshot {
@@ -99,9 +114,12 @@ impl PipelineSnapshot {
             "pub_rtp_gated":     self.pub_rtp_gated,
             "pub_rtp_rewritten": self.pub_rtp_rewritten,
             "pub_video_pending": self.pub_video_pending,
+            "pub_pli_received":  self.pub_pli_received,
             "sub_rtp_relayed":   self.sub_rtp_relayed,
             "sub_rtp_dropped":   self.sub_rtp_dropped,
             "sub_sr_relayed":    self.sub_sr_relayed,
+            "sub_nack_sent":     self.sub_nack_sent,
+            "sub_rtx_received":  self.sub_rtx_received,
         })
     }
 }
