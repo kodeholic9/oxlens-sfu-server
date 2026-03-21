@@ -202,6 +202,7 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
         opcode::FLOOR_REQUEST   => Some(floor_ops::handle_floor_request(session, state, &packet).await),
         opcode::FLOOR_RELEASE   => Some(floor_ops::handle_floor_release(session, state, &packet).await),
         opcode::FLOOR_PING      => Some(floor_ops::handle_floor_ping(session, state, &packet)),
+        opcode::FLOOR_QUEUE_POS => Some(floor_ops::handle_floor_queue_pos(session, state, &packet)),
         opcode::SUBSCRIBE_LAYER => Some(track_ops::handle_subscribe_layer(session, state, &packet).await),
         _ => {
             warn!("unknown opcode: {}", packet.op);

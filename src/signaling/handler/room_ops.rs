@@ -192,7 +192,15 @@ pub(super) async fn handle_room_join(session: &mut Session, state: &AppState, pa
             "audio": room.audio_rewriter.virtual_ssrc(),
             "video": room.video_rewriter.virtual_ssrc(),
         });
-        response["floor_speaker"] = serde_json::json!(room.floor.current_speaker());
+        let queue_snap: Vec<serde_json::Value> = room.floor.queue_snapshot()
+            .iter().map(|(uid, pri, pos)| serde_json::json!({
+                "user_id": uid, "priority": pri, "position": pos
+            })).collect();
+        response["floor"] = serde_json::json!({
+            "speaker": room.floor.current_speaker(),
+            "speaker_priority": room.floor.current_speaker_priority(),
+            "queue": queue_snap,
+        });
     }
 
     Packet::ok(opcode::ROOM_JOIN, packet.pid, response)
@@ -237,7 +245,15 @@ pub(super) async fn handle_room_sync(session: &Session, state: &AppState, packet
 
     let participants: Vec<String> = room.member_ids();
 
-    let floor = serde_json::json!({ "speaker": room.floor.current_speaker() });
+    let queue_snap: Vec<serde_json::Value> = room.floor.queue_snapshot()
+        .iter().map(|(uid, pri, pos)| serde_json::json!({
+            "user_id": uid, "priority": pri, "position": pos
+        })).collect();
+    let floor = serde_json::json!({
+        "speaker": room.floor.current_speaker(),
+        "speaker_priority": room.floor.current_speaker_priority(),
+        "queue": queue_snap,
+    });
 
     debug!("ROOM_SYNC user={} room={} participants={} tracks={}",
         user_id, room_id, participants.len(), subscribe_tracks.len());
@@ -269,8 +285,9 @@ pub(super) async fn handle_room_leave(session: &mut Session, state: &AppState, p
             p.cancel_pli_burst();
         }
         if room.mode == RoomMode::Ptt {
-            if let Some(action) = room.floor.on_participant_leave(user_id) {
-                super::floor_ops::apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
+            let actions = room.floor.on_participant_leave(user_id);
+            if !actions.is_empty() {
+                super::floor_ops::apply_floor_actions(opcode::FLOOR_RELEASE, 0, &actions, &room, user_id, state);
                 flush_ptt_silence(&room);
             }
         }
@@ -371,8 +388,9 @@ pub(super) async fn cleanup(session: &Session, state: &AppState) {
 
             // PTT floor auto-release
             if room.mode == RoomMode::Ptt {
-                if let Some(action) = room.floor.on_participant_leave(user_id) {
-                    super::floor_ops::apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
+                let actions = room.floor.on_participant_leave(user_id);
+                if !actions.is_empty() {
+                    super::floor_ops::apply_floor_actions(opcode::FLOOR_RELEASE, 0, &actions, &room, user_id, state);
                     flush_ptt_silence(&room);
                 }
             }

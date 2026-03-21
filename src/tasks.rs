@@ -12,17 +12,21 @@ use crate::config;
 use crate::config::RoomMode;
 use crate::metrics::GlobalMetrics;
 use crate::room::floor::FloorAction;
+use crate::room::participant::TrackKind;
 use crate::room::room::RoomHub;
 use crate::signaling::handler::helpers::{broadcast_to_room, build_remove_tracks};
 use crate::signaling::message::Packet;
 use crate::signaling::opcode;
+use crate::transport::udp::spawn_pli_burst;
 
 /// Floor Control 타이머 태스크 (PTT T2/T_FLOOR_TIMEOUT 감시)
 /// 2초 주기로 PTT 모드 room의 floor 타이머를 체크하여
 /// max burst 초과 또는 ping 미수신 시 발화권을 강제 회수한다.
+/// v2: Revoke 후 큐에서 다음 발화자 자동 grant.
 pub(crate) async fn run_floor_timer(
     rooms: Arc<RoomHub>,
     metrics: Arc<GlobalMetrics>,
+    udp_socket: Arc<tokio::net::UdpSocket>,
     cancel: CancellationToken,
 ) {
     let mut timer = tokio::time::interval(
@@ -51,8 +55,13 @@ pub(crate) async fn run_floor_timer(
                 continue;
             }
 
-            if let Some(action) = room.floor.check_timers(now) {
-                match &action {
+            let actions = room.floor.check_timers(now);
+            if actions.is_empty() {
+                continue;
+            }
+
+            for action in &actions {
+                match action {
                     FloorAction::Revoked { prev_speaker, cause } => {
                         metrics.ptt_floor_revoked.fetch_add(1, Ordering::Relaxed);
                         warn!("[FLOOR] timer revoke: user={} cause={} room={}",
@@ -86,11 +95,63 @@ pub(crate) async fn run_floor_timer(
                             serde_json::json!({
                                 "room_id": &room.id,
                                 "prev_speaker": prev_speaker,
+                                "cause": cause,
                             }),
                         );
                         broadcast_to_room(&room, &idle);
                     }
-                    _ => {} // check_timers는 Revoked만 반환
+                    FloorAction::Granted { speaker, priority, duration_s } => {
+                        // 큐 pop에 의한 자동 grant
+                        metrics.ptt_floor_granted.fetch_add(1, Ordering::Relaxed);
+                        metrics.ptt_speaker_switches.fetch_add(1, Ordering::Relaxed);
+                        metrics.ptt_floor_queue_pop.fetch_add(1, Ordering::Relaxed);
+
+                        room.audio_rewriter.switch_speaker(speaker);
+                        room.video_rewriter.switch_speaker(speaker);
+
+                        info!("[FLOOR] timer queue pop → granted user={} priority={} room={}",
+                            speaker, priority, room.id);
+
+                        // PLI burst for new speaker
+                        if let Some(participant) = room.get_participant(speaker) {
+                            if participant.is_publish_ready() {
+                                if let Some(pub_addr) = participant.publish.get_address() {
+                                    let video_ssrc = {
+                                        let tracks = participant.tracks.lock().unwrap();
+                                        tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.ssrc)
+                                    };
+                                    if let Some(ssrc) = video_ssrc {
+                                        spawn_pli_burst(&participant, ssrc, pub_addr, udp_socket.clone(), &[0, 500, 1500], "FLOOR_QPOP");
+                                    }
+                                }
+                            }
+                        }
+
+                        // 해당 사용자에게 Granted 응답
+                        if let Some(p) = room.get_participant(speaker) {
+                            let granted = Packet::ok(opcode::FLOOR_REQUEST, 0, serde_json::json!({
+                                "granted": true,
+                                "speaker": speaker,
+                                "priority": priority,
+                                "duration": duration_s,
+                            }));
+                            let json = serde_json::to_string(&granted).unwrap_or_default();
+                            let _ = p.ws_tx.send(json);
+                        }
+
+                        // 전체에 FLOOR_TAKEN
+                        let taken = Packet::new(
+                            opcode::FLOOR_TAKEN,
+                            0,
+                            serde_json::json!({
+                                "room_id": &room.id,
+                                "speaker": speaker,
+                                "priority": priority,
+                            }),
+                        );
+                        broadcast_to_room(&room, &taken);
+                    }
+                    _ => {} // 다른 액션은 check_timers에서 발생하지 않음
                 }
             }
         }

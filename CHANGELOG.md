@@ -7,6 +7,51 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.3] - 2026-03-21
+
+### Added (Floor Control v2 — priority + queue + preemption)
+
+#### FloorController 전면 재작성 (room/floor.rs)
+
+- `FloorState::Speaking { speaker_priority }` — 발화자 우선순위 추적
+- `QueueEntry { user_id, priority, enqueued_at }` — 대기열 엔트리
+- `VecDeque` 기반 우선순위 큐 (priority 내림차순 삽입)
+- `FloorAction::Queued` variant — 큐 삽입 결과 반환
+- `Vec<FloorAction>` 반환 — 단일 요청에서 복수 액션 발생 가능 (preemption: Revoked + Granted)
+- `FloorConfig`: max_queue_size, preemption_enabled, max_burst_ms, ping_timeout_ms
+- Preemption: 높은 priority 요청 시 현재 발화자 revoke + 즉시 grant
+- Queue pop: release/revoke/timer 후 큐에서 자동 grant
+- `queue_snapshot()`, `queue_size()`, `query_queue_position()` 조회 API
+- 12개 유닛 테스트 (큐잉, 선점, 큐 풀, 중복 방지, 타이머 pop 등)
+
+#### 시그널링 확장
+
+- `FLOOR_QUEUE_POS` (op=43) — 큐 위치 조회 opcode
+- `FloorRequestMsg.priority` 필드 (0~255, optional, 기본 0)
+- `FloorQueuePosMsg` 신규 메시지 타입
+- ROOM_JOIN/ROOM_SYNC: `floor.queue` 스냅샷 + `speaker_priority` 필드
+- `apply_floor_actions()`: Vec<FloorAction> 일괄 처리 (queue pop → 개별 Granted WS 전송)
+
+#### MBCP (UDP) 경로
+
+- MBCP Floor Request: `FLOOR_DEFAULT_PRIORITY` 사용
+- `apply_mbcp_floor_actions()`: Vec 처리 + preemption 카운터
+
+#### GlobalMetrics
+
+- `ptt_floor_queued` — 큐 삽입 횟수
+- `ptt_floor_preempted` — 선점 횟수
+- `ptt_floor_queue_pop` — 큐 자동 grant 횟수
+
+### Changed
+
+- `floor_ops.rs` 전면 재작성 (Vec<FloorAction> 처리)
+- `tasks.rs` 전면 재작성 (check_timers Vec 처리 + 큐 pop 후속 브로드캐스트)
+- `room_ops.rs` ROOM_JOIN/LEAVE/cleanup 3곳 Vec 처리 + floor.queue 정보
+- `ingress.rs` MBCP Vec 처리 + send_ws_floor_taken priority 필드
+
+---
+
 ## [0.6.2] - 2026-03-20
 
 ### Refactored (리팩토링 2차: 공통 헬퍼 추출 + lib.rs 분리)

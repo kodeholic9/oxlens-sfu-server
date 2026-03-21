@@ -123,6 +123,9 @@ pub struct TracksAckRequest {
 #[derive(Debug, Deserialize)]
 pub struct FloorRequestMsg {
     pub room_id: String,
+    /// 우선순위 (0~255, 기본값 0). 3GPP TS 24.380 Floor Priority.
+    #[serde(default)]
+    pub priority: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +135,11 @@ pub struct FloorReleaseMsg {
 
 #[derive(Debug, Deserialize)]
 pub struct FloorPingMsg {
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FloorQueuePosMsg {
     pub room_id: String,
 }
 

@@ -187,8 +187,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     {
         let rooms = Arc::clone(&state.rooms);
         let metrics = Arc::clone(&metrics);
+        let udp_socket = Arc::clone(&state.udp_socket);
         let cancel = cancel.clone();
-        tokio::spawn(async move { run_floor_timer(rooms, metrics, cancel).await; });
+        tokio::spawn(async move { run_floor_timer(rooms, metrics, udp_socket, cancel).await; });
     }
 
     // Start WebSocket signaling

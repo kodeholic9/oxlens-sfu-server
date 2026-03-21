@@ -501,29 +501,23 @@ impl UdpTransport {
             match msg.subtype {
                 config::MBCP_SUBTYPE_FREQ => {
                     info!("[MBCP] FLOOR_REQUEST user={} ssrc=0x{:08X}", user_id, msg.ssrc);
-                    let action = room.floor.request(user_id, now);
-                    self.apply_mbcp_floor_action(&action, room, sender, is_detail).await;
-
-                    // Granted → rewriter 전환 + PLI (기존 WS 핸들러와 동일 로직)
-                    if let FloorAction::Granted { ref speaker } = action {
-                        self.metrics.ptt_floor_granted.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.ptt_speaker_switches.fetch_add(1, Ordering::Relaxed);
-                        room.audio_rewriter.switch_speaker(speaker);
-                        room.video_rewriter.switch_speaker(speaker);
-                        self.send_pli_burst(room, speaker).await;
-                    }
+                    // MBCP UDP: priority=0 고정 (우선순위 요청은 WS만 지원)
+                    let actions = room.floor.request(user_id, config::FLOOR_DEFAULT_PRIORITY, now);
+                    self.apply_mbcp_floor_actions(&actions, room, sender, is_detail).await;
                 }
                 config::MBCP_SUBTYPE_FREL => {
                     info!("[MBCP] FLOOR_RELEASE user={} ssrc=0x{:08X}", user_id, msg.ssrc);
-                    let action = room.floor.release(user_id);
+                    let actions = room.floor.release(user_id);
 
-                    if matches!(&action, FloorAction::Released { .. }) {
-                        self.metrics.ptt_floor_released.fetch_add(1, Ordering::Relaxed);
-                        room.audio_rewriter.clear_speaker();
-                        room.video_rewriter.clear_speaker();
+                    for a in &actions {
+                        if matches!(a, FloorAction::Released { .. }) {
+                            self.metrics.ptt_floor_released.fetch_add(1, Ordering::Relaxed);
+                            room.audio_rewriter.clear_speaker();
+                            room.video_rewriter.clear_speaker();
+                        }
                     }
 
-                    self.apply_mbcp_floor_action(&action, room, sender, is_detail).await;
+                    self.apply_mbcp_floor_actions(&actions, room, sender, is_detail).await;
                 }
                 config::MBCP_SUBTYPE_FPNG => {
                     let action = room.floor.ping(user_id, now);
@@ -541,91 +535,121 @@ impl UdpTransport {
         }
     }
 
-    /// FloorAction → MBCP APP 패킷 브로드캐스트 (서버 → 모든 subscriber)
+    /// Vec<FloorAction> → MBCP APP 패킷 브로드캐스트 (서버 → 모든 subscriber)
     ///
-    /// WS 시그널링의 apply_floor_action과 동일한 의미론이지만,
+    /// WS 시그널링의 apply_floor_actions와 동일한 의미론이지만,
     /// 메시지를 RTCP APP 패킷으로 조립해서 subscriber egress 큐에 넣는다.
-    async fn apply_mbcp_floor_action(
+    async fn apply_mbcp_floor_actions(
         &self,
-        action: &FloorAction,
+        actions: &[FloorAction],
         room: &Arc<Room>,
         requester: &Arc<crate::room::participant::Participant>,
         is_detail: bool,
     ) {
-        match action {
-            FloorAction::Granted { speaker } => {
-                // 전체에 FTKN 브로드캐스트 (요청자 포함)
-                let ftkn = build_mbcp_app(
-                    config::MBCP_SUBTYPE_FTKN,
-                    0, // 서버 SSRC = 0
-                    Some(speaker),
-                );
-                self.broadcast_mbcp_to_subscribers(room, &ftkn);
+        for action in actions {
+            match action {
+                FloorAction::Granted { speaker, priority, .. } => {
+                    self.metrics.ptt_floor_granted.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.ptt_speaker_switches.fetch_add(1, Ordering::Relaxed);
+                    room.audio_rewriter.switch_speaker(speaker);
+                    room.video_rewriter.switch_speaker(speaker);
+                    self.send_pli_burst(room, speaker).await;
 
-                // 요청자에게도 WS FLOOR_TAKEN 전송 (하이브리드: WS 클라이언트 호환)
-                self.send_ws_floor_taken(room, speaker);
+                    // 전체에 FTKN 브로드캐스트 (요청자 포함)
+                    let ftkn = build_mbcp_app(
+                        config::MBCP_SUBTYPE_FTKN,
+                        0, // 서버 SSRC = 0
+                        Some(speaker),
+                    );
+                    self.broadcast_mbcp_to_subscribers(room, &ftkn);
 
-                if is_detail {
-                    debug!("[MBCP] FTKN broadcast speaker={}", speaker);
+                    // WS 호환: FLOOR_TAKEN 전송
+                    self.send_ws_floor_taken(room, speaker, *priority);
+
+                    if is_detail {
+                        debug!("[MBCP] FTKN broadcast speaker={} priority={}", speaker, priority);
+                    }
                 }
-            }
-            FloorAction::Denied { reason, current_speaker } => {
-                // 요청자에게만 거부 응답 — FRVK subtype 재사용 (cause에 이유)
-                // 네이티브 클라이언트는 FRVK 수신 시 subtype로 구분 가능
-                let deny_msg = format!("denied: {} (speaker={})", reason, current_speaker);
-                let frvk = build_mbcp_app(
-                    config::MBCP_SUBTYPE_FRVK,
-                    0,
-                    Some(&deny_msg),
-                );
-                self.send_mbcp_to_participant(requester, &frvk);
-
-                if is_detail {
-                    debug!("[MBCP] denied user={} reason={}", requester.user_id, reason);
-                }
-            }
-            FloorAction::Released { prev_speaker } => {
-                // 전체에 FIDL 브로드캐스트
-                let fidl = build_mbcp_app(
-                    config::MBCP_SUBTYPE_FIDL,
-                    0,
-                    Some(prev_speaker),
-                );
-                self.broadcast_mbcp_to_subscribers(room, &fidl);
-
-                // WS 호환 이벤트
-                self.send_ws_floor_idle(room, prev_speaker);
-
-                if is_detail {
-                    debug!("[MBCP] FIDL broadcast prev_speaker={}", prev_speaker);
-                }
-            }
-            FloorAction::Revoked { prev_speaker, cause } => {
-                // prev_speaker에게 FRVK
-                if let Some(p) = room.get_participant(prev_speaker) {
+                FloorAction::Denied { reason, current_speaker } => {
+                    let deny_msg = format!("denied: {} (speaker={})", reason, current_speaker);
                     let frvk = build_mbcp_app(
                         config::MBCP_SUBTYPE_FRVK,
                         0,
-                        Some(cause),
+                        Some(&deny_msg),
                     );
-                    self.send_mbcp_to_participant(&p, &frvk);
-                }
-                // 전체에 FIDL
-                let fidl = build_mbcp_app(
-                    config::MBCP_SUBTYPE_FIDL,
-                    0,
-                    Some(prev_speaker),
-                );
-                self.broadcast_mbcp_to_subscribers(room, &fidl);
+                    self.send_mbcp_to_participant(requester, &frvk);
 
-                // WS 호환 이벤트
-                self.send_ws_floor_idle(room, prev_speaker);
-
-                if is_detail {
-                    debug!("[MBCP] FRVK → {} cause={}, FIDL broadcast", prev_speaker, cause);
+                    if is_detail {
+                        debug!("[MBCP] denied user={} reason={}", requester.user_id, reason);
+                    }
                 }
+                FloorAction::Queued { user_id, position, priority, queue_size } => {
+                    self.metrics.ptt_floor_queued.fetch_add(1, Ordering::Relaxed);
+                    // MBCP UDP에서는 Queued에 대한 전용 subtype 없음
+                    // Deny + 큐 정보를 FRVK로 전송 (WS에서 상세 처리)
+                    let queued_msg = format!("queued: pos={} pri={} size={}", position, priority, queue_size);
+                    let frvk = build_mbcp_app(
+                        config::MBCP_SUBTYPE_FRVK,
+                        0,
+                        Some(&queued_msg),
+                    );
+                    self.send_mbcp_to_participant(requester, &frvk);
+
+                    if is_detail {
+                        debug!("[MBCP] queued user={} pos={}", user_id, position);
+                    }
+                }
+                FloorAction::Released { prev_speaker } => {
+                    // 전체에 FIDL 브로드캐스트
+                    let fidl = build_mbcp_app(
+                        config::MBCP_SUBTYPE_FIDL,
+                        0,
+                        Some(prev_speaker),
+                    );
+                    self.broadcast_mbcp_to_subscribers(room, &fidl);
+
+                    // WS 호환 이벤트
+                    self.send_ws_floor_idle(room, prev_speaker);
+
+                    if is_detail {
+                        debug!("[MBCP] FIDL broadcast prev_speaker={}", prev_speaker);
+                    }
+                }
+                FloorAction::Revoked { prev_speaker, cause } => {
+                    self.metrics.ptt_floor_revoked.fetch_add(1, Ordering::Relaxed);
+                    if cause == "preempted" {
+                        self.metrics.ptt_floor_preempted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // prev_speaker에게 FRVK
+                    if let Some(p) = room.get_participant(prev_speaker) {
+                        p.cancel_pli_burst();
+                        let frvk = build_mbcp_app(
+                            config::MBCP_SUBTYPE_FRVK,
+                            0,
+                            Some(cause),
+                        );
+                        self.send_mbcp_to_participant(&p, &frvk);
+                    }
+                    room.audio_rewriter.clear_speaker();
+                    room.video_rewriter.clear_speaker();
+
+                    // 전체에 FIDL
+                    let fidl = build_mbcp_app(
+                        config::MBCP_SUBTYPE_FIDL,
+                        0,
+                        Some(prev_speaker),
+                    );
+                    self.broadcast_mbcp_to_subscribers(room, &fidl);
+
+                    // WS 호환 이벤트
+                    self.send_ws_floor_idle(room, prev_speaker);
+
+                    if is_detail {
+                        debug!("[MBCP] FRVK → {} cause={}, FIDL broadcast", prev_speaker, cause);
+                    }
+                }
+                _ => {} // PingOk, PingDenied — MBCP에서는 무응답
             }
-            _ => {} // PingOk, PingDenied — MBCP에서는 무응답
         }
     }
 
@@ -655,11 +679,11 @@ impl UdpTransport {
     }
 
     /// WS 호환: Floor Taken 이벤트를 WS로도 전송 (웹 클라이언트용)
-    fn send_ws_floor_taken(&self, room: &Arc<Room>, speaker: &str) {
+    fn send_ws_floor_taken(&self, room: &Arc<Room>, speaker: &str, priority: u8) {
         let json = serde_json::json!({
             "op": crate::signaling::opcode::FLOOR_TAKEN,
             "pid": 0,
-            "d": { "room_id": room.id, "speaker": speaker },
+            "d": { "room_id": room.id, "speaker": speaker, "priority": priority },
         });
         let msg = serde_json::to_string(&json).unwrap_or_default();
         for entry in room.participants.iter() {

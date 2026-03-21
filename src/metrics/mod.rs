@@ -165,6 +165,12 @@ pub(crate) struct GlobalMetrics {
     pub(crate) ptt_floor_released:      AtomicU64,
     /// 화자 전환 횟수 (switch_speaker 호출)
     pub(crate) ptt_speaker_switches:    AtomicU64,
+    /// Floor Queued (대기열 삽입) 횟수
+    pub(crate) ptt_floor_queued:        AtomicU64,
+    /// Floor Preempted (선점) 횟수
+    pub(crate) ptt_floor_preempted:     AtomicU64,
+    /// Floor Queue Pop (큐 자동 grant) 횟수
+    pub(crate) ptt_floor_queue_pop:     AtomicU64,
     /// 오디오 리라이팅 성공 횟수
     pub(crate) ptt_audio_rewritten:     AtomicU64,
     /// 비디오 리라이팅 성공 횟수
@@ -233,6 +239,9 @@ impl GlobalMetrics {
             ptt_nack_remapped:      AtomicU64::new(0),
             ptt_floor_released:     AtomicU64::new(0),
             ptt_speaker_switches:   AtomicU64::new(0),
+            ptt_floor_queued:       AtomicU64::new(0),
+            ptt_floor_preempted:    AtomicU64::new(0),
+            ptt_floor_queue_pop:    AtomicU64::new(0),
             ptt_audio_rewritten:    AtomicU64::new(0),
             ptt_video_rewritten:    AtomicU64::new(0),
             ptt_video_skip:         AtomicU64::new(0),
@@ -322,6 +331,9 @@ impl GlobalMetrics {
         let ptt_nack_remap        = self.ptt_nack_remapped.swap(0, Ordering::Relaxed);
         let ptt_released          = self.ptt_floor_released.swap(0, Ordering::Relaxed);
         let ptt_switches          = self.ptt_speaker_switches.swap(0, Ordering::Relaxed);
+        let ptt_queued            = self.ptt_floor_queued.swap(0, Ordering::Relaxed);
+        let ptt_preempted         = self.ptt_floor_preempted.swap(0, Ordering::Relaxed);
+        let ptt_queue_pop         = self.ptt_floor_queue_pop.swap(0, Ordering::Relaxed);
         let ptt_audio_rw          = self.ptt_audio_rewritten.swap(0, Ordering::Relaxed);
         let ptt_video_rw          = self.ptt_video_rewritten.swap(0, Ordering::Relaxed);
         let ptt_video_skip        = self.ptt_video_skip.swap(0, Ordering::Relaxed);
@@ -387,6 +399,9 @@ impl GlobalMetrics {
             "floor_revoked":     ptt_revoked,
             "speaker_switches":  ptt_switches,
             "nack_remapped":     ptt_nack_remap,
+            "floor_queued":      ptt_queued,
+            "floor_preempted":   ptt_preempted,
+            "floor_queue_pop":   ptt_queue_pop,
         });
 
         // 최종 조립: 필드 수를 ~15개로 제한하여 매크로 재귀 안전

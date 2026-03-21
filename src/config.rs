@@ -173,6 +173,16 @@ pub const FLOOR_PING_INTERVAL_MS: u64 = 2_000;
 /// T_FLOOR_TIMEOUT: Floor PING 미수신 시 revoke (ms)
 pub const FLOOR_PING_TIMEOUT_MS: u64 = 5_000;
 
+// --- Floor Priority & Queuing (3GPP TS 24.380 기반) ---
+/// Floor 요청 기본 우선순위 (0 = 최저, 255 = 최고)
+pub const FLOOR_DEFAULT_PRIORITY: u8 = 0;
+/// Floor 최대 우선순위
+pub const FLOOR_MAX_PRIORITY: u8 = 255;
+/// Floor 큐 최대 크기
+pub const FLOOR_QUEUE_MAX_SIZE: usize = 10;
+/// Granted 응답의 기본 duration (초)
+pub const FLOOR_DEFAULT_DURATION_S: u16 = 30;
+
 // --- RTX budget (per-subscriber, 3s window) ---
 /// subscriber별 3초당 최대 RTX 전송 수. 초과 시 RTX를 버려서 다른 참가자 보호.
 /// 정상 세션: ~10-30 RTX/3s, LTE lossy: 수백~수천. 200이면 정상은 통과, 폭풍은 차단.
