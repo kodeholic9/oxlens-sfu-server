@@ -91,9 +91,15 @@ pub struct PublishTrackItem {
     #[serde(default)]
     pub rid: Option<String>,
     /// 비디오 코덱 ("VP8" | "H264" | "VP9", 없으면 VP8 기본)
-    /// mediasoup/Janus 선례: 시그널링에서 코덱을 명시적으로 전달받음.
     #[serde(default)]
     pub codec: Option<String>,
+    /// 클라이언트(Chrome/Safari)가 실제 사용하는 video PT (offer SDP 기준)
+    /// 서버는 ingress에서 이 PT를 표준 PT로 정규화
+    #[serde(default)]
+    pub pt: Option<u8>,
+    /// 클라이언트가 실제 사용하는 RTX PT
+    #[serde(default)]
+    pub rtx_pt: Option<u8>,
 }
 
 /// 트랙 mute/unmute 상태 변경 요청

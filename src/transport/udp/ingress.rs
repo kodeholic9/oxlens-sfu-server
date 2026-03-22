@@ -69,7 +69,7 @@ impl UdpTransport {
         }
 
         // Decrypt SRTP → plaintext RTP (from publish session)
-        let plaintext = {
+        let mut plaintext = {
             let lock_t = Instant::now();
             let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
             self.metrics.lock_wait.record(lock_t.elapsed().as_micros() as u64);
@@ -95,7 +95,21 @@ impl UdpTransport {
         sender.pipeline.pub_rtp_in.fetch_add(1, Ordering::Relaxed);
 
         // [DBG:RTP] Parse RTP header for logging
-        let rtp_hdr = parse_rtp_header(&plaintext);
+        let mut rtp_hdr = parse_rtp_header(&plaintext);
+        // PT 정규화: 클라이언트 actual PT → 서버 표준 PT (ingress 입구 1회 변환)
+        // Chrome offer에서 H264=PT119를 할당했지만, 서버 내부는 H264=PT102로 통일
+        {
+            let tracks = sender.tracks.lock().unwrap();
+            if let Some(track) = tracks.iter().find(|t| t.actual_pt != 0 && t.actual_pt == rtp_hdr.pt) {
+                let std_pt = track.video_codec.standard_pt();
+                plaintext[1] = (plaintext[1] & 0x80) | std_pt;
+                rtp_hdr.pt = std_pt;
+            } else if let Some(track) = tracks.iter().find(|t| t.actual_rtx_pt != 0 && t.actual_rtx_pt == rtp_hdr.pt) {
+                let std_rtx = track.video_codec.standard_rtx_pt();
+                plaintext[1] = (plaintext[1] & 0x80) | std_rtx;
+                rtp_hdr.pt = std_rtx;
+            }
+        }
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
         let is_summary = seq_num > 0 && seq_num % config::DBG_SUMMARY_INTERVAL == 0;
 
@@ -131,7 +145,7 @@ impl UdpTransport {
         }
 
         // Simulcast video fan-out: 레이어 선택 + SimulcastRewriter
-        if room.simulcast_enabled && rtp_hdr.pt == 96 {
+        if room.simulcast_enabled && config::is_video_pt(rtp_hdr.pt) {
             self.fanout_simulcast_video(&fanout_payload, &rtp_hdr, &sender, &room).await;
         } else {
             // Normal fan-out (audio, non-simulcast video, PTT)
@@ -241,7 +255,7 @@ impl UdpTransport {
         _is_detail: bool,
     ) {
         // Audio inter-arrival jitter 감지 (40ms 초과 시 warn 로그)
-        if rtp_hdr.pt == 111 {
+        if config::is_audio_pt(rtp_hdr.pt) {
             let now_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -260,13 +274,13 @@ impl UdpTransport {
         }
 
         // RTCP Terminator: 수신 통계 갱신 (서버가 peer로서 RR 생성용)
-        // RTX(PT=97)는 재전송 패킷이므로 수신 통계에서 제외 — jitter 폭등 방지
-        if rtp_hdr.pt != config::RTX_PAYLOAD_TYPE {
+        // RTX는 재전송 패킷이므로 수신 통계에서 제외 — jitter 폭등 방지
+        if !config::is_rtx_pt(rtp_hdr.pt) {
             let arrival_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let clock_rate = if rtp_hdr.pt == 111 {
+            let clock_rate = if config::is_audio_pt(rtp_hdr.pt) {
                 config::CLOCK_RATE_AUDIO
             } else {
                 config::CLOCK_RATE_VIDEO
@@ -278,8 +292,7 @@ impl UdpTransport {
         }
 
         // 비디오 RTP 캐시 (NACK → RTX 재전송용, audio는 skip)
-        // PT 96 = VP8 (server_codec_policy)
-        if rtp_hdr.pt == 96 {
+        if config::is_video_pt(rtp_hdr.pt) {
             match sender.rtp_cache.lock() {
                 Ok(mut cache) => {
                     cache.store(rtp_hdr.seq, plaintext);
@@ -338,17 +351,16 @@ impl UdpTransport {
         // Phase E-2/E-4: PTT 모드 SSRC 리라이팅 (오디오 + 비디오)
         if room.mode == RoomMode::Ptt {
             use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe, is_h264_keyframe};
-            use crate::room::participant::VideoCodec;
             let mut rewritten = plaintext.to_vec();
-            let result = if rtp_hdr.pt == 111 {
+            let result = if config::is_audio_pt(rtp_hdr.pt) {
                 // Audio (Opus) — 키프레임 대기 없음
                 room.audio_rewriter.rewrite(&mut rewritten, &sender.user_id, false)
-            } else if rtp_hdr.pt == 96 {
-                // Video — 코덱별 키프레임 감지 (mediasoup/Janus 선례)
-                let codec = sender.get_video_codec();
-                let keyframe = match codec {
-                    VideoCodec::H264 => is_h264_keyframe(plaintext),
-                    _ => is_vp8_keyframe(plaintext),
+            } else if config::is_video_pt(rtp_hdr.pt) {
+                // Video — PT 기반 코덱별 키프레임 감지
+                let keyframe = if rtp_hdr.pt == config::H264_PAYLOAD_TYPE {
+                    is_h264_keyframe(plaintext)
+                } else {
+                    is_vp8_keyframe(plaintext)
                 };
                 if keyframe {
                     self.metrics.ptt_keyframe_arrived.fetch_add(1, Ordering::Relaxed);
@@ -362,9 +374,9 @@ impl UdpTransport {
                 RewriteResult::Ok => {
                     self.metrics.ptt_rtp_rewritten.fetch_add(1, Ordering::Relaxed);
                     sender.pipeline.pub_rtp_rewritten.fetch_add(1, Ordering::Relaxed);
-                    if rtp_hdr.pt == 111 {
+                    if config::is_audio_pt(rtp_hdr.pt) {
                         self.metrics.ptt_audio_rewritten.fetch_add(1, Ordering::Relaxed);
-                    } else if rtp_hdr.pt == 96 {
+                    } else if config::is_video_pt(rtp_hdr.pt) {
                         self.metrics.ptt_video_rewritten.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(rewritten)
@@ -379,7 +391,7 @@ impl UdpTransport {
                     None // 키프레임 대기 중 — P-frame 드롭
                 }
                 RewriteResult::Skip => {
-                    if rtp_hdr.pt == 96 {
+                    if config::is_video_pt(rtp_hdr.pt) {
                         self.metrics.ptt_video_skip.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(plaintext.to_vec())
@@ -413,13 +425,10 @@ impl UdpTransport {
             None => return, // simulcast track이 아님
         };
 
-        let is_keyframe = {
-            use crate::room::participant::VideoCodec;
-            let codec = sender.get_video_codec();
-            match codec {
-                VideoCodec::H264 => crate::room::ptt_rewriter::is_h264_keyframe(fanout_payload),
-                _ => crate::room::ptt_rewriter::is_vp8_keyframe(fanout_payload),
-            }
+        let is_keyframe = if rtp_hdr.pt == config::H264_PAYLOAD_TYPE {
+            crate::room::ptt_rewriter::is_h264_keyframe(fanout_payload)
+        } else {
+            crate::room::ptt_rewriter::is_vp8_keyframe(fanout_payload)
         };
         let vssrc = sender.ensure_simulcast_video_ssrc();
         let mut pli_sent = false;

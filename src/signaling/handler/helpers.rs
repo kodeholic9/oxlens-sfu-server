@@ -57,6 +57,15 @@ pub(super) fn server_codec_policy() -> serde_json::Value {
             "clockrate": 90000,
             "rtx_pt": 97,
             "rtcp_fb": ["nack", "nack pli", "ccm fir", "goog-remb"]
+        },
+        {
+            "kind": "video",
+            "name": "H264",
+            "pt": 102,
+            "clockrate": 90000,
+            "rtx_pt": 103,
+            "rtcp_fb": ["nack", "nack pli", "ccm fir", "goog-remb"],
+            "fmtp": "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
         }
     ])
 }

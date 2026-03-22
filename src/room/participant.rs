@@ -295,6 +295,19 @@ impl VideoCodec {
             _            => VideoCodec::Vp8,
         }
     }
+
+    /// 서버 표준 PT (server_codec_policy 기준)
+    pub fn standard_pt(&self) -> u8 {
+        match self {
+            VideoCodec::H264 => crate::config::H264_PAYLOAD_TYPE,
+            _                => crate::config::VP8_PAYLOAD_TYPE,
+        }
+    }
+
+    /// 서버 표준 RTX PT
+    pub fn standard_rtx_pt(&self) -> u8 {
+        crate::config::rtx_pt_for(self.standard_pt())
+    }
 }
 
 impl std::fmt::Display for VideoCodec {
@@ -337,6 +350,10 @@ pub struct Track {
     pub simulcast_group: Option<u32>,
     /// 비디오 코덱 (PUBLISH_TRACKS에서 전달, audio는 Vp8 기본값 — 참조 안 됨)
     pub video_codec: VideoCodec,
+    /// 클라이언트가 실제 사용하는 PT (Chrome offer 기준, 0=표준 PT 사용)
+    pub actual_pt: u8,
+    /// 클라이언트가 실제 사용하는 RTX PT (0=표준 RTX PT 사용)
+    pub actual_rtx_pt: u8,
 }
 
 // ============================================================================
@@ -586,16 +603,24 @@ impl Participant {
 
     /// 트랙 등록 (SSRC 중복 방지). video 트랙은 RTX SSRC 자동 할당.
     pub fn add_track(&self, ssrc: u32, kind: TrackKind, track_id: String) {
-        self.add_track_full(ssrc, kind, track_id, None, None, VideoCodec::Vp8);
+        self.add_track_full(ssrc, kind, track_id, None, None, VideoCodec::Vp8, 0, 0);
     }
 
-    /// Simulcast rid/simulcast_group 포함 트랙 등록
-    pub fn add_track_ext(&self, ssrc: u32, kind: TrackKind, track_id: String, rid: Option<String>, simulcast_group: Option<u32>, video_codec: VideoCodec) {
-        self.add_track_full(ssrc, kind, track_id, rid, simulcast_group, video_codec);
+    /// Simulcast rid/simulcast_group 포함 트랙 등록 (actual_pt/actual_rtx_pt 포함)
+    pub fn add_track_ext(
+        &self, ssrc: u32, kind: TrackKind, track_id: String,
+        rid: Option<String>, simulcast_group: Option<u32>, video_codec: VideoCodec,
+        actual_pt: u8, actual_rtx_pt: u8,
+    ) {
+        self.add_track_full(ssrc, kind, track_id, rid, simulcast_group, video_codec, actual_pt, actual_rtx_pt);
     }
 
     /// 트랙 등록 내부 구현 (SSRC 중복 방지, video → RTX SSRC 자동 할당)
-    fn add_track_full(&self, ssrc: u32, kind: TrackKind, track_id: String, rid: Option<String>, simulcast_group: Option<u32>, video_codec: VideoCodec) {
+    fn add_track_full(
+        &self, ssrc: u32, kind: TrackKind, track_id: String,
+        rid: Option<String>, simulcast_group: Option<u32>, video_codec: VideoCodec,
+        actual_pt: u8, actual_rtx_pt: u8,
+    ) {
         let mut tracks = self.tracks.lock().unwrap();
         if !tracks.iter().any(|t| t.ssrc == ssrc) {
             let rtx_ssrc = if kind == TrackKind::Video {
@@ -603,9 +628,9 @@ impl Participant {
             } else {
                 None
             };
-            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid, simulcast_group, video_codec });
-            trace!("track added ssrc={} rtx_ssrc={:?} rid={:?} codec={} user={}",
-                ssrc, rtx_ssrc, tracks.last().unwrap().rid, video_codec, self.user_id);
+            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid, simulcast_group, video_codec, actual_pt, actual_rtx_pt });
+            trace!("track added ssrc={} rtx_ssrc={:?} rid={:?} codec={} actual_pt={} user={}",
+                ssrc, rtx_ssrc, tracks.last().unwrap().rid, video_codec, actual_pt, self.user_id);
         }
     }
 

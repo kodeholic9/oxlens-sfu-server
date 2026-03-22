@@ -59,13 +59,15 @@ pub(super) async fn handle_publish_tracks(session: &Session, state: &AppState, p
         track_id_counter += 1;
 
         let video_codec = VideoCodec::from_str_or_default(t.codec.as_deref());
+        let actual_pt = t.pt.unwrap_or(0);
+        let actual_rtx_pt = t.rtx_pt.unwrap_or(0);
 
         if let Some(ref rid) = t.rid {
             let group = simulcast_group_counter;
             if rid == "l" { simulcast_group_counter += 1; }
-            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), Some(rid.clone()), Some(group), video_codec);
+            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), Some(rid.clone()), Some(group), video_codec, actual_pt, actual_rtx_pt);
         } else {
-            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), None, None, video_codec);
+            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), None, None, video_codec, actual_pt, actual_rtx_pt);
         }
 
         let rtx_ssrc = participant.get_tracks().iter()

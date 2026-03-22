@@ -153,10 +153,10 @@ pub(crate) async fn run_egress_task(
         let result = match pkt {
             EgressPacket::Rtp(ref plaintext) => {
                 // RTCP Terminator: SendStats 갱신 (SR translation용)
-                // RTX(PT=97)는 재전송이므로 제외
+                // RTX는 재전송이므로 제외
                 if plaintext.len() >= 12 {
                     let pt = plaintext[1] & 0x7F;
-                    if pt != crate::config::RTX_PAYLOAD_TYPE {
+                    if !crate::config::is_rtx_pt(pt) {
                         let ssrc = u32::from_be_bytes(
                             [plaintext[8], plaintext[9], plaintext[10], plaintext[11]]
                         );
@@ -175,7 +175,7 @@ pub(crate) async fn run_egress_task(
                         }
                         let payload_len = plaintext.len().saturating_sub(hdr_len);
 
-                        let clock_rate = if pt == 111 {
+                        let clock_rate = if crate::config::is_audio_pt(pt) {
                             crate::config::CLOCK_RATE_AUDIO
                         } else {
                             crate::config::CLOCK_RATE_VIDEO

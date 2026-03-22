@@ -264,8 +264,9 @@ pub(crate) fn build_rtx_packet(original: &[u8], rtx_ssrc: u32, rtx_seq: u16) -> 
     // RTP header 복사 (V/P/X/CC 유지)
     rtx.extend_from_slice(&original[..header_len]);
 
-    // PT → RTX (97), M=0
-    rtx[1] = config::RTX_PAYLOAD_TYPE;
+    // PT → 원본 코덱에 대응하는 RTX PT, M=0
+    let orig_pt = original[1] & 0x7F;
+    rtx[1] = config::rtx_pt_for(orig_pt);
 
     // seq → rtx_seq
     rtx[2..4].copy_from_slice(&rtx_seq.to_be_bytes());

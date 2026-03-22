@@ -53,10 +53,40 @@ pub const EGRESS_QUEUE_SIZE: usize = 256;
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 pub const UDP_RECV_BUF_SIZE: usize = 2048;
 
+// --- Codec Payload Types (server_codec_policy와 일치해야 함) ---
+pub const OPUS_PAYLOAD_TYPE: u8 = 111;
+pub const VP8_PAYLOAD_TYPE: u8 = 96;
+pub const VP8_RTX_PAYLOAD_TYPE: u8 = 97;
+pub const H264_PAYLOAD_TYPE: u8 = 102;
+pub const H264_RTX_PAYLOAD_TYPE: u8 = 103;
+
+/// media PT → video PT 여부
+pub fn is_video_pt(pt: u8) -> bool {
+    pt == VP8_PAYLOAD_TYPE || pt == H264_PAYLOAD_TYPE
+}
+
+/// media PT → audio PT 여부
+pub fn is_audio_pt(pt: u8) -> bool {
+    pt == OPUS_PAYLOAD_TYPE
+}
+
+/// RTX PT 여부 (재전송 패킷 — recv_stats 제외 대상)
+pub fn is_rtx_pt(pt: u8) -> bool {
+    pt == VP8_RTX_PAYLOAD_TYPE || pt == H264_RTX_PAYLOAD_TYPE
+}
+
+/// 원본 media PT → 대응 RTX PT
+pub fn rtx_pt_for(media_pt: u8) -> u8 {
+    match media_pt {
+        H264_PAYLOAD_TYPE => H264_RTX_PAYLOAD_TYPE,
+        _ => VP8_RTX_PAYLOAD_TYPE,
+    }
+}
+
 // --- RTX (RFC 4588) ---
 /// RTP 캐시 링버퍼 크기 (seq % SIZE로 인덱싱, 약 4초분 @30fps)
 pub const RTP_CACHE_SIZE: usize = 512;
-/// RTX payload type (server_codec_policy의 rtx_pt와 일치해야 함)
+/// RTX payload type — 하위 호환용 (신규 코드는 is_rtx_pt()/rtx_pt_for() 사용)
 pub const RTX_PAYLOAD_TYPE: u8 = 97;
 /// NACK RTCP payload type (RFC 4585, Generic NACK)
 pub const RTCP_PT_NACK: u8 = 205;
