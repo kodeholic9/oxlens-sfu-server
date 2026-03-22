@@ -75,9 +75,17 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| format!("oxlens_sfu_server={}", log_level).into());
 
     if let Some(ref dir) = log_dir {
-        // 일별 로테이션 파일 (oxsfud.YYYY-MM-DD.log)
-        let file_appender = tracing_appender::rolling::daily(dir, "oxsfud.log");
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        // 일별 로테이션 파일 — 로컬 시간 기준 (oxsfud.log.YYYY-MM-DD)
+        // tracing_appender::rolling::daily는 UTC 기준이라 파일명이 KST와 어긋남.
+        // 시작 시점 로컬 날짜로 파일 생성, 서버 재시작 시 자동 로테이션.
+        let local_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let log_path = std::path::Path::new(dir).join(format!("oxsfud.log.{}", local_date));
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap_or_else(|e| panic!("failed to open log file {:?}: {}", log_path, e));
+        let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
         // _guard를 들고 있어야 flush됨 — Box::leak으로 프로세스 수명 동안 유지
         Box::leak(Box::new(_guard));
 

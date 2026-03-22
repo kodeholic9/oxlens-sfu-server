@@ -7,6 +7,31 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.4] - 2026-03-22
+
+### Fixed (PTT Video Freeze — WARM 복귀 시 영상 정지)
+
+#### Video dynamic ts_gap 추가 (ptt_rewriter.rs)
+- WARM idle 후 발화 시 arrival_time gap과 RTP ts gap 불일치 → jitter buffer 교란 방지
+- Audio와 동일 원리: idle 경과 시간 × 90kHz → video ts_gap 동적 계산
+- 이전: 고정 3000 (33ms) → idle 12초 후에도 ts 33ms만 점프 → jitter 폭등
+- 수정: idle 12초 → ts_gap=1,080,000 (12초분) → arrival gap과 일치
+
+#### Video marker bit 강제 설정 제거 (ptt_rewriter.rs)
+- 화자 전환 첫 패킷에 marker=1 강제 설정 → Audio 전용으로 변경
+- VP8 키프레임은 다중 RTP 패킷 분할 → 첫 패킷에 marker=1 시
+  Chrome이 "이 패킷이 전체 프레임"으로 오인 → 불완전 디코딩 → freeze
+- Audio(Opus)는 1패킷=1프레임이라 marker 강제가 무해 → 유지
+
+#### rewrite() first_pkt video base 재계산 제거 (ptt_rewriter.rs)
+- 기존: first_pkt에서 last_virtual_ts + 3000(고정)으로 v_base 재계산
+- 수정: switch_speaker에서 dynamic ts_gap으로 설정한 v_base를 그대로 사용
+
+### Added (디버그)
+- `diagnose_vp8()` 함수 + `Vp8Diag` 구조체 (ptt_rewriter.rs)
+- `[DIAG:VP8:PENDING]` / `[DIAG:VP8:KEYFRAME]` 조건부 진단 로그 (ingress.rs)
+- TODO: 안정화 후 제거
+
 ## [0.6.3] - 2026-03-21
 
 ### Added (Floor Control v2 — priority + queue + preemption)

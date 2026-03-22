@@ -337,7 +337,7 @@ impl UdpTransport {
 
         // Phase E-2/E-4: PTT 모드 SSRC 리라이팅 (오디오 + 비디오)
         if room.mode == RoomMode::Ptt {
-            use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe};
+            use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe, diagnose_vp8};
             let mut rewritten = plaintext.to_vec();
             let result = if rtp_hdr.pt == 111 {
                 // Audio (Opus) — 키프레임 대기 없음
@@ -349,7 +349,36 @@ impl UdpTransport {
                     self.metrics.ptt_keyframe_arrived.fetch_add(1, Ordering::Relaxed);
                 }
 
-                room.video_rewriter.rewrite(&mut rewritten, &sender.user_id, keyframe)
+                let vp8_result = room.video_rewriter.rewrite(&mut rewritten, &sender.user_id, keyframe);
+
+                // [DIAG] pending_keyframe 진단 — VP8 PD 덤프 (TODO: 안정화 후 제거)
+                if vp8_result == RewriteResult::PendingKeyframe {
+                    let pending_n = self.metrics.ptt_video_pending_drop.load(Ordering::Relaxed);
+                    if pending_n < 5 || pending_n % 30 == 0 {
+                        if let Some(diag) = diagnose_vp8(plaintext) {
+                            warn!("[DIAG:VP8:PENDING] #{} user={} seq={} marker={} kf={} S={} pd=[{:02x},{:02x},{:02x},{:02x}] frame=0x{} paylen={}",
+                                pending_n, sender.user_id, rtp_hdr.seq, rtp_hdr.marker,
+                                diag.is_keyframe, diag.s_bit,
+                                diag.pd_bytes[0], diag.pd_bytes[1], diag.pd_bytes[2], diag.pd_bytes[3],
+                                diag.frame_byte.map(|b| format!("{:02x}", b)).unwrap_or_else(|| "--".into()),
+                                diag.payload_len);
+                        } else {
+                            warn!("[DIAG:VP8:PENDING] #{} user={} seq={} — parse failed len={}",
+                                pending_n, sender.user_id, rtp_hdr.seq, plaintext.len());
+                        }
+                    }
+                }
+                // [DIAG] 키프레임 도착 시점 확인
+                if keyframe {
+                    if let Some(diag) = diagnose_vp8(plaintext) {
+                        info!("[DIAG:VP8:KEYFRAME] user={} seq={} marker={} pd=[{:02x},{:02x},{:02x},{:02x}] frame=0x{}",
+                            sender.user_id, rtp_hdr.seq, rtp_hdr.marker,
+                            diag.pd_bytes[0], diag.pd_bytes[1], diag.pd_bytes[2], diag.pd_bytes[3],
+                            diag.frame_byte.map(|b| format!("{:02x}", b)).unwrap_or_else(|| "--".into()));
+                    }
+                }
+
+                vp8_result
             } else {
                 RewriteResult::Skip
             };

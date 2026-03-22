@@ -120,16 +120,16 @@ impl PttRewriter {
     pub fn switch_speaker(&self, user_id: &str) {
         let mut s = self.state.lock().unwrap();
 
-        // Audio: idle 경과 시간 → ts_guard_gap 동적 계산
-        // NetEQ가 arrival_time gap과 ts gap의 불일치를 jitter로 해석하지 않도록
-        // 실제 경과 시간을 ts에 반영. Video는 키프레임 게이팅이 대신 처리.
+        // Audio/Video: idle 경과 시간 → ts_guard_gap 동적 계산
+        // NetEQ/jitter buffer가 arrival_time gap과 RTP ts gap의 불일치를 jitter로 해석하지 않도록
+        // 실제 idle 경과 시간을 ts에 반영. Audio와 Video 모두 동일 원리 적용.
         if !self.require_keyframe {
-            // Audio rewriter
+            // Audio rewriter — dynamic ts_gap (idle 경과 시간 반영)
             let dynamic_ts_gap = if let Some(cleared) = s.cleared_at {
                 let elapsed_ms = cleared.elapsed().as_millis() as u32;
                 let gap = elapsed_ms.saturating_mul(48); // 48kHz: 48 samples/ms
                 let gap = gap.max(self.ts_guard_gap);     // 최소 960 (20ms)
-                info!("[PTT:REWRITE] dynamic ts_gap: idle={}ms → ts_gap={} (vs fixed={})",
+                info!("[PTT:REWRITE] audio dynamic ts_gap: idle={}ms → ts_gap={} (vs fixed={})",
                     elapsed_ms, gap, self.ts_guard_gap);
                 gap
             } else {
@@ -142,6 +142,22 @@ impl PttRewriter {
             let extra_gap = dynamic_ts_gap.saturating_sub(silence_ts);
             s.virtual_base_ts = s.last_virtual_ts.wrapping_add(extra_gap);
             // seq는 silence flush가 이미 +3 했으므로 +1만
+            s.virtual_base_seq = s.last_virtual_seq.wrapping_add(1);
+        } else {
+            // Video rewriter — dynamic ts_gap (idle 경과 시간 반영)
+            // arrival_time gap과 RTP ts gap 불일치 → jitter buffer 오동작 방지
+            // Audio와 동일 원리: 실제 idle 시간을 ts에 반영
+            let dynamic_ts_gap = if let Some(cleared) = s.cleared_at {
+                let elapsed_ms = cleared.elapsed().as_millis() as u32;
+                let gap = elapsed_ms.saturating_mul(90); // 90kHz: 90 ticks/ms
+                let gap = gap.max(self.ts_guard_gap);     // 최소 3000 (~33ms)
+                info!("[PTT:REWRITE] video dynamic ts_gap: idle={}ms → ts_gap={} (vs fixed={})",
+                    elapsed_ms, gap, self.ts_guard_gap);
+                gap
+            } else {
+                self.ts_guard_gap
+            };
+            s.virtual_base_ts = s.last_virtual_ts.wrapping_add(dynamic_ts_gap);
             s.virtual_base_seq = s.last_virtual_seq.wrapping_add(1);
         }
         s.cleared_at = None;
@@ -259,13 +275,8 @@ impl PttRewriter {
             s.origin_base_seq = orig_seq;
             s.origin_base_ts = orig_ts;
 
-            // Video: switch_speaker에서 base를 안 잡았으므로 여기서 기존 방식으로 계산
-            // Audio: switch_speaker에서 동적 ts_gap으로 이미 계산 완료
-            if self.require_keyframe {
-                s.virtual_base_seq = s.last_virtual_seq.wrapping_add(1);
-                s.virtual_base_ts = s.last_virtual_ts.wrapping_add(self.ts_guard_gap);
-            }
-
+            // Audio/Video 모두 switch_speaker에서 dynamic ts_gap 기반 v_base 설정 완료
+            // 여기서는 origin_base만 설정
             s.awaiting_first_packet = false;
 
             debug!("[PTT:REWRITE] first_pkt user={} orig_seq={} orig_ts={} → v_base_seq={} v_base_ts={}",
@@ -302,8 +313,11 @@ impl PttRewriter {
         plaintext[6] = ts_bytes[2];
         plaintext[7] = ts_bytes[3];
 
-        // 화자 전환 첫 패킷: marker bit 설정 (수신 측 Jitter Buffer 플러시 힌트)
-        if is_first {
+        // 화자 전환 첫 패킷: marker bit 설정 (Audio 전용)
+        // Opus는 1패킷=1프레임이라 marker 강제가 무해.
+        // VP8는 키프레임이 다중 패킷으로 분할되므로, 첫 패킷에 marker=1을 설정하면
+        // Chrome이 "이 패킷이 전체 프레임"으로 오인 → 불완전 디코딩 → freeze.
+        if is_first && !self.require_keyframe {
             plaintext[1] |= 0x80;
         }
 
@@ -397,6 +411,74 @@ pub fn is_vp8_keyframe(rtp_plaintext: &[u8]) -> bool {
     if rtp_plaintext.len() <= pd_offset { return false; }
     let frame_byte = rtp_plaintext[pd_offset];
     (frame_byte & 0x01) == 0
+}
+
+/// VP8 진단 정보 (임시 디버그 — 키프레임 미도착 원인 추적용)
+pub struct Vp8Diag {
+    pub is_keyframe: bool,
+    pub pd_bytes: [u8; 4],
+    pub frame_byte: Option<u8>,
+    pub s_bit: bool,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+}
+
+/// VP8 payload descriptor 진단 — is_vp8_keyframe()과 동일 파싱 경로로 상세 정보 반환
+pub fn diagnose_vp8(rtp_plaintext: &[u8]) -> Option<Vp8Diag> {
+    if rtp_plaintext.len() < 13 { return None; }
+
+    let cc = (rtp_plaintext[0] & 0x0F) as usize;
+    let has_ext = (rtp_plaintext[0] & 0x10) != 0;
+    let mut offset = 12 + cc * 4;
+
+    if has_ext {
+        if rtp_plaintext.len() < offset + 4 { return None; }
+        let ext_len = u16::from_be_bytes([
+            rtp_plaintext[offset + 2], rtp_plaintext[offset + 3],
+        ]) as usize;
+        offset += 4 + ext_len * 4;
+    }
+
+    if rtp_plaintext.len() <= offset { return None; }
+
+    let payload_offset = offset;
+    let payload_len = rtp_plaintext.len() - offset;
+    let pd = rtp_plaintext[offset];
+    let x = (pd & 0x80) != 0;
+    let s = (pd & 0x10) != 0;
+
+    // PD 첫 4바이트 수집
+    let mut pd_bytes = [0u8; 4];
+    let avail = payload_len.min(4);
+    pd_bytes[..avail].copy_from_slice(&rtp_plaintext[payload_offset..payload_offset + avail]);
+
+    // frame byte 추출 (is_vp8_keyframe 동일 경로)
+    let mut pd_offset = offset + 1;
+    if x {
+        if rtp_plaintext.len() <= pd_offset {
+            return Some(Vp8Diag { is_keyframe: false, pd_bytes, frame_byte: None, s_bit: s, payload_offset, payload_len });
+        }
+        let x_byte = rtp_plaintext[pd_offset];
+        pd_offset += 1;
+        if (x_byte & 0x80) != 0 {
+            if rtp_plaintext.len() <= pd_offset {
+                return Some(Vp8Diag { is_keyframe: false, pd_bytes, frame_byte: None, s_bit: s, payload_offset, payload_len });
+            }
+            if (rtp_plaintext[pd_offset] & 0x80) != 0 { pd_offset += 2; } else { pd_offset += 1; }
+        }
+        if (x_byte & 0x40) != 0 { pd_offset += 1; }
+        if (x_byte & 0x20) != 0 || (x_byte & 0x10) != 0 { pd_offset += 1; }
+    }
+
+    let frame_byte = if rtp_plaintext.len() > pd_offset {
+        Some(rtp_plaintext[pd_offset])
+    } else {
+        None
+    };
+
+    let is_keyframe = s && frame_byte.map(|b| (b & 0x01) == 0).unwrap_or(false);
+
+    Some(Vp8Diag { is_keyframe, pd_bytes, frame_byte, s_bit: s, payload_offset, payload_len })
 }
 
 /// 랜덤 u32 생성
