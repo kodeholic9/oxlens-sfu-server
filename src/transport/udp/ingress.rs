@@ -118,6 +118,29 @@ impl UdpTransport {
         // Per-packet stats: jitter, recv_stats, cache, TWCC
         self.collect_rtp_stats(&plaintext, &rtp_hdr, &sender, is_detail);
 
+        // Layer 1b: Publisher video RTP gap 감지 (atomic swap only — 루프 없음)
+        // gap > 3초: cache가 이미 덮어쓰여져서 subscriber NACK이 무의미 → 억제 + PLI burst
+        if config::is_video_pt(rtp_hdr.pt) {
+            let now_ms = sender.last_seen.load(Ordering::Relaxed); // touch()에서 설정된 값 재활용
+            let prev_ms = sender.last_video_rtp_ms.swap(now_ms, Ordering::Relaxed);
+            if prev_ms > 0 && now_ms.saturating_sub(prev_ms) > 3000 {
+                // 희귀 이벤트: publisher video RTP gap detected
+                self.metrics.rtp_gap_detected.fetch_add(1, Ordering::Relaxed);
+                sender.rtp_gap_suppress_until_ms.store(now_ms + 5000, Ordering::Relaxed);
+                // PLI burst to publisher (키프레임 확보)
+                if let Some(pub_addr) = sender.publish.get_address() {
+                    if sender.is_publish_ready() {
+                        super::pli::spawn_pli_burst(
+                            &sender, rtp_hdr.ssrc, pub_addr,
+                            self.socket.clone(), &[0, 500, 1500], "RTP_GAP",
+                        );
+                    }
+                }
+                info!("[RTP:GAP] video gap {}ms user={} ssrc=0x{:08X}",
+                    now_ms.saturating_sub(prev_ms), sender.user_id, rtp_hdr.ssrc);
+            }
+        }
+
         if is_detail {
             debug!("[DBG:RTP] #{} user={} ssrc=0x{:08X} pt={} seq={} ts={} marker={} payload_len={}",
                 seq_num, sender.user_id,
@@ -940,7 +963,34 @@ impl UdpTransport {
                 None => continue,
             };
 
-            let compound = assemble_compound(blocks);
+            // Layer 2: PLI throttle — publisher별 3초당 1회 제한
+            let pli_count_raw = pli_per_ssrc.get(media_ssrc).copied().unwrap_or(0);
+            let pli_throttled = if pli_count_raw > 0 {
+                let now_ms = current_ts();
+                let last_pli = publisher.last_pli_relay_ms.load(Ordering::Relaxed);
+                if now_ms.saturating_sub(last_pli) < 3000 {
+                    self.metrics.pli_throttled.fetch_add(pli_count_raw, Ordering::Relaxed);
+                    true
+                } else {
+                    publisher.last_pli_relay_ms.store(now_ms, Ordering::Relaxed);
+                    false
+                }
+            } else { false };
+
+            // PLI throttled → PSFB 블록 제거 (non-PLI RTCP만 전달)
+            let filtered_blocks: Vec<&[u8]>;
+            let send_blocks: &[&[u8]] = if pli_throttled {
+                filtered_blocks = blocks.iter()
+                    .filter(|b| (b.get(1).copied().unwrap_or(0) & 0x7F) != config::RTCP_PT_PSFB)
+                    .copied()
+                    .collect();
+                if filtered_blocks.is_empty() { continue; }
+                &filtered_blocks
+            } else {
+                blocks
+            };
+
+            let compound = assemble_compound(send_blocks);
 
             let encrypted = {
                 let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
@@ -961,11 +1011,11 @@ impl UdpTransport {
                         media_ssrc, pub_addr);
                 }
             } else {
-                // PLI per-publisher 계측
-                let pli_count = pli_per_ssrc.get(media_ssrc).copied().unwrap_or(0);
-                if pli_count > 0 {
-                    self.metrics.pli_sent.fetch_add(pli_count, Ordering::Relaxed);
-                    publisher.pipeline.pub_pli_received.fetch_add(pli_count, Ordering::Relaxed);
+                // PLI per-publisher 계측 (throttle된 경우 0)
+                let effective_pli = if pli_throttled { 0 } else { pli_count_raw };
+                if effective_pli > 0 {
+                    self.metrics.pli_sent.fetch_add(effective_pli, Ordering::Relaxed);
+                    publisher.pipeline.pub_pli_received.fetch_add(effective_pli, Ordering::Relaxed);
                     crate::agg_logger::inc_with(
                         crate::agg_logger::agg_key(&["pli_subscriber_relay", &room.id, &publisher.user_id, &_subscriber.user_id]),
                         format!("pli_subscriber_relay pub={} sub={}", publisher.user_id, _subscriber.user_id),
@@ -993,6 +1043,14 @@ impl UdpTransport {
         is_detail: bool,
     ) {
         let nack_items = parse_rtcp_nack(nack_data);
+
+        // Layer 1a: NACK storm protection — subscriber 억제 체크
+        let now_ms = current_ts();
+        let suppress_until = subscriber.nack_suppress_until_ms.load(Ordering::Relaxed);
+        if suppress_until > 0 && now_ms < suppress_until {
+            self.metrics.nack_suppressed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         // Phase E-4: PTT 모드 NACK 역매핑
         let is_ptt = room.mode == RoomMode::Ptt;
@@ -1073,6 +1131,13 @@ impl UdpTransport {
                 }
             };
 
+            // Layer 1b: publisher RTP gap 억제 체크 (cache가 덮어쓰여져서 NACK 무의미)
+            let pub_gap_until = publisher.rtp_gap_suppress_until_ms.load(Ordering::Relaxed);
+            if pub_gap_until > 0 && now_ms < pub_gap_until {
+                self.metrics.nack_suppressed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             let rtx_ssrc = publisher.get_tracks().iter()
                 .find(|t| t.ssrc == lookup_ssrc)
                 .and_then(|t| t.rtx_ssrc);
@@ -1115,6 +1180,25 @@ impl UdpTransport {
                     crate::agg_logger::agg_key(&["rtx_cache_miss", &room.id, &subscriber.user_id]),
                     format!("rtx_cache_miss {}/{} ssrc=0x{:08X} pub={} sub={}",
                         cache_miss, cache_seqs.len(), lookup_ssrc, publisher.user_id, subscriber.user_id),
+                    Some(&room.id),
+                );
+            }
+
+            // Layer 1a: NACK→PLI 에스컬레이션 — 절반 이상 cache miss → NACK 억제 + PLI 전송
+            if cache_miss > 0 && cache_miss * 2 >= cache_seqs.len() {
+                subscriber.nack_suppress_until_ms.store(now_ms + 5000, Ordering::Relaxed);
+                if let Some(pub_addr) = publisher.publish.get_address() {
+                    if publisher.is_publish_ready() {
+                        super::pli::spawn_pli_burst(
+                            &publisher, lookup_ssrc, pub_addr,
+                            self.socket.clone(), &[0], "NACK_ESC",
+                        );
+                    }
+                }
+                crate::agg_logger::inc_with(
+                    crate::agg_logger::agg_key(&["nack_escalation", &room.id, &subscriber.user_id]),
+                    format!("nack_escalation miss={}/{} pub={} sub={}",
+                        cache_miss, cache_seqs.len(), publisher.user_id, subscriber.user_id),
                     Some(&room.id),
                 );
             }

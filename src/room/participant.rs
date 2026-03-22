@@ -533,6 +533,18 @@ pub struct Participant {
     /// 마지막 audio RTP 도착 시각 (µs, Instant 대신 u64로 저장 — AtomicU64 호환)
     pub last_audio_arrival_us: AtomicU64,
 
+    // --- NACK storm protection (Layer 1) ---
+    /// 이 시각(ms epoch) 이전까지 이 subscriber의 NACK 처리 억제 (0 = 억제 안 함)
+    /// cache miss 연속 시 설정, 5초 후 자동 해제 (per-subscriber)
+    pub nack_suppress_until_ms: AtomicU64,
+    /// 이 publisher의 RTP gap 감지 시 NACK 억제 (per-publisher, 0 = 억제 안 함)
+    /// 화면 off→on 복귀 시 cache는 이미 덮어쓰여져서 NACK이 무의미
+    pub rtp_gap_suppress_until_ms: AtomicU64,
+    /// 마지막 video RTP 도착 시각 (ms epoch) — publisher RTP gap 감지용
+    pub last_video_rtp_ms: AtomicU64,
+    /// 이 publisher에 대한 마지막 PLI relay 시각 (ms epoch) — PLI throttle용
+    pub last_pli_relay_ms: AtomicU64,
+
     // --- Simulcast ---
     /// Chrome offerer가 할당한 TWCC extmap ID (client-offer 모드에서 전달받음)
     pub twcc_extmap_id: AtomicU8,
@@ -582,6 +594,10 @@ impl Participant {
             rtx_budget_used: AtomicU64::new(0),
             pli_burst_handle: Mutex::new(None),
             last_audio_arrival_us: AtomicU64::new(0),
+            nack_suppress_until_ms: AtomicU64::new(0),
+            rtp_gap_suppress_until_ms: AtomicU64::new(0),
+            last_video_rtp_ms: AtomicU64::new(0),
+            last_pli_relay_ms: AtomicU64::new(0),
             twcc_extmap_id: AtomicU8::new(0),
             simulcast_video_ssrc: AtomicU32::new(0),
             subscribe_layers: Mutex::new(HashMap::new()),

@@ -182,6 +182,14 @@ pub(crate) struct GlobalMetrics {
     /// PT 정규화 횟수 (client actual PT → 서버 표준 PT 변환)
     pub(crate) pt_normalized:           AtomicU64,
 
+    // ---- NACK storm protection ----
+    /// NACK 억제된 횟수 (cache miss 연속 → 일정 시간 NACK 무시)
+    pub(crate) nack_suppressed:         AtomicU64,
+    /// PLI throttle된 횟수 (publisher당 3초 1회 제한 초과)
+    pub(crate) pli_throttled:           AtomicU64,
+    /// publisher RTP gap 감지 횟수 (3초+ 공백 후 재개)
+    pub(crate) rtp_gap_detected:        AtomicU64,
+
     // ---- RTCP Terminator 진단 스냅샷 (1초마다 갱신, 3초 flush 시 전송) ----
     pub(crate) rr_diag_snapshot: Mutex<Vec<serde_json::Value>>,
 
@@ -250,6 +258,9 @@ impl GlobalMetrics {
             ptt_video_rewritten:    AtomicU64::new(0),
             ptt_video_skip:         AtomicU64::new(0),
             pt_normalized:          AtomicU64::new(0),
+            nack_suppressed:        AtomicU64::new(0),
+            pli_throttled:          AtomicU64::new(0),
+            rtp_gap_detected:       AtomicU64::new(0),
             rr_diag_snapshot: Mutex::new(Vec::new()),
             tokio_snapshot:  Mutex::new(TokioRuntimeSnapshot::new()),
             env_meta:        EnvironmentMeta::capture(worker_count, bwe_mode),
@@ -343,6 +354,9 @@ impl GlobalMetrics {
         let ptt_video_rw          = self.ptt_video_rewritten.swap(0, Ordering::Relaxed);
         let ptt_video_skip        = self.ptt_video_skip.swap(0, Ordering::Relaxed);
         let pt_normalized         = self.pt_normalized.swap(0, Ordering::Relaxed);
+        let nack_suppressed       = self.nack_suppressed.swap(0, Ordering::Relaxed);
+        let pli_throttled         = self.pli_throttled.swap(0, Ordering::Relaxed);
+        let rtp_gap_detected      = self.rtp_gap_detected.swap(0, Ordering::Relaxed);
 
         // RTCP Terminator 진단 스냅샷 (swap 추출)
         let rr_diag = {
@@ -391,6 +405,9 @@ impl GlobalMetrics {
             "spawn_sr_relayed":   spawn_sr_relayed,
             "spawn_encrypt_fail": spawn_encrypt_fail,
             "pt_normalized":     pt_normalized,
+            "nack_suppressed":   nack_suppressed,
+            "pli_throttled":     pli_throttled,
+            "rtp_gap_detected":  rtp_gap_detected,
         });
 
         let ptt_json = serde_json::json!({
