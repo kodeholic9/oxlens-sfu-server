@@ -277,6 +277,36 @@ impl std::fmt::Display for PcType {
 // Track
 // ============================================================================
 
+/// 비디오 코덱 종류 (PUBLISH_TRACKS에서 클라이언트가 전달)
+/// mediasoup/Janus 선례: SDP 또는 시그널링에서 코덱을 명시적으로 전달받음.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VideoCodec {
+    Vp8,
+    H264,
+    Vp9,
+}
+
+impl VideoCodec {
+    /// 클라이언트 문자열 → VideoCodec (대소문자 무관, 미지정 시 VP8 기본)
+    pub fn from_str_or_default(s: Option<&str>) -> Self {
+        match s.map(|c| c.to_uppercase()).as_deref() {
+            Some("H264") => VideoCodec::H264,
+            Some("VP9")  => VideoCodec::Vp9,
+            _            => VideoCodec::Vp8,
+        }
+    }
+}
+
+impl std::fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VideoCodec::Vp8  => write!(f, "VP8"),
+            VideoCodec::H264 => write!(f, "H264"),
+            VideoCodec::Vp9  => write!(f, "VP9"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum TrackKind {
     Audio,
@@ -305,6 +335,8 @@ pub struct Track {
     pub rid: Option<String>,
     /// Simulcast 그룹 ID (같은 소스의 h/l 레이어는 동일 group)
     pub simulcast_group: Option<u32>,
+    /// 비디오 코덱 (PUBLISH_TRACKS에서 전달, audio는 Vp8 기본값 — 참조 안 됨)
+    pub video_codec: VideoCodec,
 }
 
 // ============================================================================
@@ -554,20 +586,16 @@ impl Participant {
 
     /// 트랙 등록 (SSRC 중복 방지). video 트랙은 RTX SSRC 자동 할당.
     pub fn add_track(&self, ssrc: u32, kind: TrackKind, track_id: String) {
-        let mut tracks = self.tracks.lock().unwrap();
-        if !tracks.iter().any(|t| t.ssrc == ssrc) {
-            let rtx_ssrc = if kind == TrackKind::Video {
-                Some(self.alloc_rtx_ssrc(ssrc))
-            } else {
-                None
-            };
-            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid: None, simulcast_group: None });
-            trace!("track added ssrc={} rtx_ssrc={:?} user={}", ssrc, rtx_ssrc, self.user_id);
-        }
+        self.add_track_full(ssrc, kind, track_id, None, None, VideoCodec::Vp8);
     }
 
     /// Simulcast rid/simulcast_group 포함 트랙 등록
-    pub fn add_track_ext(&self, ssrc: u32, kind: TrackKind, track_id: String, rid: Option<String>, simulcast_group: Option<u32>) {
+    pub fn add_track_ext(&self, ssrc: u32, kind: TrackKind, track_id: String, rid: Option<String>, simulcast_group: Option<u32>, video_codec: VideoCodec) {
+        self.add_track_full(ssrc, kind, track_id, rid, simulcast_group, video_codec);
+    }
+
+    /// 트랙 등록 내부 구현 (SSRC 중복 방지, video → RTX SSRC 자동 할당)
+    fn add_track_full(&self, ssrc: u32, kind: TrackKind, track_id: String, rid: Option<String>, simulcast_group: Option<u32>, video_codec: VideoCodec) {
         let mut tracks = self.tracks.lock().unwrap();
         if !tracks.iter().any(|t| t.ssrc == ssrc) {
             let rtx_ssrc = if kind == TrackKind::Video {
@@ -575,10 +603,19 @@ impl Participant {
             } else {
                 None
             };
-            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid, simulcast_group });
-            trace!("track added (ext) ssrc={} rtx_ssrc={:?} rid={:?} group={:?} user={}",
-                ssrc, rtx_ssrc, tracks.last().unwrap().rid, simulcast_group, self.user_id);
+            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc, muted: false, rid, simulcast_group, video_codec });
+            trace!("track added ssrc={} rtx_ssrc={:?} rid={:?} codec={} user={}",
+                ssrc, rtx_ssrc, tracks.last().unwrap().rid, video_codec, self.user_id);
         }
+    }
+
+    /// 이 참가자의 video 코덱 조회 (첫 번째 video track 기준)
+    pub fn get_video_codec(&self) -> VideoCodec {
+        let tracks = self.tracks.lock().unwrap();
+        tracks.iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .map(|t| t.video_codec)
+            .unwrap_or(VideoCodec::Vp8)
     }
 
     /// RTX SSRC 할당: media_ssrc + 1000 + counter (충돌 회피)

@@ -337,14 +337,19 @@ impl UdpTransport {
 
         // Phase E-2/E-4: PTT 모드 SSRC 리라이팅 (오디오 + 비디오)
         if room.mode == RoomMode::Ptt {
-            use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe};
+            use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe, is_h264_keyframe};
+            use crate::room::participant::VideoCodec;
             let mut rewritten = plaintext.to_vec();
             let result = if rtp_hdr.pt == 111 {
                 // Audio (Opus) — 키프레임 대기 없음
                 room.audio_rewriter.rewrite(&mut rewritten, &sender.user_id, false)
             } else if rtp_hdr.pt == 96 {
-                // Video (VP8) — 키프레임 감지 후 리라이팅
-                let keyframe = is_vp8_keyframe(plaintext);
+                // Video — 코덱별 키프레임 감지 (mediasoup/Janus 선례)
+                let codec = sender.get_video_codec();
+                let keyframe = match codec {
+                    VideoCodec::H264 => is_h264_keyframe(plaintext),
+                    _ => is_vp8_keyframe(plaintext),
+                };
                 if keyframe {
                     self.metrics.ptt_keyframe_arrived.fetch_add(1, Ordering::Relaxed);
                 }
@@ -408,7 +413,14 @@ impl UdpTransport {
             None => return, // simulcast track이 아님
         };
 
-        let is_keyframe = crate::room::ptt_rewriter::is_vp8_keyframe(fanout_payload);
+        let is_keyframe = {
+            use crate::room::participant::VideoCodec;
+            let codec = sender.get_video_codec();
+            match codec {
+                VideoCodec::H264 => crate::room::ptt_rewriter::is_h264_keyframe(fanout_payload),
+                _ => crate::room::ptt_rewriter::is_vp8_keyframe(fanout_payload),
+            }
+        };
         let vssrc = sender.ensure_simulcast_video_ssrc();
         let mut pli_sent = false;
 

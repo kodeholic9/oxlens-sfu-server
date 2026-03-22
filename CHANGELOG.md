@@ -7,6 +7,31 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.5] - 2026-03-22
+
+### Added (H264 키프레임 감지 — 멀티 코덱 지원)
+
+#### VideoCodec enum + PUBLISH_TRACKS codec 필드 (participant.rs, message.rs)
+- `VideoCodec` enum (Vp8, H264, Vp9) + `Track.video_codec` 필드 추가
+- `PublishTrackItem.codec` optional 필드 ("VP8" | "H264" | "VP9", 없으면 VP8 기본)
+- mediasoup/Janus 선례: 시그널링에서 코덱을 명시적으로 전달받음
+- 구버전 클라이언트 호환: codec 필드 미전송 시 VP8 fallback
+
+#### is_h264_keyframe() 구현 (ptt_rewriter.rs)
+- H264 키프레임 감지 (RFC 6184): SPS(NAL=7) + IDR(NAL=5) 기준
+- STAP-A(24) 내부 sub-NAL 검사, FU-A(28) start_bit + inner_type 검사
+- mediasoup #283 교훈: SPS 도착 시점을 키프레임으로 판정 (IDR만 보면 race condition)
+- rtp_payload_offset() 공통 함수 추출 (VP8/H264 공용)
+
+#### 코덱별 키프레임 감지 분기 (ingress.rs)
+- PTT prepare_fanout_payload(): sender.get_video_codec() → H264/VP8 분기
+- Simulcast fanout_simulcast_video(): 동일 분기 적용
+- iPhone/Safari(H264) PTT/Simulcast 방 참여 시 비디오 드롭 해결
+
+#### 웹 클라이언트 codec 전달 (media-session.js)
+- _getOutboundTracks(): outbound-rtp codecId → mimeType → codec 필드 추출
+- PUBLISH_TRACKS 페이로드에 codec 포함 (예: {kind:"video", ssrc:123, codec:"H264"})
+
 ## [0.6.4] - 2026-03-22
 
 ### Fixed (PTT Video Freeze — WARM 복귀 시 영상 정지)

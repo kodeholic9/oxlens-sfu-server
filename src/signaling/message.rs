@@ -90,6 +90,10 @@ pub struct PublishTrackItem {
     /// Simulcast RTP stream ID ("h" | "l", None for non-simulcast)
     #[serde(default)]
     pub rid: Option<String>,
+    /// 비디오 코덱 ("VP8" | "H264" | "VP9", 없으면 VP8 기본)
+    /// mediasoup/Janus 선례: 시그널링에서 코덱을 명시적으로 전달받음.
+    #[serde(default)]
+    pub codec: Option<String>,
 }
 
 /// 트랙 mute/unmute 상태 변경 요청

@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
 use crate::config::RoomMode;
-use crate::room::participant::{TrackKind, SimulcastRewriter, SubscribeLayerEntry};
+use crate::room::participant::{TrackKind, VideoCodec, SimulcastRewriter, SubscribeLayerEntry};
 use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
@@ -58,12 +58,14 @@ pub(super) async fn handle_publish_tracks(session: &Session, state: &AppState, p
         let track_id = format!("{}_{}", user_id, track_id_counter);
         track_id_counter += 1;
 
+        let video_codec = VideoCodec::from_str_or_default(t.codec.as_deref());
+
         if let Some(ref rid) = t.rid {
             let group = simulcast_group_counter;
             if rid == "l" { simulcast_group_counter += 1; }
-            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), Some(rid.clone()), Some(group));
+            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), Some(rid.clone()), Some(group), video_codec);
         } else {
-            participant.add_track(t.ssrc, kind.clone(), track_id.clone());
+            participant.add_track_ext(t.ssrc, kind.clone(), track_id.clone(), None, None, video_codec);
         }
 
         let rtx_ssrc = participant.get_tracks().iter()

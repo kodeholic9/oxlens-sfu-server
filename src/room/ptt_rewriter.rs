@@ -378,25 +378,41 @@ impl PttRewriter {
     }
 }
 
-/// VP8 키프레임 감지 (RFC 7741)
-/// RTP payload 첫 바이트의 VP8 payload descriptor에서 I-frame 여부 판별
-/// VP8 payload descriptor: 1st octet bit0(S) + bit4(P)
-///   P=0 → key frame, P=1 → inter frame (delta)
-pub fn is_vp8_keyframe(rtp_plaintext: &[u8]) -> bool {
-    if rtp_plaintext.len() < 13 { return false; }
+// ============================================================================
+// RTP payload offset 공통 함수
+// ============================================================================
 
-    // RTP 헤더 크기 계산 (고정 12 + CSRC + extension)
+/// RTP 헤더 끝나는 지점 (payload 시작 offset) 계산.
+/// 고정 12바이트 + CSRC (CC개 × 4) + header extension.
+/// VP8/H264/VP9 키프레임 감지에서 공용.
+pub fn rtp_payload_offset(rtp_plaintext: &[u8]) -> Option<usize> {
+    if rtp_plaintext.len() < 12 { return None; }
     let cc = (rtp_plaintext[0] & 0x0F) as usize;
     let has_ext = (rtp_plaintext[0] & 0x10) != 0;
     let mut offset = 12 + cc * 4;
 
     if has_ext {
-        if rtp_plaintext.len() < offset + 4 { return false; }
+        if rtp_plaintext.len() < offset + 4 { return None; }
         let ext_len = u16::from_be_bytes([rtp_plaintext[offset + 2], rtp_plaintext[offset + 3]]) as usize;
         offset += 4 + ext_len * 4;
     }
 
-    if rtp_plaintext.len() <= offset { return false; }
+    if rtp_plaintext.len() <= offset { return None; }
+    Some(offset)
+}
+
+// ============================================================================
+// VP8 키프레임 감지 (RFC 7741)
+// ============================================================================
+
+/// VP8 키프레임 감지
+/// VP8 payload descriptor: 1st octet bit0(S) + bit4(P)
+///   P=0 → key frame, P=1 → inter frame (delta)
+pub fn is_vp8_keyframe(rtp_plaintext: &[u8]) -> bool {
+    let offset = match rtp_payload_offset(rtp_plaintext) {
+        Some(o) => o,
+        None => return false,
+    };
 
     // VP8 payload descriptor: 첫 바이트
     let pd = rtp_plaintext[offset];
@@ -433,6 +449,65 @@ pub fn is_vp8_keyframe(rtp_plaintext: &[u8]) -> bool {
     if rtp_plaintext.len() <= pd_offset { return false; }
     let frame_byte = rtp_plaintext[pd_offset];
     (frame_byte & 0x01) == 0
+}
+
+// ============================================================================
+// H264 키프레임 감지 (RFC 6184)
+// ============================================================================
+
+/// H264 키프레임 감지.
+///
+/// mediasoup/Janus 선례: SPS(NAL type 7) 도착을 키프레임으로 판정.
+/// - mediasoup #283: IDR(5)만 보면 race condition — SPS 없이 IDR만 받은 디코더는 해상도 정보 없어 깨짐
+/// - Janus commit 86a00fe: SPS/PPS 도착 시점에서 전환 판단
+///
+/// NAL unit types (RFC 6184):
+///   1-23: Single NAL unit (5=IDR, 7=SPS)
+///   24:   STAP-A (aggregation)
+///   28:   FU-A (fragmentation)
+pub fn is_h264_keyframe(rtp_plaintext: &[u8]) -> bool {
+    let offset = match rtp_payload_offset(rtp_plaintext) {
+        Some(o) => o,
+        None => return false,
+    };
+
+    let first_byte = rtp_plaintext[offset];
+    let nal_type = first_byte & 0x1F;
+
+    match nal_type {
+        // Single NAL unit: SPS(7) 또는 IDR(5)
+        7 | 5 => true,
+
+        // STAP-A(24): 내부 NAL unit 중 SPS(7) 또는 IDR(5) 검색
+        24 => {
+            let mut pos = offset + 1;
+            while pos + 2 < rtp_plaintext.len() {
+                let nalu_size = u16::from_be_bytes([
+                    rtp_plaintext[pos], rtp_plaintext[pos + 1]
+                ]) as usize;
+                pos += 2;
+                if pos < rtp_plaintext.len() {
+                    let sub_type = rtp_plaintext[pos] & 0x1F;
+                    if sub_type == 7 || sub_type == 5 { return true; }
+                }
+                // nalu_size 바이트만큼 건너뛰기 (남은 바이트 부족 시 중단)
+                if rtp_plaintext.len() < pos + nalu_size { break; }
+                pos += nalu_size;
+            }
+            false
+        }
+
+        // FU-A(28): start_bit + 내부 NAL type이 IDR(5) 또는 SPS(7)
+        28 => {
+            if rtp_plaintext.len() <= offset + 1 { return false; }
+            let fu_header = rtp_plaintext[offset + 1];
+            let start_bit = (fu_header & 0x80) != 0;
+            let inner_type = fu_header & 0x1F;
+            start_bit && (inner_type == 5 || inner_type == 7)
+        }
+
+        _ => false,
+    }
 }
 
 /// 랜덤 u32 생성
