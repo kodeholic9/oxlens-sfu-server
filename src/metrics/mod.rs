@@ -178,6 +178,10 @@ pub(crate) struct GlobalMetrics {
     /// 비디오 rewriter Skip 횟수 (화자 불일치)
     pub(crate) ptt_video_skip:          AtomicU64,
 
+    // ---- Multi-codec (Phase H264) ----
+    /// PT 정규화 횟수 (client actual PT → 서버 표준 PT 변환)
+    pub(crate) pt_normalized:           AtomicU64,
+
     // ---- RTCP Terminator 진단 스냅샷 (1초마다 갱신, 3초 flush 시 전송) ----
     pub(crate) rr_diag_snapshot: Mutex<Vec<serde_json::Value>>,
 
@@ -245,6 +249,7 @@ impl GlobalMetrics {
             ptt_audio_rewritten:    AtomicU64::new(0),
             ptt_video_rewritten:    AtomicU64::new(0),
             ptt_video_skip:         AtomicU64::new(0),
+            pt_normalized:          AtomicU64::new(0),
             rr_diag_snapshot: Mutex::new(Vec::new()),
             tokio_snapshot:  Mutex::new(TokioRuntimeSnapshot::new()),
             env_meta:        EnvironmentMeta::capture(worker_count, bwe_mode),
@@ -337,6 +342,7 @@ impl GlobalMetrics {
         let ptt_audio_rw          = self.ptt_audio_rewritten.swap(0, Ordering::Relaxed);
         let ptt_video_rw          = self.ptt_video_rewritten.swap(0, Ordering::Relaxed);
         let ptt_video_skip        = self.ptt_video_skip.swap(0, Ordering::Relaxed);
+        let pt_normalized         = self.pt_normalized.swap(0, Ordering::Relaxed);
 
         // RTCP Terminator 진단 스냅샷 (swap 추출)
         let rr_diag = {
@@ -384,6 +390,7 @@ impl GlobalMetrics {
             "spawn_rtp_relayed":  spawn_rtp_relayed,
             "spawn_sr_relayed":   spawn_sr_relayed,
             "spawn_encrypt_fail": spawn_encrypt_fail,
+            "pt_normalized":     pt_normalized,
         });
 
         let ptt_json = serde_json::json!({

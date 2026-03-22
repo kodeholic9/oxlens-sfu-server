@@ -104,10 +104,12 @@ impl UdpTransport {
                 let std_pt = track.video_codec.standard_pt();
                 plaintext[1] = (plaintext[1] & 0x80) | std_pt;
                 rtp_hdr.pt = std_pt;
+                self.metrics.pt_normalized.fetch_add(1, Ordering::Relaxed);
             } else if let Some(track) = tracks.iter().find(|t| t.actual_rtx_pt != 0 && t.actual_rtx_pt == rtp_hdr.pt) {
                 let std_rtx = track.video_codec.standard_rtx_pt();
                 plaintext[1] = (plaintext[1] & 0x80) | std_rtx;
                 rtp_hdr.pt = std_rtx;
+                self.metrics.pt_normalized.fetch_add(1, Ordering::Relaxed);
             }
         }
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
@@ -965,8 +967,8 @@ impl UdpTransport {
                     self.metrics.pli_sent.fetch_add(pli_count, Ordering::Relaxed);
                     publisher.pipeline.pub_pli_received.fetch_add(pli_count, Ordering::Relaxed);
                     crate::agg_logger::inc_with(
-                        crate::agg_logger::agg_key(&["pli_subscriber_relay", &room.id, &publisher.user_id]),
-                        format!("pli_subscriber_relay pub={}", publisher.user_id),
+                        crate::agg_logger::agg_key(&["pli_subscriber_relay", &room.id, &publisher.user_id, &_subscriber.user_id]),
+                        format!("pli_subscriber_relay pub={} sub={}", publisher.user_id, _subscriber.user_id),
                         Some(&room.id),
                     );
                 }
@@ -1110,9 +1112,9 @@ impl UdpTransport {
             if cache_miss > 0 {
                 self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
                 crate::agg_logger::inc_with(
-                    crate::agg_logger::agg_key(&["rtx_cache_miss", &room.id]),
-                    format!("rtx_cache_miss {}/{} ssrc=0x{:08X} user={}",
-                        cache_miss, cache_seqs.len(), lookup_ssrc, publisher.user_id),
+                    crate::agg_logger::agg_key(&["rtx_cache_miss", &room.id, &subscriber.user_id]),
+                    format!("rtx_cache_miss {}/{} ssrc=0x{:08X} pub={} sub={}",
+                        cache_miss, cache_seqs.len(), lookup_ssrc, publisher.user_id, subscriber.user_id),
                     Some(&room.id),
                 );
             }
