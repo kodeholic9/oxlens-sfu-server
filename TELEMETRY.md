@@ -335,22 +335,25 @@ WebRTC 프로토콜의 기대 계약이 이행되는지 자동 판정.
 
 ---
 
-## 12. 현재 구현 상태 (v0.5.4)
+## 12. 현재 구현 상태 (v0.6.4)
 
 | 구간 | 수집 | 어드민 표시 | 비고 |
 |------|------|------------|------|
 | S-1 (SDP) | ✅ | ✅ | 입장 시 + subscribe 변경 시 |
 | S-2 (코덱) | ✅ | ✅ | 3초 주기 |
 | A (Publish) | ✅ | ✅ | delta bitrate + 인코더 진단 (framesSent/huge/encTime/qld delta) |
-| B (SFU) | ✅ | ✅ | 타이밍 + RTCP 카운터 |
+| B (SFU) | ✅ | ✅ | 타이밍 + RTCP 카운터 + PipelineStats + AggLogger |
 | C (Subscribe) | ✅ | ✅ | sourceUser + delta bitrate 포함 |
 | 구간별 손실 | ✅ | ✅ | pub→sub cross-reference (어드민 매칭) |
 | 이벤트 타임라인 | ✅ | ✅ | 10종 상태 전이 감지, 링버퍼 50개 |
 | Contract | ✅ | ✅ | 12항목 (encoder_bottleneck 포함) |
-| 스냅샷 | ✅ | ✅ | LOSS CROSS-REF + EVENT TIMELINE 섹션 추가 |
+| 스냅샷 | ✅ | ✅ | LOSS CROSS-REF + EVENT TIMELINE + PIPELINE STATS 섹션 |
+| PipelineStats | ✅ | ✅ | per-participant 파이프라인 카운터 (pub/sub 7종) |
+| AggLogger | ✅ | ✅ | 핫패스 로그 집계 (DashMap 해시키 기반) |
+| PLI/NACK 계측 | ✅ | ✅ | per-participant PLI·NACK·RTX 카운터 |
+| Power State | ✅ | ✅ | powerStats 버킷 + ptt_power_change 이벤트 (클라이언트) |
 | 시계열 차트 | 데이터 수집만 | ❌ | 향후 추가 예정 |
 
 ### 미구현 (향후)
-- 서버 SSRC별 수신 패킷 카운터 (정밀 구간 손실 분리)
 - 시계열 차트 (어드민)
 - REST API (`GET /admin/rooms`)

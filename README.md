@@ -39,9 +39,10 @@ Browser / Native SDK (WebRTC)
 - Simulcast Phase 3 (가상 SSRC + SimulcastRewriter + 레이어 전환 + PLI 교착 방지)
 
 ### PTT 모드 (MCPTT/MBCP 기반)
-- Floor Control 상태 머신 (IDLE/TAKEN, T2 burst 30초 + ping timeout 5초)
+- Floor Control v2 (Priority Queue + Preemption + T2 burst 30초 + ping timeout 5초)
 - 미디어 게이팅 (비발화자 RTP 드롭)
-- SSRC 리라이팅 (오디오 + 비디오 오프셋 기반)
+- SSRC 리라이팅 (오디오 + 비디오 오프셋 기반, dynamic ts_gap, pending compensation)
+- Silence flush: clear_speaker 시 Opus silence 3프레임 주입
 - VP8 키프레임 대기 + PLI burst (0ms/500ms/1500ms)
 - MBCP over UDP (RTCP APP PT=204) + WS 시그널링 하이브리드
 
@@ -59,7 +60,7 @@ Browser / Native SDK (WebRTC)
 
 ### Telemetry & Admin
 - 클라이언트 telemetry 수집 (Publish/Subscribe delta, 10종 이벤트 감지)
-- 어드민 대시보드 (6파일 ES module, 20개 ring buffer, 통합 타임라인)
+- 어드민 대시보드 (6파일 ES module, 50개 ring buffer, 통합 타임라인)
 - GlobalMetrics (AtomicU64 카운터 + 3초 flush)
 - PipelineStats (per-participant 파이프라인 카운터)
 - Contract 체크 12항목 (rr_generated, rr_consumed, sr_relay, egress_drop 등)
@@ -115,6 +116,7 @@ Packet format:
 | 40 | FLOOR_REQUEST | PTT 발화권 요청 |
 | 41 | FLOOR_RELEASE | PTT 발화권 해제 |
 | 42 | FLOOR_PING | 발화자 생존 확인 |
+| 43 | FLOOR_QUEUE_POS | 큐 위치 조회 |
 | 50 | ROOM_SYNC | 참여자+트랙+floor 전체 동기화 (폴링 안전망) |
 | 51 | SUBSCRIBE_LAYER | Simulcast 레이어 선택 (h/l/pause) |
 
@@ -179,7 +181,7 @@ src/
 ├── room/
 │   ├── room.rs                 Room (3-index DashMap O(1)) + RoomHub
 │   ├── participant.rs          Participant, MediaSession, Track, SimulcastRewriter, PipelineStats
-│   ├── floor.rs                FloorController 상태 머신 (IDLE/TAKEN)
+│   ├── floor.rs                FloorController v2 (priority queue + preemption)
 │   └── ptt_rewriter.rs         PttRewriter (SSRC/seq/ts 오프셋 리라이팅)
 │
 └── metrics/
@@ -223,7 +225,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 
 ## Version
 
-현재 v0.6.1 — 자세한 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참조.
+현재 v0.6.4 — 자세한 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참조.
 
 ## Related Projects
 

@@ -427,7 +427,10 @@ RUST_LOG=dtls=debug,webrtc_srtp=debug,oxlens_sfu_server=info ./oxsfud
 | `HEARTBEAT_INTERVAL_MS` | 30,000 | 하트비트 간격 |
 | `HEARTBEAT_TIMEOUT_MS` | 90,000 | 하트비트 타임아웃 |
 | `ZOMBIE_TIMEOUT_MS` | 120,000 | 좀비 판정 시간 |
-| `ROOM_MAX_CAPACITY` | 20 | 방 최대 인원 |
+| `ROOM_MAX_CAPACITY` | 1,000 | 방 최대 인원 |
 | `RTP_CACHE_SIZE` | 512 | RTX 캐시 슬롯 수 |
+| `RTX_BUDGET_PER_3S` | 200 | subscriber별 3초당 RTX 상한 |
 | `REMB_BITRATE_BPS` | 500,000 | 서버 REMB 힌트 (bps) |
 | `REMB_INTERVAL_MS` | 1,000 | REMB 전송 주기 |
+| `FLOOR_MAX_BURST_MS` | 30,000 | PTT 최대 발화 시간 |
+| `FLOOR_PING_TIMEOUT_MS` | 5,000 | 발화자 ping 타임아웃 |
