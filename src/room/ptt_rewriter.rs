@@ -65,6 +65,9 @@ struct RewriteState {
 
     /// clear_speaker 시점 기록 (idle 경과 시간 → ts_guard_gap 동적 계산)
     cleared_at: Option<Instant>,
+
+    /// switch_speaker 시점 기록 (pending 경과 시간 → v_base_ts 보정)
+    switched_at: Option<Instant>,
 }
 
 /// Audio용 ts 간격: Opus 48kHz, 20ms ptime = 960 samples
@@ -107,6 +110,7 @@ impl PttRewriter {
                 awaiting_first_packet: false,
                 pending_keyframe: false,
                 cleared_at: None,
+                switched_at: None,
             }),
         }
     }
@@ -167,6 +171,7 @@ impl PttRewriter {
         s.speaker = Some(user_id.to_string());
         s.awaiting_first_packet = true;
         s.pending_keyframe = self.require_keyframe;
+        s.switched_at = Some(Instant::now());
     }
 
     /// 발화권 해제/회수 — Floor Release/Revoke 시점에 호출.
@@ -177,6 +182,7 @@ impl PttRewriter {
         s.awaiting_first_packet = false;
         s.pending_keyframe = false;
         s.cleared_at = Some(Instant::now());
+        s.switched_at = None;
 
         // Audio rewriter만 silence flush 생성 (Video는 해당 없음)
         if self.require_keyframe {
@@ -275,8 +281,24 @@ impl PttRewriter {
             s.origin_base_seq = orig_seq;
             s.origin_base_ts = orig_ts;
 
-            // Audio/Video 모두 switch_speaker에서 dynamic ts_gap 기반 v_base 설정 완료
-            // 여기서는 origin_base만 설정
+            // Video: pending_keyframe 구간 경과 시간을 v_base_ts에 가산
+            // switch_speaker에서 idle gap만 반영했으므로, pending 구간(getUserMedia 대기 등)의
+            // 시간을 추가 반영해야 subscriber의 arrival_gap과 ts_gap이 일치함.
+            // Audio는 pending이 없으므로(즉시 도착) 보정 불필요.
+            if self.require_keyframe {
+                if let Some(switched) = s.switched_at {
+                    let pending_ms = switched.elapsed().as_millis() as u32;
+                    if pending_ms > 50 {
+                        // 50ms 미만은 HOT 상태(pending 없음) — 보정 불필요
+                        let pending_ts = pending_ms.saturating_mul(90); // 90kHz
+                        s.virtual_base_ts = s.virtual_base_ts.wrapping_add(pending_ts);
+                        info!("[PTT:REWRITE] video pending compensation: {}ms → ts+={} v_base_ts={}",
+                            pending_ms, pending_ts, s.virtual_base_ts);
+                    }
+                }
+                s.switched_at = None;
+            }
+
             s.awaiting_first_packet = false;
 
             debug!("[PTT:REWRITE] first_pkt user={} orig_seq={} orig_ts={} → v_base_seq={} v_base_ts={}",

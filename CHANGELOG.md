@@ -23,9 +23,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   Chrome이 "이 패킷이 전체 프레임"으로 오인 → 불완전 디코딩 → freeze
 - Audio(Opus)는 1패킷=1프레임이라 marker 강제가 무해 → 유지
 
-#### rewrite() first_pkt video base 재계산 제거 (ptt_rewriter.rs)
+#### rewrite() first_pkt video base 재계산 제거 + pending 보상 (ptt_rewriter.rs)
 - 기존: first_pkt에서 last_virtual_ts + 3000(고정)으로 v_base 재계산
-- 수정: switch_speaker에서 dynamic ts_gap으로 설정한 v_base를 그대로 사용
+- 수정: switch_speaker에서 dynamic ts_gap으로 설정한 v_base를 기본으로 사용
+- Video pending 보상: switch_speaker → first_pkt 경과 시간(getUserMedia 대기) × 90kHz 가산
+  arrival_gap = idle + pending, ts_gap = idle + pending → subscriber jb_delay 폭등 방지
 
 ### Added (디버그)
 - `diagnose_vp8()` 함수 + `Vp8Diag` 구조체 (ptt_rewriter.rs)
